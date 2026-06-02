@@ -1,0 +1,14 @@
+{
+  "name": "go-search",
+  "version": "1.0.0",
+  "description": "云比赛选手历史查询",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0"
+  }
+}

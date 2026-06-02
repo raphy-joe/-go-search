@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>云比赛 · 选手历史查询</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>云比赛 · 选手历史查询</h1>
+      <p class="subtitle">查询选手近两年的围棋比赛记录</p>
+    </header>
+
+    <form id="searchForm" class="search-card">
+      <div class="form-row">
+        <div class="form-group flex-2">
+          <label>选手姓名 <span class="required">*</span></label>
+          <input id="name" type="text" placeholder="请输入精确姓名（如：张三）" required autocomplete="off">
+        </div>
+        <div class="form-group flex-2">
+          <label>省份 <span class="required">*</span></label>
+          <select id="province" required>
+            <option value="" disabled selected>请选择省份</option>
+            <option value="浙江省">浙江省</option>
+            <option value="广东省">广东省</option>
+            <option value="江苏省">江苏省</option>
+            <option value="安徽省">安徽省</option>
+            <option value="四川省">四川省</option>
+            <option value="广西">广西</option>
+            <option value="湖南省">湖南省</option>
+            <option value="福建省">福建省</option>
+            <option value="北京市">北京市</option>
+            <option value="重庆市">重庆市</option>
+            <option value="河北省">河北省</option>
+            <option value="山东省">山东省</option>
+            <option value="江西省">江西省</option>
+            <option value="陕西省">陕西省</option>
+            <option value="山西省">山西省</option>
+            <option value="海南省">海南省</option>
+            <option value="甘肃省">甘肃省</option>
+            <option value="新疆">新疆</option>
+            <option value="上海市">上海市</option>
+            <option value="湖北省">湖北省</option>
+            <option value="黑龙江省">黑龙江省</option>
+            <option value="云南省">云南省</option>
+            <option value="辽宁省">辽宁省</option>
+            <option value="河南省">河南省</option>
+            <option value="贵州省">贵州省</option>
+            <option value="内蒙古">内蒙古</option>
+            <option value="吉林省">吉林省</option>
+            <option value="宁夏">宁夏</option>
+            <option value="天津市">天津市</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-actions">
+        <button type="submit" id="searchBtn">查询近两年记录</button>
+        <button type="button" id="stopBtn" class="btn-stop" style="display:none">停止</button>
+      </div>
+    </form>
+
+    <!-- Progress section -->
+    <div id="progressSection" style="display:none" class="progress-section">
+      <div class="progress-header">
+        <span id="progressText">准备中...</span>
+        <span id="progressCount"></span>
+      </div>
+      <div class="progress-bar-wrap">
+        <div id="progressBar" class="progress-bar"></div>
+      </div>
+    </div>
+
+    <!-- Results section -->
+    <div id="resultsSection" style="display:none">
+      <div class="results-header">
+        <h2 id="resultsTitle">查询结果</h2>
+        <span id="resultCount" class="badge">0</span>
+      </div>
+      <div id="resultsList"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
