@@ -14,7 +14,6 @@ const resultsSection  = document.getElementById('resultsSection');
 const resultsTitle    = document.getElementById('resultsTitle');
 const resultCount     = document.getElementById('resultCount');
 const resultsList     = document.getElementById('resultsList');
-
 let evtSource = null;
 let hits = 0;
 let currentProvince = '';
@@ -74,7 +73,7 @@ function startSearch() {
   if (!name)     { nameInput.focus();     return; }
   if (!province) { provinceSelect.focus(); return; }
 
-  currentProvince = province;
+  currentProvince = (province === '__ALL__') ? '' : province;
 
   if (evtSource) { evtSource.close(); evtSource = null; }
 
@@ -93,13 +92,14 @@ function startSearch() {
   progressCount.textContent = '';
   progressSection.style.display = 'block';
   resultsSection.style.display  = 'block';
-  resultsTitle.textContent = `${esc(name)} · ${esc(province)} · ${yearFrom}–${yearTo}`;
+  const provinceLabel = province === '__ALL__' ? '全国' : province;
+  resultsTitle.textContent = `${esc(name)} · ${esc(provinceLabel)} · ${yearFrom}–${yearTo}`;
   searchBtn.disabled = true;
   stopBtn.style.display = 'inline-block';
 
   const params = new URLSearchParams({
     name, province,
-    eventType: '2',   // 围棋
+    eventType: '2',
     yearFrom, yearTo,
   });
   evtSource = new EventSource(`/api/search?${params}`);
