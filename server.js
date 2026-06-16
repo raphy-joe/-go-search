@@ -14,6 +14,8 @@ const PORT = process.env.PORT || 3000;
 const SEARCH_API      = 'https://api.yunbisai.com/request/event/SearchInfo';
 const DETAIL_BASE     = 'https://www.yunbisai.com/tpl/eventFeatures/eventDetail-';
 const AGAINSTPLAN_API = 'https://api.yunbisai.com/request/Group/Againstplan';
+const SEARCH_TIMEOUT_MS = 15000;
+const SEARCH_RETRIES    = 1;
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
@@ -92,11 +94,10 @@ async function doSearch(event, name, send) {
     const params = new URLSearchParams({
       eventid: event.event_id, keywords: name, type: 1, callback: 'cb',
     });
-    const r    = await fetch(`${SEARCH_API}?${params}`, {
-      headers: { Referer: 'https://www.yunbisai.com/' }, timeout: 8000,
-    });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const text = await r.text();
+    const text = await fetchTextWithRetry(`${SEARCH_API}?${params}`, {
+      headers: { Referer: 'https://www.yunbisai.com/' },
+      timeout: SEARCH_TIMEOUT_MS,
+    }, SEARCH_RETRIES);
     const s    = text.trim()
       .replace(/^[^(]+\(/, '').replace(/\);\s*$/, '').replace(/\)\s*$/, '');
     const data = JSON.parse(s);
@@ -135,6 +136,21 @@ async function doSearch(event, name, send) {
     console.warn(`[Search] event ${event.event_id} failed: ${err.message}`);
     return { ok: false, error: err.message };
   }
+}
+
+async function fetchTextWithRetry(url, options, retries) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const r = await fetch(url, options);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return await r.text();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries) await delay(300 * (attempt + 1));
+    }
+  }
+  throw lastErr;
 }
 
 // ── /api/matches ──────────────────────────────────────────────────────────────
