@@ -17,6 +17,7 @@ const PAGE_DELAY_MS    = 100;
 const TIMEOUT_MS       = 12000;
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
+const activeControllers = new Set();
 
 // ── 单例状态 ──────────────────────────────────────────────────────────────────
 let state = {
@@ -26,26 +27,54 @@ let state = {
   totalPages:  0,
   eventsStored: 0,
   lastError:  null,
+  stopRequested: false,
 };
 
 function getState() { return { ...state }; }
 
+function isStopRequested() {
+  return state.stopRequested || !state.running;
+}
+
+function throwIfStopped() {
+  if (isStopRequested()) throw new Error('CRAWL_STOPPED');
+}
+
 // ── 拉取单页 ──────────────────────────────────────────────────────────────────
 async function fetchPage(eventType, province, page) {
+  throwIfStopped();
   const params = new URLSearchParams({
     page, PageSize: 100, eventType, areaNum: province || '',
   });
-  const res = await fetch(`${EVENTS_API}?${params}`, { timeout: TIMEOUT_MS });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = await res.json();
-  return json.datArr || {};
+  const controller = new AbortController();
+  activeControllers.add(controller);
+  try {
+    const res = await fetch(`${EVENTS_API}?${params}`, {
+      timeout: TIMEOUT_MS,
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    throwIfStopped();
+    return json.datArr || {};
+  } finally {
+    activeControllers.delete(controller);
+  }
 }
 
 // ── 主入口 ────────────────────────────────────────────────────────────────────
 async function runCrawl({ eventType = '2', province = '' } = {}) {
   if (state.running) { console.log('[Crawler] Already running.'); return; }
 
-  state = { running: true, startedAt: Date.now(), pagesLoaded: 0, totalPages: 0, eventsStored: 0, lastError: null };
+  state = {
+    running: true,
+    startedAt: Date.now(),
+    pagesLoaded: 0,
+    totalPages: 0,
+    eventsStored: 0,
+    lastError: null,
+    stopRequested: false,
+  };
   console.log(`[Crawler] Start — type=${eventType} province="${province}"`);
 
   try {
@@ -58,8 +87,10 @@ async function runCrawl({ eventType = '2', province = '' } = {}) {
     // 剩余页并发拉取
     const remaining = Array.from({ length: state.totalPages - 1 }, (_, i) => i + 2);
     while (remaining.length) {
+      throwIfStopped();
       const batch = remaining.splice(0, PAGE_CONCURRENCY);
       const pages = await Promise.all(batch.map(p => fetchPage(eventType, province, p)));
+      throwIfStopped();
       for (const pg of pages) {
         allRows.push(...(pg.rows || []));
         state.pagesLoaded++;
@@ -70,6 +101,7 @@ async function runCrawl({ eventType = '2', province = '' } = {}) {
     console.log(`[Crawler] ${allRows.length} events fetched, saving to DB...`);
 
     // 持久化
+    throwIfStopped();
     const now = Date.now();
     await upsertEvents(allRows.map(e => ({
       event_id:     String(e.event_id),
@@ -87,15 +119,23 @@ async function runCrawl({ eventType = '2', province = '' } = {}) {
     console.log(`[Crawler] Done. DB now has ${stats.eventCount} events.`);
 
   } catch (err) {
-    state.lastError = err.message;
-    console.error('[Crawler] Error:', err.message);
+    if (err.message === 'CRAWL_STOPPED' || err.name === 'AbortError') {
+      console.log('[Crawler] Stopped before completion; partial data was not saved.');
+    } else {
+      state.lastError = err.message;
+      console.error('[Crawler] Error:', err.message);
+    }
   } finally {
     state.running = false;
+    activeControllers.clear();
   }
 }
 
 function stopCrawl() {
-  if (state.running) { state.running = false; console.log('[Crawler] Stopped.'); }
+  if (!state.running) return;
+  state.stopRequested = true;
+  for (const controller of activeControllers) controller.abort();
+  console.log('[Crawler] Stop requested.');
 }
 
 module.exports = { runCrawl, stopCrawl, getState };

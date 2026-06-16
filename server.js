@@ -28,8 +28,8 @@ app.get('/api/search', async (req, res) => {
   const cleanName = name.trim();
   // __ALL__ 表示全国，不限省份
   const cleanProvince = (province === '__ALL__') ? '' : province;
-  const dateFrom  = yearFrom ? `${yearFrom}-01-01` : '0000-01-01';
-  const dateTo    = yearTo   ? `${yearTo}-12-31`   : '9999-12-31';
+  const dateFrom  = req.query.dateFrom || (yearFrom ? `${yearFrom}-01-01` : '0000-01-01');
+  const dateTo    = req.query.dateTo   || (yearTo   ? `${yearTo}-12-31`   : '9999-12-31');
 
   // SSE setup
   res.setHeader('Content-Type', 'text/event-stream');
@@ -56,6 +56,7 @@ app.get('/api/search', async (req, res) => {
     // 并发按姓名搜索
     const CONCURRENCY = 8;
     let searched = 0;
+    let failed   = 0;
     let lastAt   = 0;
     const queue  = [...events];
 
@@ -63,19 +64,20 @@ app.get('/api/search', async (req, res) => {
       while (queue.length && !closed) {
         const event = queue.shift();
         if (!event) break;
-        await doSearch(event, cleanName, send);
+        const result = await doSearch(event, cleanName, send);
+        if (!result.ok) failed++;
         searched++;
         const now = Date.now();
         if (now - lastAt > 300 || queue.length === 0) {
           lastAt = now;
-          send({ type: 'progress', searched, queued: events.length, pagesLoaded: 1, totalPages: 1 });
+          send({ type: 'progress', searched, queued: events.length, failed, pagesLoaded: 1, totalPages: 1 });
         }
         await delay(50);
       }
     }
 
     await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-    send({ type: 'done', searched, queued: events.length });
+    send({ type: 'done', searched, queued: events.length, failed });
 
   } catch (err) {
     send({ type: 'error', msg: err.message });
@@ -93,6 +95,7 @@ async function doSearch(event, name, send) {
     const r    = await fetch(`${SEARCH_API}?${params}`, {
       headers: { Referer: 'https://www.yunbisai.com/' }, timeout: 8000,
     });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const text = await r.text();
     const s    = text.trim()
       .replace(/^[^(]+\(/, '').replace(/\);\s*$/, '').replace(/\)\s*$/, '');
@@ -127,7 +130,11 @@ async function doSearch(event, name, send) {
         }
       }
     }
-  } catch (_) { /* skip */ }
+    return { ok: true };
+  } catch (err) {
+    console.warn(`[Search] event ${event.event_id} failed: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
 }
 
 // ── /api/matches ──────────────────────────────────────────────────────────────

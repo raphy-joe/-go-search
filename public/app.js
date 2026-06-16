@@ -48,12 +48,23 @@ async function fetchAllMatchData(hits) {
   return matchMap;
 }
 
-// ── Compute "recent two years" range ─────────────────────────────────────────
-function getYearRange() {
+// ── Compute rolling recent two years range ───────────────────────────────────
+function formatDate(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function getRecentTwoYearRange() {
   const now = new Date();
-  const yearTo   = now.getFullYear();
-  const yearFrom = yearTo - 1;
-  return { yearFrom: String(yearFrom), yearTo: String(yearTo) };
+  const from = new Date(now);
+  from.setFullYear(from.getFullYear() - 2);
+  return {
+    dateFrom: formatDate(from),
+    dateTo: formatDate(now),
+    label: `${formatDate(from)}–${formatDate(now)}`,
+  };
 }
 
 // ── Form submit ───────────────────────────────────────────────────────────────
@@ -77,7 +88,7 @@ function startSearch() {
 
   if (evtSource) { evtSource.close(); evtSource = null; }
 
-  const { yearFrom, yearTo } = getYearRange();
+  const { dateFrom, dateTo, label: dateLabel } = getRecentTwoYearRange();
 
   // Reset UI
   hits = 0;
@@ -93,14 +104,14 @@ function startSearch() {
   progressSection.style.display = 'block';
   resultsSection.style.display  = 'block';
   const provinceLabel = province === '__ALL__' ? '全国' : province;
-  resultsTitle.textContent = `${esc(name)} · ${esc(provinceLabel)} · ${yearFrom}–${yearTo}`;
+  resultsTitle.textContent = `${esc(name)} · ${esc(provinceLabel)} · ${dateLabel}`;
   searchBtn.disabled = true;
   stopBtn.style.display = 'inline-block';
 
   const params = new URLSearchParams({
     name, province,
     eventType: '2',
-    yearFrom, yearTo,
+    dateFrom, dateTo,
   });
   evtSource = new EventSource(`/api/search?${params}`);
 
@@ -127,8 +138,9 @@ function startSearch() {
         const pageInfo = (msg.totalPages > 1 && msg.pagesLoaded < msg.totalPages)
           ? `  （列表加载中 ${msg.pagesLoaded}/${msg.totalPages} 页）`
           : '';
+        const failedInfo = msg.failed ? `，${msg.failed} 场失败` : '';
         progressText.textContent = `正在搜索${pageInfo}`;
-        progressCount.textContent = `${msg.searched} / ${msg.queued} 场`;
+        progressCount.textContent = `${msg.searched} / ${msg.queued} 场${failedInfo}`;
         break;
       }
 
@@ -153,7 +165,7 @@ function startSearch() {
       case 'done':
         progressBar.style.width = '100%';
         progressText.textContent = '搜索完成';
-        progressCount.textContent = `共搜索 ${msg.searched} 场赛事，找到 ${hits} 条记录`;
+        progressCount.textContent = `共搜索 ${msg.searched} 场赛事，找到 ${hits} 条记录${msg.failed ? `，${msg.failed} 场请求失败` : ''}`;
         if (hits === 0) showEmpty(name, province);
         else showStrengthEstimate(allHits);
         evtSource.close(); evtSource = null;
@@ -376,7 +388,9 @@ function timeWeight(dateStr) {
   if (!dateStr) return 0;
   const days = (Date.now() - new Date(dateStr).getTime()) / 86400000;
   if (days <= 90)  return 1.00;
-  if (days <= 180) return 0.40;
+  if (days <= 180) return 0.70;
+  if (days <= 365) return 0.40;
+  if (days <= 730) return 0.15;
   return 0;
 }
 
