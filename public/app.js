@@ -325,7 +325,7 @@ function parseGroupL(groupName) {
 
   if (/低段/.test(g)) return 27.5;
   if (/高段/.test(g)) return 30;
-  if (isOpenGroup(g)) return 30.5;   // 公开组通常强于普通5段组
+  if (isOpenGroup(g)) return 30.2;   // 公开组略强于普通5段组
   return null;
 }
 
@@ -467,7 +467,7 @@ function estimateStrength(hits, matchMap = null) {
     }
 
     let wrAdj = winRateAdj(win, lose, draw);
-    if (isOpen && wrAdj < 0) wrAdj *= 0.5;
+    if (isOpen && wrAdj < 0) wrAdj *= 0.75;
     const T_raw = L_group + (isAgeGroup ? 0 : 0.5) + wrAdj + oppAdj;
     const ew = eventLevelWeight(h.event.title, h.event.organizer || '');
 
@@ -509,7 +509,7 @@ function estimateStrength(hits, matchMap = null) {
       const floor = L_base !== null ? Math.max(e.L_group, L_base) : e.L_group;
       T = Math.max(T, floor);
     }
-    if (e.isOpen) T = Math.max(T, 30.5);
+    if (e.isOpen) T = Math.max(T, 30.0);
 
     weightedSum += T * e.w;
     totalWeight += e.w;
