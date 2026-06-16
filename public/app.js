@@ -325,8 +325,12 @@ function parseGroupL(groupName) {
 
   if (/低段/.test(g)) return 27.5;
   if (/高段/.test(g)) return 30;
-  if (/公开/.test(g)) return 30;   // 公开组 = 5段及以上
+  if (isOpenGroup(g)) return 30.5;   // 公开组通常强于普通5段组
   return null;
+}
+
+function isOpenGroup(groupName) {
+  return /公开/.test(groupName || '');
 }
 
 // ── Path B: age/grade groups (年级组, U10组, 8岁组…) ─────────────────────────
@@ -388,9 +392,7 @@ function timeWeight(dateStr) {
   if (!dateStr) return 0;
   const days = (Date.now() - new Date(dateStr).getTime()) / 86400000;
   if (days <= 90)  return 1.00;
-  if (days <= 180) return 0.70;
-  if (days <= 365) return 0.40;
-  if (days <= 730) return 0.15;
+  if (days <= 180) return 0.40;
   return 0;
 }
 
@@ -425,6 +427,7 @@ function estimateStrength(hits, matchMap = null) {
     const isAgeGroup = L_skill === null && L_age !== null;
     const L_group = L_skill ?? L_age;
     if (L_group === null) continue;
+    const isOpen = !isAgeGroup && isOpenGroup(h.player.group);
 
     const win   = parseInt(h.player.win)  || 0;
     const lose  = parseInt(h.player.lose) || 0;
@@ -463,7 +466,8 @@ function estimateStrength(hits, matchMap = null) {
       }
     }
 
-    const wrAdj = winRateAdj(win, lose, draw);
+    let wrAdj = winRateAdj(win, lose, draw);
+    if (isOpen && wrAdj < 0) wrAdj *= 0.5;
     const T_raw = L_group + (isAgeGroup ? 0 : 0.5) + wrAdj + oppAdj;
     const ew = eventLevelWeight(h.event.title, h.event.organizer || '');
 
@@ -474,7 +478,7 @@ function estimateStrength(hits, matchMap = null) {
     else                         dq = 0.75;
 
     const w = effectiveRounds * tw * ew * dq;
-    collected.push({ h, L_group, wrAdj, oppAdj, T_raw, w, rounds: effectiveRounds, tw, ew, isAgeGroup, hasMatchData, knownOppCount });
+    collected.push({ h, L_group, wrAdj, oppAdj, T_raw, w, rounds: effectiveRounds, tw, ew, isAgeGroup, isOpen, hasMatchData, knownOppCount });
   }
 
   if (collected.length === 0) return null;
@@ -505,6 +509,7 @@ function estimateStrength(hits, matchMap = null) {
       const floor = L_base !== null ? Math.max(e.L_group, L_base) : e.L_group;
       T = Math.max(T, floor);
     }
+    if (e.isOpen) T = Math.max(T, 30.5);
 
     weightedSum += T * e.w;
     totalWeight += e.w;
@@ -530,16 +535,17 @@ async function showStrengthEstimate(hits) {
   if (old) old.remove();
 
   const allGroups = [...new Set(hits.map(h => h.player.group).filter(Boolean))];
+  const hasRecent = hits.some(h => timeWeight(h.event.date) > 0);
 
   // Phase 1: show basic estimate immediately (synchronous, no match data)
   const basicResult = estimateStrength(hits, null);
-  renderStrengthCard(basicResult, hits, allGroups, '（正在加载对局数据…）');
+  renderStrengthCard(basicResult, hits, allGroups, hasRecent, '（正在加载对局数据…）');
 
   // Phase 2: fetch all match data in parallel, re-render enhanced estimate
   const matchMap = await fetchAllMatchData(hits);
   if (matchMap.size === 0) {
     // No match data could be fetched — re-render without loading note
-    renderStrengthCard(basicResult, hits, allGroups, null);
+    renderStrengthCard(basicResult, hits, allGroups, hasRecent, null);
     if (basicResult) {
       playerStrengthCache.set(
         nameInput.value.trim(),
@@ -550,7 +556,7 @@ async function showStrengthEstimate(hits) {
   }
 
   const enhancedResult = estimateStrength(hits, matchMap);
-  renderStrengthCard(enhancedResult, hits, allGroups, null);
+  renderStrengthCard(enhancedResult, hits, allGroups, hasRecent, null);
   if (enhancedResult) {
     playerStrengthCache.set(
       nameInput.value.trim(),
@@ -559,21 +565,27 @@ async function showStrengthEstimate(hits) {
   }
 }
 
-function renderStrengthCard(result, hits, allGroups, loadingMsg) {
+function renderStrengthCard(result, hits, allGroups, hasRecent, loadingMsg) {
   const old = document.getElementById('strengthCard');
   if (old) old.remove();
 
   if (!result) {
     if (allGroups.length === 0) return;
+    const reason = hasRecent
+      ? '组别信息无法映射到段级位，暂不估算'
+      : '近180天内缺少可用棋力样本，暂不估算';
+    const note = hasRecent
+      ? `识别到的组别：${allGroups.map(g => `<b>${esc(g)}</b>`).join('、')}。如需支持这些组别，请反馈给开发者。`
+      : `识别到的组别：${allGroups.map(g => `<b>${esc(g)}</b>`).join('、')}。当前棋力评测只采纳近180天内的比赛。`;
     const card = document.createElement('div');
     card.id = 'strengthCard';
     card.className = 'strength-card strength-card--unknown';
     card.innerHTML = `
       <div class="strength-header">
         <div class="strength-label strength-label--unknown">棋力待估</div>
-        <div class="strength-meta">组别信息无法映射到段级位，暂不估算</div>
+        <div class="strength-meta">${reason}</div>
       </div>
-      <div class="strength-note">识别到的组别：${allGroups.map(g => `<b>${esc(g)}</b>`).join('、')}。如需支持这些组别，请反馈给开发者。</div>`;
+      <div class="strength-note">${note}</div>`;
     resultsList.before(card);
     return;
   }
