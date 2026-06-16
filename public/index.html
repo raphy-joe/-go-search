@@ -13,11 +13,11 @@
       <p class="subtitle">查询选手近两年的围棋比赛记录</p>
     </header>
 
-    <form id="searchForm" class="search-card">
+    <form id="searchForm" class="search-card" autocomplete="on">
       <div class="form-row">
         <div class="form-group flex-2">
           <label>选手姓名 <span class="required">*</span></label>
-          <input id="name" type="text" placeholder="请输入精确姓名（如：张三）" required autocomplete="off">
+          <input id="name" name="playerName" type="text" placeholder="请输入精确姓名（如：张三）" required autocomplete="on">
         </div>
         <div class="form-group flex-2">
           <label>省份 <span class="required">*</span></label>

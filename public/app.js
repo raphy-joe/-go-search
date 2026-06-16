@@ -19,6 +19,7 @@ let hits = 0;
 let currentProvince = '';
 let hitDates  = [];   // parallel to resultsList children, YYYY-MM-DD strings, descending
 let allHits   = [];   // all hit messages, used for strength estimation
+let searchSeq = 0;
 
 // Cross-search cache: player name → { L, confidence }
 // Populated after each search; used as opponent strength reference in future searches.
@@ -84,6 +85,7 @@ function startSearch() {
   if (!name)     { nameInput.focus();     return; }
   if (!province) { provinceSelect.focus(); return; }
 
+  const seq = ++searchSeq;
   currentProvince = (province === '__ALL__') ? '' : province;
 
   if (evtSource) { evtSource.close(); evtSource = null; }
@@ -105,6 +107,7 @@ function startSearch() {
   resultsSection.style.display  = 'block';
   const provinceLabel = province === '__ALL__' ? '全国' : province;
   resultsTitle.textContent = `${esc(name)} · ${esc(provinceLabel)} · ${dateLabel}`;
+  renderStrengthPending(name);
   searchBtn.disabled = true;
   stopBtn.style.display = 'inline-block';
 
@@ -116,6 +119,7 @@ function startSearch() {
   evtSource = new EventSource(`/api/search?${params}`);
 
   evtSource.onmessage = e => {
+    if (seq !== searchSeq) return;
     const msg = JSON.parse(e.data);
 
     switch (msg.type) {
@@ -166,8 +170,12 @@ function startSearch() {
         progressBar.style.width = '100%';
         progressText.textContent = '搜索完成';
         progressCount.textContent = `共搜索 ${msg.searched} 场赛事，找到 ${hits} 条记录${msg.failed ? `，${msg.failed} 场请求失败` : ''}`;
-        if (hits === 0) showEmpty(name, province);
-        else showStrengthEstimate(allHits);
+        if (hits === 0) {
+          clearStrengthCard();
+          showEmpty(name, province);
+        } else {
+          showStrengthEstimate(allHits, seq, name);
+        }
         evtSource.close(); evtSource = null;
         searchBtn.disabled = false;
         stopBtn.style.display = 'none';
@@ -183,6 +191,7 @@ function startSearch() {
   };
 
   evtSource.onerror = () => {
+    if (seq !== searchSeq) return;
     progressText.textContent = '连接中断';
     evtSource.close(); evtSource = null;
     searchBtn.disabled = false;
@@ -530,7 +539,8 @@ function estimateStrength(hits, matchMap = null) {
   return { L, label: lToLabel(L), confidence: conf, events: usedEvents };
 }
 
-async function showStrengthEstimate(hits) {
+async function showStrengthEstimate(hits, seq, playerName) {
+  if (seq !== searchSeq) return;
   const old = document.getElementById('strengthCard');
   if (old) old.remove();
 
@@ -539,16 +549,18 @@ async function showStrengthEstimate(hits) {
 
   // Phase 1: show basic estimate immediately (synchronous, no match data)
   const basicResult = estimateStrength(hits, null);
+  if (seq !== searchSeq) return;
   renderStrengthCard(basicResult, hits, allGroups, hasRecent, '（正在加载对局数据…）');
 
   // Phase 2: fetch all match data in parallel, re-render enhanced estimate
   const matchMap = await fetchAllMatchData(hits);
+  if (seq !== searchSeq) return;
   if (matchMap.size === 0) {
     // No match data could be fetched — re-render without loading note
     renderStrengthCard(basicResult, hits, allGroups, hasRecent, null);
     if (basicResult) {
       playerStrengthCache.set(
-        nameInput.value.trim(),
+        playerName,
         { L: basicResult.L, confidence: basicResult.confidence }
       );
     }
@@ -556,18 +568,36 @@ async function showStrengthEstimate(hits) {
   }
 
   const enhancedResult = estimateStrength(hits, matchMap);
+  if (seq !== searchSeq) return;
   renderStrengthCard(enhancedResult, hits, allGroups, hasRecent, null);
   if (enhancedResult) {
     playerStrengthCache.set(
-      nameInput.value.trim(),
+      playerName,
       { L: enhancedResult.L, confidence: enhancedResult.confidence }
     );
   }
 }
 
-function renderStrengthCard(result, hits, allGroups, hasRecent, loadingMsg) {
+function renderStrengthPending(name) {
+  clearStrengthCard();
+  const card = document.createElement('div');
+  card.id = 'strengthCard';
+  card.className = 'strength-card strength-card--unknown';
+  card.innerHTML = `
+    <div class="strength-header">
+      <div class="strength-label strength-label--unknown">棋力评估中</div>
+      <div class="strength-meta">正在等待「${esc(name)}」的搜索结果</div>
+    </div>`;
+  resultsList.before(card);
+}
+
+function clearStrengthCard() {
   const old = document.getElementById('strengthCard');
   if (old) old.remove();
+}
+
+function renderStrengthCard(result, hits, allGroups, hasRecent, loadingMsg) {
+  clearStrengthCard();
 
   if (!result) {
     if (allGroups.length === 0) return;
