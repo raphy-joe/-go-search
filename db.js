@@ -52,6 +52,45 @@ const initPromise = new Promise((res, rej) =>
 
     CREATE INDEX IF NOT EXISTS idx_events_province ON events (provincename);
     CREATE INDEX IF NOT EXISTS idx_events_time     ON events (min_time);
+
+    CREATE TABLE IF NOT EXISTS event_groups (
+      group_id     TEXT PRIMARY KEY,
+      event_id     TEXT NOT NULL DEFAULT '',
+      group_name   TEXT NOT NULL DEFAULT '',
+      team_type    TEXT NOT NULL DEFAULT '0',
+      pnumber      INTEGER NOT NULL DEFAULT 0,
+      updated_at   INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_event_groups_event ON event_groups (event_id);
+
+    CREATE TABLE IF NOT EXISTS participant_index (
+      event_id         TEXT NOT NULL DEFAULT '',
+      group_id         TEXT NOT NULL DEFAULT '',
+      group_name       TEXT NOT NULL DEFAULT '',
+      participant_id   TEXT NOT NULL DEFAULT '',
+      participant_name TEXT NOT NULL DEFAULT '',
+      org              TEXT NOT NULL DEFAULT '',
+      short_no         TEXT NOT NULL DEFAULT '',
+      win              INTEGER NOT NULL DEFAULT 0,
+      lose             INTEGER NOT NULL DEFAULT 0,
+      draw             INTEGER NOT NULL DEFAULT 0,
+      score            TEXT NOT NULL DEFAULT '',
+      updated_at       INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (event_id, group_id, participant_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_participant_index_name  ON participant_index (participant_name);
+    CREATE INDEX IF NOT EXISTS idx_participant_index_event ON participant_index (event_id);
+    CREATE INDEX IF NOT EXISTS idx_participant_index_group ON participant_index (group_id);
+
+    CREATE TABLE IF NOT EXISTS indexed_events (
+      event_id           TEXT PRIMARY KEY,
+      indexed_at         INTEGER NOT NULL DEFAULT 0,
+      group_count        INTEGER NOT NULL DEFAULT 0,
+      participant_count  INTEGER NOT NULL DEFAULT 0,
+      last_error         TEXT NOT NULL DEFAULT ''
+    );
   `, err => err ? rej(err) : res())
 );
 
@@ -101,14 +140,159 @@ async function queryEvents({ province, dateFrom, dateTo }) {
   );
 }
 
+async function queryEventsForIndex({ province = '', dateFrom, dateTo, force = false, limit = 0 }) {
+  await initPromise;
+  const params = [];
+  const conds  = ['e.play_num > 0'];
+
+  if (province) { conds.push('e.provincename = ?'); params.push(province); }
+  if (dateFrom) { conds.push('e.min_time >= ?');     params.push(dateFrom); }
+  if (dateTo)   { conds.push('e.min_time <= ?');     params.push(dateTo); }
+  if (!force) conds.push('ie.event_id IS NULL');
+
+  const limitClause = limit ? ' LIMIT ?' : '';
+  if (limit) params.push(limit);
+
+  return all(
+    `SELECT e.event_id, e.title, e.min_time, e.provincename, e.city_name, e.cname
+     FROM events e
+     LEFT JOIN indexed_events ie ON ie.event_id = e.event_id
+     WHERE ${conds.join(' AND ')} ORDER BY e.min_time DESC${limitClause}`,
+    params
+  );
+}
+
+async function queryUnindexedEvents({ province, dateFrom, dateTo }) {
+  return queryEventsForIndex({ province, dateFrom, dateTo, force: false });
+}
+
+async function getIndexCoverage({ province = '', dateFrom, dateTo }) {
+  await initPromise;
+  const params = [];
+  const conds = ['e.play_num > 0'];
+
+  if (province) { conds.push('e.provincename = ?'); params.push(province); }
+  if (dateFrom) { conds.push('e.min_time >= ?'); params.push(dateFrom); }
+  if (dateTo) { conds.push('e.min_time <= ?'); params.push(dateTo); }
+
+  return get(
+    `SELECT
+       COUNT(*) AS eventCount,
+       SUM(CASE WHEN ie.event_id IS NULL THEN 0 ELSE 1 END) AS indexedEventCount
+     FROM events e
+     LEFT JOIN indexed_events ie ON ie.event_id = e.event_id
+     WHERE ${conds.join(' AND ')}`,
+    params
+  );
+}
+
+async function queryParticipants({ name, province = '', dateFrom, dateTo }) {
+  await initPromise;
+  const params = [name];
+  const conds = ['p.participant_name = ?'];
+
+  if (province) { conds.push('e.provincename = ?'); params.push(province); }
+  if (dateFrom) { conds.push('e.min_time >= ?'); params.push(dateFrom); }
+  if (dateTo) { conds.push('e.min_time <= ?'); params.push(dateTo); }
+
+  return all(
+    `SELECT
+       e.event_id, e.title, e.min_time, e.provincename, e.city_name, e.cname,
+       p.group_id, p.group_name, p.participant_id, p.participant_name,
+       p.org, p.win, p.lose, p.draw, p.score
+     FROM participant_index p
+     JOIN events e ON e.event_id = p.event_id
+     WHERE ${conds.join(' AND ')} ORDER BY e.min_time DESC`,
+    params
+  );
+}
+
+async function upsertIndexedEvent({ event_id, group_count = 0, participant_count = 0, last_error = '', indexed_at = Date.now() }) {
+  await initPromise;
+  return run(
+    `INSERT OR REPLACE INTO indexed_events
+       (event_id, indexed_at, group_count, participant_count, last_error)
+     VALUES (?, ?, ?, ?, ?)`,
+    [String(event_id), indexed_at, group_count, participant_count, last_error]
+  );
+}
+
+async function upsertEventGroups(groups) {
+  await initPromise;
+  const sql = `
+    INSERT OR REPLACE INTO event_groups
+      (group_id, event_id, group_name, team_type, pnumber, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `;
+  await run('BEGIN');
+  try {
+    for (const g of groups) {
+      await run(sql, [
+        String(g.group_id), String(g.event_id), g.group_name || '',
+        String(g.team_type ?? '0'), parseInt(g.pnumber) || 0, g.updated_at || Date.now(),
+      ]);
+    }
+    await run('COMMIT');
+  } catch (err) {
+    await run('ROLLBACK');
+    throw err;
+  }
+}
+
+async function replaceParticipantsForEvent(event_id, participants) {
+  await initPromise;
+  const sql = `
+    INSERT OR REPLACE INTO participant_index
+      (event_id, group_id, group_name, participant_id, participant_name, org, short_no, win, lose, draw, score, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `;
+  await run('BEGIN');
+  try {
+    await run('DELETE FROM participant_index WHERE event_id = ?', [String(event_id)]);
+    for (const p of participants) {
+      await run(sql, [
+        String(p.event_id), String(p.group_id), p.group_name || '',
+        String(p.participant_id), p.participant_name || '', p.org || '', p.short_no || '',
+        parseInt(p.win) || 0, parseInt(p.lose) || 0, parseInt(p.draw) || 0,
+        String(p.score ?? ''), p.updated_at || Date.now(),
+      ]);
+    }
+    await run('COMMIT');
+  } catch (err) {
+    await run('ROLLBACK');
+    throw err;
+  }
+}
+
 /** 获取 DB 中赛事总数和更新时间 */
 async function getStats() {
   await initPromise;
-  const [cnt, ts] = await Promise.all([
+  const [cnt, ts, pcnt, icnt, pts] = await Promise.all([
     get(`SELECT COUNT(*) AS c FROM events`),
     get(`SELECT MAX(updated_at) AS t FROM events`),
+    get(`SELECT COUNT(*) AS c FROM participant_index`),
+    get(`SELECT COUNT(*) AS c FROM indexed_events WHERE last_error = ''`),
+    get(`SELECT MAX(updated_at) AS t FROM participant_index`),
   ]);
-  return { eventCount: cnt.c, lastUpdated: ts.t };
+  return {
+    eventCount: cnt.c,
+    lastUpdated: ts.t,
+    participantCount: pcnt.c,
+    indexedEventCount: icnt.c,
+    participantLastUpdated: pts.t,
+  };
 }
 
-module.exports = { initPromise, upsertEvents, queryEvents, getStats };
+module.exports = {
+  initPromise,
+  upsertEvents,
+  queryEvents,
+  queryEventsForIndex,
+  queryUnindexedEvents,
+  getIndexCoverage,
+  queryParticipants,
+  upsertIndexedEvent,
+  upsertEventGroups,
+  replaceParticipantsForEvent,
+  getStats,
+};

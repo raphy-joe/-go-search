@@ -5,8 +5,15 @@ const fetch   = require('node-fetch');
 const path    = require('path');
 const cron    = require('node-cron');
 
-const { initPromise, queryEvents, getStats } = require('./db');
+const {
+  initPromise,
+  queryUnindexedEvents,
+  getIndexCoverage,
+  queryParticipants,
+  getStats,
+} = require('./db');
 const { runCrawl, stopCrawl, getState: getCrawlerState } = require('./crawler');
+const { runIndex, stopIndex, getState: getIndexerState } = require('./indexer');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -43,21 +50,42 @@ app.get('/api/search', async (req, res) => {
 
   try {
     // 从 DB 取赛事列表（毫秒级，省去分页请求）
-    const events = await queryEvents({ province: cleanProvince, dateFrom, dateTo });
+    const coverage = await getIndexCoverage({ province: cleanProvince, dateFrom, dateTo });
+    const totalEventCount = coverage.eventCount || 0;
+    const indexedEventCount = coverage.indexedEventCount || 0;
+    const indexedHits = await queryParticipants({ name: cleanName, province: cleanProvince, dateFrom, dateTo });
+    for (const row of indexedHits) send(indexedRowToHit(row));
+
+    const events = await queryUnindexedEvents({ province: cleanProvince, dateFrom, dateTo });
 
     if (events.length === 0) {
-      send({ type: 'done', searched: 0, queued: 0 });
+      send({
+        type: 'done',
+        searched: indexedEventCount,
+        queued: totalEventCount,
+        failed: 0,
+        indexed: indexedEventCount,
+        indexHits: indexedHits.length,
+        mode: 'index',
+      });
       return res.end();
     }
 
     send({
-      type: 'progress', searched: 0, queued: events.length,
-      pagesLoaded: 1, totalPages: 1,
+      type: 'progress',
+      searched: indexedEventCount,
+      queued: totalEventCount,
+      failed: 0,
+      indexed: indexedEventCount,
+      indexHits: indexedHits.length,
+      fallbackQueued: events.length,
+      pagesLoaded: 1,
+      totalPages: 1,
     });
 
     // 并发按姓名搜索
     const CONCURRENCY = 8;
-    let searched = 0;
+    let searched = indexedEventCount;
     let failed   = 0;
     let lastAt   = 0;
     const queue  = [...events];
@@ -72,14 +100,32 @@ app.get('/api/search', async (req, res) => {
         const now = Date.now();
         if (now - lastAt > 300 || queue.length === 0) {
           lastAt = now;
-          send({ type: 'progress', searched, queued: events.length, failed, pagesLoaded: 1, totalPages: 1 });
+          send({
+            type: 'progress',
+            searched,
+            queued: totalEventCount,
+            failed,
+            indexed: indexedEventCount,
+            indexHits: indexedHits.length,
+            fallbackQueued: events.length,
+            pagesLoaded: 1,
+            totalPages: 1,
+          });
         }
         await delay(50);
       }
     }
 
     await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-    send({ type: 'done', searched, queued: events.length, failed });
+    send({
+      type: 'done',
+      searched,
+      queued: totalEventCount,
+      failed,
+      indexed: indexedEventCount,
+      indexHits: indexedHits.length,
+      mode: indexedEventCount ? 'hybrid' : 'live',
+    });
 
   } catch (err) {
     send({ type: 'error', msg: err.message });
@@ -89,6 +135,34 @@ app.get('/api/search', async (req, res) => {
 });
 
 // ── 搜索单个赛事 ──────────────────────────────────────────────────────────────
+function indexedRowToHit(row) {
+  return {
+    type: 'hit',
+    source: 'index',
+    event: {
+      event_id:   String(row.event_id),
+      title:      row.title,
+      date:       (row.min_time || '').substring(0, 10),
+      province:   row.provincename,
+      city:       row.city_name,
+      organizer:  row.cname,
+      detail_url: `${DETAIL_BASE}${row.event_id}.html#groupID=${row.group_id}`,
+    },
+    player: {
+      name:          row.participant_name,
+      group:         row.group_name,
+      org:           row.org,
+      win:           String(row.win),
+      lose:          String(row.lose),
+      draw:          String(row.draw),
+      score:         row.score,
+      groupid:       String(row.group_id),
+      participantid: String(row.participant_id),
+      detail_url:    `https://m.yunbisai.com/memberData/personInfo/${randomStr()}?id=${row.group_id}&pID=${row.participant_id}&eventid=${row.event_id}`,
+    },
+  };
+}
+
 async function doSearch(event, name, send) {
   try {
     const params = new URLSearchParams({
@@ -224,10 +298,30 @@ app.post('/api/crawl/stop', (_req, res) => {
   res.json({ stopped: true });
 });
 
+app.get('/api/index/status', async (_req, res) => {
+  const stats = await getStats();
+  res.json({ ...getIndexerState(), stats });
+});
+
+app.post('/api/index/start', express.json(), (req, res) => {
+  if (getIndexerState().running)
+    return res.status(409).json({ error: '索引正在运行' });
+  const { province = '', dateFrom, dateTo, force = false, limit = 0 } = req.body || {};
+  runIndex({ province, dateFrom, dateTo, force, limit }).catch(console.error);
+  res.json({ started: true });
+});
+
+app.post('/api/index/stop', (_req, res) => {
+  stopIndex();
+  res.json({ stopped: true });
+});
+
 // ── 定时任务：每天凌晨 2:30 刷新赛事列表 ─────────────────────────────────────
 cron.schedule('30 2 * * *', () => {
   console.log('[Scheduler] Nightly crawl triggered.');
-  runCrawl().catch(console.error);
+  runCrawl()
+    .then(() => runIndex())
+    .catch(console.error);
 }, { timezone: 'Asia/Shanghai' });
 
 // ── 启动：DB 空则立即爬一次 ───────────────────────────────────────────────────
