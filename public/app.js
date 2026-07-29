@@ -168,11 +168,16 @@ function startSearch() {
 
       case 'done':
         progressBar.style.width = '100%';
-        progressText.textContent = '搜索完成';
-        progressCount.textContent = `共搜索 ${msg.searched} 场赛事，找到 ${hits} 条记录${msg.failed ? `，${msg.failed} 场请求失败` : ''}`;
+        if (msg.partial) {
+          progressText.textContent = '已返回已索引结果';
+          progressCount.textContent = `已检索本地索引 ${msg.searched} / ${msg.queued} 场，找到 ${hits} 条记录，${msg.fallbackQueued || 0} 场正在后台补索引`;
+        } else {
+          progressText.textContent = '搜索完成';
+          progressCount.textContent = `共搜索 ${msg.searched} 场赛事，找到 ${hits} 条记录${msg.failed ? `，${msg.failed} 场请求失败` : ''}`;
+        }
         if (hits === 0) {
           clearStrengthCard();
-          showEmpty(name, province);
+          showEmpty(name, province, msg.partial);
         } else {
           showStrengthEstimate(allHits, seq, name);
         }
@@ -291,12 +296,15 @@ function buildCard(msg) {
   return card;
 }
 
-function showEmpty(name, province) {
+function showEmpty(name, province, partial = false) {
+  const hint = partial
+    ? '部分赛事正在后台补索引，稍后再查会更完整'
+    : '请确认姓名是否精确，或尝试换一个省份';
   resultsList.innerHTML = `
     <div class="state-msg">
       <div class="icon">🔍</div>
-      <div>未找到「${esc(name)}」在${esc(province)}近两年的参赛记录</div>
-      <div style="margin-top:6px;font-size:.82rem">请确认姓名是否精确，或尝试换一个省份</div>
+      <div>${partial ? '已索引赛事中暂未找到' : '未找到'}「${esc(name)}」在${esc(province)}近两年的参赛记录</div>
+      <div style="margin-top:6px;font-size:.82rem">${hint}</div>
     </div>`;
 }
 

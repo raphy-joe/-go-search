@@ -23,6 +23,8 @@ const DETAIL_BASE     = 'https://www.yunbisai.com/tpl/eventFeatures/eventDetail-
 const AGAINSTPLAN_API = 'https://api.yunbisai.com/request/Group/Againstplan';
 const SEARCH_TIMEOUT_MS = 15000;
 const SEARCH_RETRIES    = 1;
+const GLOBAL_LIVE_FALLBACK_LIMIT = parseInt(process.env.SEARCH_GLOBAL_LIVE_FALLBACK_LIMIT || '50', 10);
+const LIVE_FALLBACK_LIMIT = parseInt(process.env.SEARCH_LIVE_FALLBACK_LIMIT || '250', 10);
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
@@ -53,8 +55,26 @@ app.get('/api/search', async (req, res) => {
     const coverage = await getIndexCoverage({ province: cleanProvince, dateFrom, dateTo });
     const totalEventCount = coverage.eventCount || 0;
     const indexedEventCount = coverage.indexedEventCount || 0;
+    const unindexedEventCount = coverage.unindexedEventCount || 0;
     const indexedHits = await queryParticipants({ name: cleanName, province: cleanProvince, dateFrom, dateTo });
     for (const row of indexedHits) send(indexedRowToHit(row));
+
+    if (shouldReturnIndexOnly({ province: cleanProvince, unindexedEventCount, query: req.query })) {
+      const backfillStarted = startIndexBackfill({ province: cleanProvince, dateFrom, dateTo });
+      send({
+        type: 'done',
+        searched: indexedEventCount,
+        queued: totalEventCount,
+        failed: 0,
+        indexed: indexedEventCount,
+        indexHits: indexedHits.length,
+        fallbackQueued: unindexedEventCount,
+        partial: true,
+        backfillStarted,
+        mode: 'index-partial',
+      });
+      return res.end();
+    }
 
     const events = await queryUnindexedEvents({ province: cleanProvince, dateFrom, dateTo });
 
@@ -161,6 +181,19 @@ function indexedRowToHit(row) {
       detail_url:    `https://m.yunbisai.com/memberData/personInfo/${randomStr()}?id=${row.group_id}&pID=${row.participant_id}&eventid=${row.event_id}`,
     },
   };
+}
+
+function shouldReturnIndexOnly({ province, unindexedEventCount, query }) {
+  if (!unindexedEventCount) return false;
+  if (query.live === '1' || query.full === '1') return false;
+  const limit = province ? LIVE_FALLBACK_LIMIT : GLOBAL_LIVE_FALLBACK_LIMIT;
+  return unindexedEventCount > limit;
+}
+
+function startIndexBackfill({ province, dateFrom, dateTo }) {
+  if (getIndexerState().running) return false;
+  runIndex({ province, dateFrom, dateTo }).catch(console.error);
+  return true;
 }
 
 async function doSearch(event, name, send) {

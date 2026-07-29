@@ -33,6 +33,22 @@ function get(sql, params = []) {
   );
 }
 
+let writeLock = Promise.resolve();
+function withWriteLock(fn) {
+  const next = writeLock.then(fn, fn);
+  writeLock = next.catch(() => {});
+  return next;
+}
+
+const RETRYABLE_INDEX_COND = `(
+  ie.event_id IS NULL
+  OR ie.last_error LIKE 'SQLITE_%'
+  OR ie.last_error LIKE '%database is locked%'
+  OR ie.last_error LIKE '%cannot start a transaction%'
+  OR ie.last_error LIKE '%timeout%'
+  OR ie.last_error LIKE 'HTTP %'
+)`;
+
 // ── Schema ────────────────────────────────────────────────────────────────────
 const initPromise = new Promise((res, rej) =>
   db.exec(`
@@ -52,6 +68,8 @@ const initPromise = new Promise((res, rej) =>
 
     CREATE INDEX IF NOT EXISTS idx_events_province ON events (provincename);
     CREATE INDEX IF NOT EXISTS idx_events_time     ON events (min_time);
+    CREATE INDEX IF NOT EXISTS idx_events_filter_province ON events (provincename, min_time, play_num);
+    CREATE INDEX IF NOT EXISTS idx_events_filter_time     ON events (min_time, play_num);
 
     CREATE TABLE IF NOT EXISTS event_groups (
       group_id     TEXT PRIMARY KEY,
@@ -81,6 +99,7 @@ const initPromise = new Promise((res, rej) =>
     );
 
     CREATE INDEX IF NOT EXISTS idx_participant_index_name  ON participant_index (participant_name);
+    CREATE INDEX IF NOT EXISTS idx_participant_index_name_event ON participant_index (participant_name, event_id);
     CREATE INDEX IF NOT EXISTS idx_participant_index_event ON participant_index (event_id);
     CREATE INDEX IF NOT EXISTS idx_participant_index_group ON participant_index (group_id);
 
@@ -91,6 +110,7 @@ const initPromise = new Promise((res, rej) =>
       participant_count  INTEGER NOT NULL DEFAULT 0,
       last_error         TEXT NOT NULL DEFAULT ''
     );
+    CREATE INDEX IF NOT EXISTS idx_indexed_events_error_event ON indexed_events (last_error, event_id);
   `, err => err ? rej(err) : res())
 );
 
@@ -98,26 +118,28 @@ const initPromise = new Promise((res, rej) =>
 
 /** 批量 upsert 赛事（单事务） */
 async function upsertEvents(events) {
-  await initPromise;
-  const sql = `
-    INSERT OR REPLACE INTO events
-      (event_id, title, min_time, provincename, city_name, cname, play_num, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `;
-  await run('BEGIN');
-  try {
-    for (const e of events) {
-      await run(sql, [
-        e.event_id, e.title, e.min_time,
-        e.provincename, e.city_name, e.cname,
-        e.play_num, e.updated_at,
-      ]);
+  return withWriteLock(async () => {
+    await initPromise;
+    const sql = `
+      INSERT OR REPLACE INTO events
+        (event_id, title, min_time, provincename, city_name, cname, play_num, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+    await run('BEGIN IMMEDIATE');
+    try {
+      for (const e of events) {
+        await run(sql, [
+          e.event_id, e.title, e.min_time,
+          e.provincename, e.city_name, e.cname,
+          e.play_num, e.updated_at,
+        ]);
+      }
+      await run('COMMIT');
+    } catch (err) {
+      await run('ROLLBACK');
+      throw err;
     }
-    await run('COMMIT');
-  } catch (err) {
-    await run('ROLLBACK');
-    throw err;
-  }
+  });
 }
 
 /**
@@ -148,7 +170,7 @@ async function queryEventsForIndex({ province = '', dateFrom, dateTo, force = fa
   if (province) { conds.push('e.provincename = ?'); params.push(province); }
   if (dateFrom) { conds.push('e.min_time >= ?');     params.push(dateFrom); }
   if (dateTo)   { conds.push('e.min_time <= ?');     params.push(dateTo); }
-  if (!force) conds.push('ie.event_id IS NULL');
+  if (!force) conds.push(RETRYABLE_INDEX_COND);
 
   const limitClause = limit ? ' LIMIT ?' : '';
   if (limit) params.push(limit);
@@ -178,7 +200,8 @@ async function getIndexCoverage({ province = '', dateFrom, dateTo }) {
   return get(
     `SELECT
        COUNT(*) AS eventCount,
-       SUM(CASE WHEN ie.event_id IS NULL THEN 0 ELSE 1 END) AS indexedEventCount
+       SUM(CASE WHEN ${RETRYABLE_INDEX_COND} THEN 0 ELSE 1 END) AS indexedEventCount,
+       SUM(CASE WHEN ${RETRYABLE_INDEX_COND} THEN 1 ELSE 0 END) AS unindexedEventCount
      FROM events e
      LEFT JOIN indexed_events ie ON ie.event_id = e.event_id
      WHERE ${conds.join(' AND ')}`,
@@ -208,60 +231,66 @@ async function queryParticipants({ name, province = '', dateFrom, dateTo }) {
 }
 
 async function upsertIndexedEvent({ event_id, group_count = 0, participant_count = 0, last_error = '', indexed_at = Date.now() }) {
-  await initPromise;
-  return run(
-    `INSERT OR REPLACE INTO indexed_events
-       (event_id, indexed_at, group_count, participant_count, last_error)
-     VALUES (?, ?, ?, ?, ?)`,
-    [String(event_id), indexed_at, group_count, participant_count, last_error]
-  );
+  return withWriteLock(async () => {
+    await initPromise;
+    return run(
+      `INSERT OR REPLACE INTO indexed_events
+         (event_id, indexed_at, group_count, participant_count, last_error)
+       VALUES (?, ?, ?, ?, ?)`,
+      [String(event_id), indexed_at, group_count, participant_count, last_error]
+    );
+  });
 }
 
 async function upsertEventGroups(groups) {
-  await initPromise;
-  const sql = `
-    INSERT OR REPLACE INTO event_groups
-      (group_id, event_id, group_name, team_type, pnumber, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `;
-  await run('BEGIN');
-  try {
-    for (const g of groups) {
-      await run(sql, [
-        String(g.group_id), String(g.event_id), g.group_name || '',
-        String(g.team_type ?? '0'), parseInt(g.pnumber) || 0, g.updated_at || Date.now(),
-      ]);
+  return withWriteLock(async () => {
+    await initPromise;
+    const sql = `
+      INSERT OR REPLACE INTO event_groups
+        (group_id, event_id, group_name, team_type, pnumber, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `;
+    await run('BEGIN IMMEDIATE');
+    try {
+      for (const g of groups) {
+        await run(sql, [
+          String(g.group_id), String(g.event_id), g.group_name || '',
+          String(g.team_type ?? '0'), parseInt(g.pnumber) || 0, g.updated_at || Date.now(),
+        ]);
+      }
+      await run('COMMIT');
+    } catch (err) {
+      await run('ROLLBACK');
+      throw err;
     }
-    await run('COMMIT');
-  } catch (err) {
-    await run('ROLLBACK');
-    throw err;
-  }
+  });
 }
 
 async function replaceParticipantsForEvent(event_id, participants) {
-  await initPromise;
-  const sql = `
-    INSERT OR REPLACE INTO participant_index
-      (event_id, group_id, group_name, participant_id, participant_name, org, short_no, win, lose, draw, score, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `;
-  await run('BEGIN');
-  try {
-    await run('DELETE FROM participant_index WHERE event_id = ?', [String(event_id)]);
-    for (const p of participants) {
-      await run(sql, [
-        String(p.event_id), String(p.group_id), p.group_name || '',
-        String(p.participant_id), p.participant_name || '', p.org || '', p.short_no || '',
-        parseInt(p.win) || 0, parseInt(p.lose) || 0, parseInt(p.draw) || 0,
-        String(p.score ?? ''), p.updated_at || Date.now(),
-      ]);
+  return withWriteLock(async () => {
+    await initPromise;
+    const sql = `
+      INSERT OR REPLACE INTO participant_index
+        (event_id, group_id, group_name, participant_id, participant_name, org, short_no, win, lose, draw, score, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+    await run('BEGIN IMMEDIATE');
+    try {
+      await run('DELETE FROM participant_index WHERE event_id = ?', [String(event_id)]);
+      for (const p of participants) {
+        await run(sql, [
+          String(p.event_id), String(p.group_id), p.group_name || '',
+          String(p.participant_id), p.participant_name || '', p.org || '', p.short_no || '',
+          parseInt(p.win) || 0, parseInt(p.lose) || 0, parseInt(p.draw) || 0,
+          String(p.score ?? ''), p.updated_at || Date.now(),
+        ]);
+      }
+      await run('COMMIT');
+    } catch (err) {
+      await run('ROLLBACK');
+      throw err;
     }
-    await run('COMMIT');
-  } catch (err) {
-    await run('ROLLBACK');
-    throw err;
-  }
+  });
 }
 
 /** 获取 DB 中赛事总数和更新时间 */
