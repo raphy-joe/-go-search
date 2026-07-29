@@ -20,6 +20,9 @@ let currentProvince = '';
 let hitDates  = [];   // parallel to resultsList children, YYYY-MM-DD strings, descending
 let allHits   = [];   // all hit messages, used for strength estimation
 let searchSeq = 0;
+let strengthRefreshTimer = null;
+let strengthEvalVersion = 0;
+const STRENGTH_REFRESH_DELAY_MS = 900;
 
 // Cross-search cache: player name → { L, confidence }
 // Populated after each search; used as opponent strength reference in future searches.
@@ -86,9 +89,14 @@ function startSearch() {
   if (!province) { provinceSelect.focus(); return; }
 
   const seq = ++searchSeq;
+  strengthEvalVersion++;
   currentProvince = (province === '__ALL__') ? '' : province;
 
   if (evtSource) { evtSource.close(); evtSource = null; }
+  if (strengthRefreshTimer) {
+    clearTimeout(strengthRefreshTimer);
+    strengthRefreshTimer = null;
+  }
 
   const { dateFrom, dateTo, label: dateLabel } = getRecentTwoYearRange();
 
@@ -163,6 +171,10 @@ function startSearch() {
           hitDates.splice(idx, 0, date);
           resultsList.insertBefore(card, resultsList.children[idx]);
         }
+        if (hits === 1) {
+          renderCurrentBasicStrength(seq, name);
+        }
+        scheduleStrengthRefresh(seq, name);
         break;
       }
 
@@ -175,11 +187,15 @@ function startSearch() {
           progressText.textContent = '搜索完成';
           progressCount.textContent = `共搜索 ${msg.searched} 场赛事，找到 ${hits} 条记录${msg.failed ? `，${msg.failed} 场请求失败` : ''}`;
         }
+        if (strengthRefreshTimer) {
+          clearTimeout(strengthRefreshTimer);
+          strengthRefreshTimer = null;
+        }
         if (hits === 0) {
           clearStrengthCard();
           showEmpty(name, province, msg.partial);
         } else {
-          showStrengthEstimate(allHits, seq, name);
+          showStrengthEstimate([...allHits], seq, name);
         }
         evtSource.close(); evtSource = null;
         searchBtn.disabled = false;
@@ -547,8 +563,39 @@ function estimateStrength(hits, matchMap = null) {
   return { L, label: lToLabel(L), confidence: conf, events: usedEvents };
 }
 
+function scheduleStrengthRefresh(seq, playerName) {
+  if (seq !== searchSeq || allHits.length === 0) return;
+  if (strengthRefreshTimer) clearTimeout(strengthRefreshTimer);
+  strengthRefreshTimer = setTimeout(() => {
+    strengthRefreshTimer = null;
+    showStrengthEstimate([...allHits], seq, playerName);
+  }, STRENGTH_REFRESH_DELAY_MS);
+}
+
+function renderCurrentBasicStrength(seq, playerName) {
+  if (seq !== searchSeq || allHits.length === 0) return;
+  const snapshot = [...allHits];
+  const allGroups = [...new Set(snapshot.map(h => h.player.group).filter(Boolean))];
+  const hasRecent = snapshot.some(h => timeWeight(h.event.date) > 0);
+  const basicResult = estimateStrength(snapshot, null);
+  renderStrengthCard(
+    basicResult,
+    snapshot,
+    allGroups,
+    hasRecent,
+    '（搜索仍在继续，棋力会随新增结果自动刷新…）'
+  );
+  if (basicResult) {
+    playerStrengthCache.set(
+      playerName,
+      { L: basicResult.L, confidence: basicResult.confidence }
+    );
+  }
+}
+
 async function showStrengthEstimate(hits, seq, playerName) {
   if (seq !== searchSeq) return;
+  const evalVersion = ++strengthEvalVersion;
   const old = document.getElementById('strengthCard');
   if (old) old.remove();
 
@@ -557,12 +604,12 @@ async function showStrengthEstimate(hits, seq, playerName) {
 
   // Phase 1: show basic estimate immediately (synchronous, no match data)
   const basicResult = estimateStrength(hits, null);
-  if (seq !== searchSeq) return;
+  if (seq !== searchSeq || evalVersion !== strengthEvalVersion) return;
   renderStrengthCard(basicResult, hits, allGroups, hasRecent, '（正在加载对局数据…）');
 
   // Phase 2: fetch all match data in parallel, re-render enhanced estimate
   const matchMap = await fetchAllMatchData(hits);
-  if (seq !== searchSeq) return;
+  if (seq !== searchSeq || evalVersion !== strengthEvalVersion) return;
   if (matchMap.size === 0) {
     // No match data could be fetched — re-render without loading note
     renderStrengthCard(basicResult, hits, allGroups, hasRecent, null);
@@ -576,7 +623,7 @@ async function showStrengthEstimate(hits, seq, playerName) {
   }
 
   const enhancedResult = estimateStrength(hits, matchMap);
-  if (seq !== searchSeq) return;
+  if (seq !== searchSeq || evalVersion !== strengthEvalVersion) return;
   renderStrengthCard(enhancedResult, hits, allGroups, hasRecent, null);
   if (enhancedResult) {
     playerStrengthCache.set(

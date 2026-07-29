@@ -15,6 +15,7 @@ const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 
 const db = new sqlite3.Database(path.join(DATA_DIR, 'yunbisai.db'));
+db.configure('busyTimeout', 10000);
 
 // ── Promise wrappers ──────────────────────────────────────────────────────────
 function run(sql, params = []) {
@@ -70,6 +71,8 @@ const initPromise = new Promise((res, rej) =>
     CREATE INDEX IF NOT EXISTS idx_events_time     ON events (min_time);
     CREATE INDEX IF NOT EXISTS idx_events_filter_province ON events (provincename, min_time, play_num);
     CREATE INDEX IF NOT EXISTS idx_events_filter_time     ON events (min_time, play_num);
+    CREATE INDEX IF NOT EXISTS idx_events_play_time_event ON events (play_num, min_time, event_id);
+    CREATE INDEX IF NOT EXISTS idx_events_province_play_time_event ON events (provincename, play_num, min_time, event_id);
 
     CREATE TABLE IF NOT EXISTS event_groups (
       group_id     TEXT PRIMARY KEY,
@@ -100,6 +103,7 @@ const initPromise = new Promise((res, rej) =>
 
     CREATE INDEX IF NOT EXISTS idx_participant_index_name  ON participant_index (participant_name);
     CREATE INDEX IF NOT EXISTS idx_participant_index_name_event ON participant_index (participant_name, event_id);
+    CREATE INDEX IF NOT EXISTS idx_participant_index_name_event_group ON participant_index (participant_name, event_id, group_id, participant_id);
     CREATE INDEX IF NOT EXISTS idx_participant_index_event ON participant_index (event_id);
     CREATE INDEX IF NOT EXISTS idx_participant_index_group ON participant_index (group_id);
 

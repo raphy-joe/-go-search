@@ -23,7 +23,6 @@ const DETAIL_BASE     = 'https://www.yunbisai.com/tpl/eventFeatures/eventDetail-
 const AGAINSTPLAN_API = 'https://api.yunbisai.com/request/Group/Againstplan';
 const SEARCH_TIMEOUT_MS = 15000;
 const SEARCH_RETRIES    = 1;
-const GLOBAL_LIVE_FALLBACK_LIMIT = parseInt(process.env.SEARCH_GLOBAL_LIVE_FALLBACK_LIMIT || '50', 10);
 const LIVE_FALLBACK_LIMIT = parseInt(process.env.SEARCH_LIVE_FALLBACK_LIMIT || '250', 10);
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
@@ -186,8 +185,8 @@ function indexedRowToHit(row) {
 function shouldReturnIndexOnly({ province, unindexedEventCount, query }) {
   if (!unindexedEventCount) return false;
   if (query.live === '1' || query.full === '1') return false;
-  const limit = province ? LIVE_FALLBACK_LIMIT : GLOBAL_LIVE_FALLBACK_LIMIT;
-  return unindexedEventCount > limit;
+  if (!province) return true;
+  return unindexedEventCount > LIVE_FALLBACK_LIMIT;
 }
 
 function startIndexBackfill({ province, dateFrom, dateTo }) {
