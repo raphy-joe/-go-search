@@ -447,9 +447,71 @@ function lToLabel(L) {
   return null;
 }
 
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function buildHeadToHeadStats(hits, matchMap) {
+  const stats = new Map();
+  if (!matchMap) return stats;
+
+  for (let i = 0; i < hits.length; i++) {
+    const h = hits[i];
+    if (timeWeight(h.event.date) === 0) continue;
+    const matches = matchMap.get(i) || [];
+    for (const m of matches) {
+      if (!m.opponent) continue;
+      const key = m.opponent.trim();
+      if (!key) continue;
+      const rec = stats.get(key) || { games: 0, win: 0, lose: 0, draw: 0 };
+      rec.games++;
+      if (m.result === 'win') rec.win++;
+      else if (m.result === 'lose') rec.lose++;
+      else rec.draw++;
+      stats.set(key, rec);
+    }
+  }
+
+  return stats;
+}
+
+function calcHeadToHeadAdj(matches, h2hStats) {
+  if (!matches?.length || !h2hStats?.size) {
+    return { h2hAdj: 0, h2hGameCount: 0, h2hOpponentCount: 0 };
+  }
+
+  let weightedScore = 0;
+  let totalWeight = 0;
+  let h2hGameCount = 0;
+  const repeatedOpponents = new Set();
+
+  for (const m of matches) {
+    if (!m.opponent) continue;
+    const rec = h2hStats.get(m.opponent.trim());
+    if (!rec || rec.games < 2) continue;
+    const score = (rec.win + 0.5 * rec.draw) / rec.games - 0.5;
+    const reliability = Math.min(1, rec.games / 4);
+    weightedScore += score * reliability * rec.games;
+    totalWeight += reliability * rec.games;
+    h2hGameCount += rec.games;
+    repeatedOpponents.add(m.opponent.trim());
+  }
+
+  if (totalWeight === 0) {
+    return { h2hAdj: 0, h2hGameCount: 0, h2hOpponentCount: 0 };
+  }
+
+  return {
+    h2hAdj: clamp(1.6 * (weightedScore / totalWeight), -0.8, 0.8),
+    h2hGameCount,
+    h2hOpponentCount: repeatedOpponents.size,
+  };
+}
+
 function estimateStrength(hits, matchMap = null) {
   // ── Pass 1: collect all event data ───────────────────────────────────────
   const collected = [];
+  const h2hStats = buildHeadToHeadStats(hits, matchMap);
 
   for (let i = 0; i < hits.length; i++) {
     const h = hits[i];
@@ -475,6 +537,9 @@ function estimateStrength(hits, matchMap = null) {
     const matches = matchMap?.get(i) ?? null;
     let effectiveRounds = totalRounds;
     let oppAdj = 0;
+    let h2hAdj = 0;
+    let h2hGameCount = 0;
+    let h2hOpponentCount = 0;
     let hasMatchData = false;
     let knownOppCount = 0;
 
@@ -497,21 +562,27 @@ function estimateStrength(hits, matchMap = null) {
         oppAdj = 0.4 * (oppLAvg - L_group);
         oppAdj = Math.max(-1.5, Math.min(1.5, oppAdj));
       }
+
+      const h2h = calcHeadToHeadAdj(realMatches, h2hStats);
+      h2hAdj = h2h.h2hAdj;
+      h2hGameCount = h2h.h2hGameCount;
+      h2hOpponentCount = h2h.h2hOpponentCount;
     }
 
     let wrAdj = winRateAdj(win, lose, draw);
     if (isOpen && wrAdj < 0) wrAdj *= 0.75;
-    const T_raw = L_group + (isAgeGroup ? 0 : 0.5) + wrAdj + oppAdj;
+    const T_raw = L_group + (isAgeGroup ? 0 : 0.5) + wrAdj + oppAdj + h2hAdj;
     const ew = eventLevelWeight(h.event.title, h.event.organizer || '');
 
     let dq;
-    if (isAgeGroup)              dq = 0.60;
+    if (isAgeGroup)              dq = h2hGameCount >= 4 ? 0.72 : 0.60;
+    else if (h2hGameCount >= 4)  dq = 1.08;
     else if (knownOppCount >= 2) dq = 1.00;
     else if (hasMatchData)       dq = 0.85;
     else                         dq = 0.75;
 
     const w = effectiveRounds * tw * ew * dq;
-    collected.push({ h, L_group, wrAdj, oppAdj, T_raw, w, rounds: effectiveRounds, tw, ew, isAgeGroup, isOpen, hasMatchData, knownOppCount });
+    collected.push({ h, L_group, wrAdj, oppAdj, h2hAdj, h2hGameCount, h2hOpponentCount, T_raw, w, rounds: effectiveRounds, tw, ew, isAgeGroup, isOpen, hasMatchData, knownOppCount });
   }
 
   if (collected.length === 0) return null;
@@ -680,7 +751,7 @@ function renderStrengthCard(result, hits, allGroups, hasRecent, loadingMsg) {
 
   // Build basis list (up to 4 events, sorted by time weight desc)
   const sorted = [...events].sort((a, b) => b.tw - a.tw);
-  const basisItems = sorted.slice(0, 4).map(({ h, L_group, wrAdj, oppAdj, T, rounds, isAgeGroup, hasMatchData, knownOppCount }) => {
+  const basisItems = sorted.slice(0, 4).map(({ h, L_group, wrAdj, oppAdj, h2hAdj, h2hGameCount, h2hOpponentCount, T, rounds, isAgeGroup, hasMatchData, knownOppCount }) => {
     const win  = parseInt(h.player.win)  || 0;
     const lose = parseInt(h.player.lose) || 0;
     const draw = parseInt(h.player.draw) || 0;
@@ -693,17 +764,24 @@ function renderStrengthCard(result, hits, allGroups, hasRecent, loadingMsg) {
     const oppAdjStr = oppAdj && Math.abs(oppAdj) >= 0.01
       ? `，对手调整${(oppAdj >= 0 ? '+' : '') + oppAdj.toFixed(2)}`
       : '';
-    const matchTag = knownOppCount >= 2
+    const h2hAdjStr = h2hAdj && Math.abs(h2hAdj) >= 0.01
+      ? `，交手修正${(h2hAdj >= 0 ? '+' : '') + h2hAdj.toFixed(2)}`
+      : '';
+    const matchTag = h2hGameCount >= 4
+      ? ` <span class="tag-opp">同对手${h2hOpponentCount}人/${h2hGameCount}盘</span>`
+      : knownOppCount >= 2
       ? ` <span class="tag-opp">对手数据</span>`
       : hasMatchData
       ? ` <span class="tag-match">对局已获取</span>`
       : '';
-    return `<li><b>${esc(title)}</b> · ${esc(groupLabel)} · ${win}胜${lose}负${draw > 0 ? draw + '和' : ''}（${rounds}轮）→ <b>T=${T.toFixed(2)}</b>（${baseNote}，胜率调整${adjStr}${oppAdjStr}）${isAgeGroup ? ' <span class="tag-age">年龄组</span>' : ''}${matchTag}</li>`;
+    return `<li><b>${esc(title)}</b> · ${esc(groupLabel)} · ${win}胜${lose}负${draw > 0 ? draw + '和' : ''}（${rounds}轮）→ <b>T=${T.toFixed(2)}</b>（${baseNote}，胜率调整${adjStr}${oppAdjStr}${h2hAdjStr}）${isAgeGroup ? ' <span class="tag-age">年龄组</span>' : ''}${matchTag}</li>`;
   }).join('');
 
   const skipped = hits.length - events.length;
   const ageCount = events.filter(e => e.isAgeGroup).length;
   const oppCount = events.filter(e => e.knownOppCount >= 2).length;
+  const h2hEvents = events.filter(e => e.h2hGameCount >= 4).length;
+  const h2hGames = events.reduce((s, e) => s + (e.h2hGameCount || 0), 0);
 
   const skipNote = skipped > 0
     ? `<div class="strength-note">另有 ${skipped} 场赛事因组别无法识别未纳入计算。</div>`
@@ -713,6 +791,9 @@ function renderStrengthCard(result, hits, allGroups, hasRecent, loadingMsg) {
     : '';
   const oppNote = oppCount > 0
     ? `<div class="strength-note strength-note--good">已通过对手强度数据（${oppCount} 场赛事）增强估算精度。</div>`
+    : '';
+  const h2hNote = h2hEvents > 0
+    ? `<div class="strength-note strength-note--good">已纳入同对手交手记录：${h2hEvents} 场赛事中识别到 ${h2hGames} 盘重复对手交手，作为重要修正因素。</div>`
     : '';
   const loadingNote = loadingMsg
     ? `<div class="strength-note strength-note--loading">${loadingMsg}</div>`
@@ -731,7 +812,7 @@ function renderStrengthCard(result, hits, allGroups, hasRecent, loadingMsg) {
       </div>
     </div>
     <ul class="strength-basis">${basisItems}</ul>
-    ${ageNote}${oppNote}${skipNote}${loadingNote}`;
+    ${ageNote}${h2hNote}${oppNote}${skipNote}${loadingNote}`;
 
   resultsList.before(card);
 }
