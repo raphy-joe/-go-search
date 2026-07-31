@@ -90,7 +90,7 @@ function startSearch() {
 
   const seq = ++searchSeq;
   strengthEvalVersion++;
-  currentProvince = (province === '__ALL__') ? '' : province;
+  currentProvince = province;
 
   if (evtSource) { evtSource.close(); evtSource = null; }
   if (strengthRefreshTimer) {
@@ -744,8 +744,8 @@ function esc(s) {
 (function initFromUrl() {
   const params = new URLSearchParams(window.location.search);
   const name     = params.get('name');
-  const province = params.get('province');
-  if (!name || !province) return;
+  const province = params.get('province') || '__ALL__';
+  if (!name) return;
   nameInput.value = name;
   provinceSelect.value = province;
   if (provinceSelect.value === province) startSearch();
