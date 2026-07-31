@@ -294,10 +294,46 @@ button[type=submit]:disabled { opacity: .5; cursor: not-allowed; transform: none
 .h2h-link:hover { background: #eef1fd; }
 
 .h2h-card { margin-top: -8px; }
+.h2h-card--flash {
+  animation: h2hPulse 1.2s ease;
+}
+@keyframes h2hPulse {
+  0% { box-shadow: 0 0 0 0 rgba(79,110,247,.28); }
+  45% { box-shadow: 0 0 0 5px rgba(79,110,247,.14); }
+  100% { box-shadow: 0 2px 12px rgba(0,0,0,.08); }
+}
+.h2h-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.h2h-title {
+  font-size: .98rem;
+  font-weight: 800;
+  color: #1a2332;
+}
+.h2h-clear {
+  border: 1px solid #dde3ec;
+  background: #fff;
+  color: #6b7a8d;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: .8rem;
+  cursor: pointer;
+  font-family: inherit;
+}
+.h2h-clear:hover { background: #f9fafc; color: #1a2332; }
 .h2h-result {
   margin-top: 14px;
   border-top: 1px solid #eef1f8;
   padding-top: 14px;
+}
+.h2h-context {
+  font-size: .84rem;
+  color: #4a5568;
+  margin-bottom: 6px;
 }
 .h2h-summary {
   display: flex;
