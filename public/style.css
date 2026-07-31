@@ -280,6 +280,65 @@ button[type=submit]:disabled { opacity: .5; cursor: not-allowed; transform: none
 .m-score { color: #6b7a8d; font-size: .78rem; margin-left: 4px; }
 .no-data { color: #b0bec5; }
 
+.h2h-link {
+  margin-left: 8px;
+  border: 1px solid #c5d0fa;
+  background: #fff;
+  color: #4f6ef7;
+  border-radius: 5px;
+  padding: 1px 7px;
+  font-size: .76rem;
+  cursor: pointer;
+  font-family: inherit;
+}
+.h2h-link:hover { background: #eef1fd; }
+
+.h2h-card { margin-top: -8px; }
+.h2h-result {
+  margin-top: 14px;
+  border-top: 1px solid #eef1f8;
+  padding-top: 14px;
+}
+.h2h-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  font-size: .88rem;
+  color: #4a5568;
+  margin-bottom: 10px;
+}
+.h2h-summary b { color: #1a2332; }
+.h2h-summary .h2h-score {
+  background: #eef1fd;
+  color: #3d5af1;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-weight: 700;
+}
+.h2h-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .84rem;
+}
+.h2h-table td, .h2h-table th {
+  padding: 6px 8px;
+  border-bottom: 1px solid #f0f4f8;
+  text-align: left;
+  vertical-align: top;
+}
+.h2h-table th {
+  color: #6b7a8d;
+  font-weight: 700;
+  background: #f9fafc;
+}
+.h2h-event-link {
+  color: #4f6ef7;
+  text-decoration: none;
+  font-weight: 600;
+}
+.h2h-event-link:hover { text-decoration: underline; }
+
 /* ── Empty / Error states ────────────────────────────────────────────────── */
 .state-msg {
   text-align: center;
@@ -390,4 +449,3 @@ button[type=submit]:disabled { opacity: .5; cursor: not-allowed; transform: none
   vertical-align: middle;
   margin-left: 4px;
 }
-

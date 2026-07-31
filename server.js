@@ -10,6 +10,9 @@ const {
   queryUnindexedEvents,
   getIndexCoverage,
   queryParticipants,
+  queryHeadToHeadCandidates,
+  getGroupMatchCache,
+  replaceGroupMatchCache,
   getStats,
 } = require('./db');
 const { runCrawl, stopCrawl, getState: getCrawlerState } = require('./crawler');
@@ -273,42 +276,202 @@ app.get('/api/matches', async (req, res) => {
   const totalRounds = parseInt(rounds) || 0;
   if (totalRounds < 1) return res.json({ matches: [] });
 
+  try {
+    const groupRows = await getOrFetchGroupMatches(group_id, totalRounds);
+    return res.json({ matches: buildPlayerMatches(groupRows, totalRounds, player_id) });
+  } catch (err) {
+    console.warn(`[Matches] group ${group_id} failed: ${err.message}`);
+  }
+
+  res.json({ matches: [] });
+});
+
+app.get('/api/head-to-head', async (req, res) => {
+  const playerA = String(req.query.playerA || '').trim();
+  const playerB = String(req.query.playerB || '').trim();
+  if (!playerA || !playerB) return res.status(400).json({ error: 'missing players' });
+  if (playerA === playerB) return res.status(400).json({ error: '请输入两位不同棋手' });
+
+  const province = req.query.province === '__ALL__' ? '' : String(req.query.province || '');
+  const dateFrom = req.query.dateFrom || '0000-01-01';
+  const dateTo = req.query.dateTo || '9999-12-31';
+  const limit = Math.min(parseInt(req.query.limit) || 300, 600);
+
+  try {
+    const candidates = await queryHeadToHeadCandidates({ playerA, playerB, province, dateFrom, dateTo, limit });
+    const games = [];
+    let checkedGroups = 0;
+    let failedGroups = 0;
+
+    for (const c of candidates) {
+      const rounds = Math.max(parseInt(c.player_a_rounds) || 0, parseInt(c.player_b_rounds) || 0);
+      if (!rounds) continue;
+      checkedGroups++;
+      try {
+        const rows = await getOrFetchGroupMatches(c.group_id, rounds);
+        const playerGames = findHeadToHeadGames(rows, c.player_a_id, c.player_b_id, c);
+        games.push(...playerGames);
+      } catch (err) {
+        failedGroups++;
+        console.warn(`[H2H] group ${c.group_id} failed: ${err.message}`);
+      }
+    }
+
+    games.sort((a, b) => (b.event.date || '').localeCompare(a.event.date || '') || b.bout - a.bout);
+    const summary = games.reduce((s, g) => {
+      s.games++;
+      if (g.result === 'win') s.win++;
+      else if (g.result === 'lose') s.lose++;
+      else s.draw++;
+      return s;
+    }, { games: 0, win: 0, lose: 0, draw: 0 });
+    summary.winRate = summary.games ? (summary.win + 0.5 * summary.draw) / summary.games : 0;
+
+    res.json({
+      players: { a: playerA, b: playerB },
+      scope: { province: province || '__ALL__', dateFrom, dateTo },
+      summary,
+      candidates: candidates.length,
+      checkedGroups,
+      failedGroups,
+      games,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+function buildPlayerMatches(groupRows, totalRounds, playerId) {
   const results = [];
   for (let bout = 1; bout <= totalRounds; bout++) {
-    try {
-      const params = new URLSearchParams({ groupid: group_id, team: 0, bout, callback: 'cb' });
-      const r      = await fetch(`${AGAINSTPLAN_API}?${params}`, {
-        headers: AGAINSTPLAN_HEADERS, timeout: 8000,
-      });
-      const s    = (await r.text()).trim()
-        .replace(/^[^(]+\(/, '').replace(/\);\s*$/, '').replace(/\)\s*$/, '');
-      const data = JSON.parse(s);
-      const rows = data.datArr?.rows ?? [];
-      const row  = rows.find(m =>
-        String(m.p1id) === String(player_id) || String(m.p2id) === String(player_id)
-      );
-      if (row) {
-        const isP1 = String(row.p1id) === String(player_id);
-        const raw  = isP1 ? row.p1_result : row.p2_result;
-        results.push({
-          bout,
-          opponent:     isP1 ? row.p2          : row.p1,
-          opponent_org: isP1 ? (row.p2_teamname || '') : (row.p1_teamname || ''),
-          result:       raw == '1' ? 'win' : raw == '2' ? 'lose' : 'draw',
-          score:        parseFloat(isP1 ? row.p1_score : row.p2_score) || 0,
-          opp_score:    parseFloat(isP1 ? row.p2_score : row.p1_score) || 0,
-        });
-      } else if (data.datArr === 'wait') {
-        results.push({ bout, opponent: null, pending: true });
-      } else {
-        results.push({ bout, opponent: null });
-      }
-    } catch (_) {
-      results.push({ bout, opponent: null, error: true });
+    const row = groupRows.find(m =>
+      m.bout === bout && (String(m.p1_id) === String(playerId) || String(m.p2_id) === String(playerId))
+    );
+    if (!row) {
+      results.push({ bout, opponent: null });
+      continue;
     }
+    const isP1 = String(row.p1_id) === String(playerId);
+    const raw = isP1 ? row.p1_result : row.p2_result;
+    results.push({
+      bout,
+      opponent: isP1 ? row.p2_name : row.p1_name,
+      opponent_org: isP1 ? row.p2_org : row.p1_org,
+      result: raw == '1' ? 'win' : raw == '2' ? 'lose' : 'draw',
+      score: parseFloat(isP1 ? row.p1_score : row.p2_score) || 0,
+      opp_score: parseFloat(isP1 ? row.p2_score : row.p1_score) || 0,
+    });
   }
-  res.json({ matches: results });
-});
+  return results;
+}
+
+async function getOrFetchGroupMatches(groupId, rounds) {
+  const cached = await getGroupMatchCache(groupId);
+  if (cached.status && !cached.status.last_error && cached.status.rounds >= rounds) {
+    return normalizeCachedRows(cached.rows);
+  }
+
+  const rows = await fetchGroupMatches(groupId, rounds);
+  await replaceGroupMatchCache({ group_id: groupId, rounds, rows });
+  return rows;
+}
+
+function normalizeCachedRows(rows) {
+  return rows.map(r => ({
+    group_id: String(r.group_id),
+    bout: parseInt(r.bout) || 0,
+    p1_id: String(r.p1_id || ''),
+    p2_id: String(r.p2_id || ''),
+    p1_name: r.p1_name || '',
+    p2_name: r.p2_name || '',
+    p1_org: r.p1_org || '',
+    p2_org: r.p2_org || '',
+    p1_result: String(r.p1_result ?? ''),
+    p2_result: String(r.p2_result ?? ''),
+    p1_score: parseFloat(r.p1_score) || 0,
+    p2_score: parseFloat(r.p2_score) || 0,
+  }));
+}
+
+async function fetchGroupMatches(groupId, rounds) {
+  const allRows = [];
+  for (let bout = 1; bout <= rounds; bout++) {
+    const params = new URLSearchParams({ groupid: groupId, team: 0, bout, callback: 'cb' });
+    const text = await fetchTextWithRetry(`${AGAINSTPLAN_API}?${params}`, {
+      headers: AGAINSTPLAN_HEADERS,
+      timeout: 8000,
+    }, 1);
+    const data = parseJsonp(text);
+    const rows = data.datArr?.rows ?? [];
+    for (const row of rows) {
+      if (!row.p1id || !row.p2id) continue;
+      allRows.push({
+        group_id: String(groupId),
+        bout,
+        p1_id: String(row.p1id),
+        p2_id: String(row.p2id),
+        p1_name: row.p1 || '',
+        p2_name: row.p2 || '',
+        p1_org: row.p1_teamname || '',
+        p2_org: row.p2_teamname || '',
+        p1_result: String(row.p1_result ?? ''),
+        p2_result: String(row.p2_result ?? ''),
+        p1_score: parseFloat(row.p1_score) || 0,
+        p2_score: parseFloat(row.p2_score) || 0,
+      });
+    }
+    await delay(40);
+  }
+  return allRows;
+}
+
+function parseJsonp(text) {
+  const s = text.trim()
+    .replace(/^[^(]+\(/, '').replace(/\);\s*$/, '').replace(/\)\s*$/, '');
+  return JSON.parse(s);
+}
+
+function findHeadToHeadGames(rows, playerAId, playerBId, candidate) {
+  const games = [];
+  for (const row of rows) {
+    const aIsP1 = String(row.p1_id) === String(playerAId);
+    const aIsP2 = String(row.p2_id) === String(playerAId);
+    const bIsP1 = String(row.p1_id) === String(playerBId);
+    const bIsP2 = String(row.p2_id) === String(playerBId);
+    if (!((aIsP1 && bIsP2) || (aIsP2 && bIsP1))) continue;
+    const raw = aIsP1 ? row.p1_result : row.p2_result;
+    games.push({
+      bout: row.bout,
+      result: raw == '1' ? 'win' : raw == '2' ? 'lose' : 'draw',
+      score: parseFloat(aIsP1 ? row.p1_score : row.p2_score) || 0,
+      opp_score: parseFloat(aIsP1 ? row.p2_score : row.p1_score) || 0,
+      playerA: {
+        id: String(playerAId),
+        name: candidate.player_a_name,
+        org: aIsP1 ? row.p1_org : row.p2_org,
+      },
+      playerB: {
+        id: String(playerBId),
+        name: candidate.player_b_name,
+        org: aIsP1 ? row.p2_org : row.p1_org,
+      },
+      group: {
+        group_id: String(candidate.group_id),
+        name: candidate.group_name || '',
+      },
+      event: {
+        event_id: String(candidate.event_id),
+        title: candidate.title,
+        date: (candidate.min_time || '').substring(0, 10),
+        province: candidate.provincename,
+        city: candidate.city_name,
+        organizer: candidate.cname,
+        detail_url: `${DETAIL_BASE}${candidate.event_id}.html#groupID=${candidate.group_id}`,
+      },
+    });
+  }
+  return games;
+}
 
 // ── /api/crawl/* ──────────────────────────────────────────────────────────────
 

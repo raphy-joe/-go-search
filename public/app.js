@@ -6,6 +6,11 @@ const nameInput       = document.getElementById('name');
 const provinceSelect  = document.getElementById('province');
 const searchBtn       = document.getElementById('searchBtn');
 const stopBtn         = document.getElementById('stopBtn');
+const h2hForm         = document.getElementById('h2hForm');
+const h2hPlayerAInput = document.getElementById('h2hPlayerA');
+const h2hPlayerBInput = document.getElementById('h2hPlayerB');
+const h2hBtn          = document.getElementById('h2hBtn');
+const h2hResult       = document.getElementById('h2hResult');
 const progressSection = document.getElementById('progressSection');
 const progressText    = document.getElementById('progressText');
 const progressCount   = document.getElementById('progressCount');
@@ -71,8 +76,92 @@ function getRecentTwoYearRange() {
   };
 }
 
+async function startHeadToHeadSearch(playerA = h2hPlayerAInput.value.trim(), playerB = h2hPlayerBInput.value.trim()) {
+  playerA = playerA.trim();
+  playerB = playerB.trim();
+  if (!playerA) { h2hPlayerAInput.focus(); return; }
+  if (!playerB) { h2hPlayerBInput.focus(); return; }
+  if (playerA === playerB) {
+    showHeadToHeadMessage('请输入两位不同棋手');
+    return;
+  }
+
+  h2hPlayerAInput.value = playerA;
+  h2hPlayerBInput.value = playerB;
+  const province = provinceSelect.value || '__ALL__';
+  const { dateFrom, dateTo } = getRecentTwoYearRange();
+
+  h2hBtn.disabled = true;
+  h2hResult.style.display = 'block';
+  h2hResult.innerHTML = '<div class="matches-loading">交手记录查询中…</div>';
+
+  try {
+    const params = new URLSearchParams({
+      playerA,
+      playerB,
+      province,
+      dateFrom,
+      dateTo,
+    });
+    const resp = await fetch(`/api/head-to-head?${params}`);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || '查询失败');
+    renderHeadToHeadResult(data);
+  } catch (err) {
+    showHeadToHeadMessage(`查询失败：${esc(err.message)}`);
+  } finally {
+    h2hBtn.disabled = false;
+  }
+}
+
+function showHeadToHeadMessage(msg) {
+  h2hResult.style.display = 'block';
+  h2hResult.innerHTML = `<div class="matches-empty">${msg}</div>`;
+}
+
+function renderHeadToHeadResult(data) {
+  const { summary, games, players } = data;
+  const winRate = summary.games ? Math.round(summary.winRate * 1000) / 10 : 0;
+  if (!summary.games) {
+    showHeadToHeadMessage(`未找到「${esc(players.a)}」与「${esc(players.b)}」近两年的交手记录；已检查 ${data.checkedGroups || 0} 个同组候选。`);
+    return;
+  }
+
+  const rows = games.map(g => {
+    const resultLabel = g.result === 'win'
+      ? '<span class="m-win">胜</span>'
+      : g.result === 'lose'
+      ? '<span class="m-lose">负</span>'
+      : '<span class="m-draw">和</span>';
+    const score = (g.score > 0 || g.opp_score > 0) ? `<span class="m-score">${g.score}:${g.opp_score}</span>` : '';
+    return `<tr>
+      <td>${esc(g.event.date || '')}</td>
+      <td><a class="h2h-event-link" href="${esc(g.event.detail_url)}" target="_blank">${esc(g.event.title)}</a><div class="opponent-org">${esc(g.group.name || '')}</div></td>
+      <td>第${g.bout}轮</td>
+      <td>${resultLabel} ${score}</td>
+      <td>${esc(g.playerA.org || '')}</td>
+      <td>${esc(g.playerB.org || '')}</td>
+    </tr>`;
+  }).join('');
+
+  h2hResult.style.display = 'block';
+  h2hResult.innerHTML = `
+    <div class="h2h-summary">
+      <span><b>${esc(players.a)}</b> 对 <b>${esc(players.b)}</b></span>
+      <span class="h2h-score">${summary.win}胜 ${summary.lose}负 ${summary.draw}和</span>
+      <span>胜率 ${winRate}%</span>
+      <span>同组候选 ${data.candidates || 0}，已检查 ${data.checkedGroups || 0}</span>
+      ${data.failedGroups ? `<span>${data.failedGroups} 组加载失败</span>` : ''}
+    </div>
+    <table class="h2h-table">
+      <thead><tr><th>日期</th><th>赛事</th><th>轮次</th><th>结果</th><th>${esc(players.a)}单位</th><th>${esc(players.b)}单位</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
 // ── Form submit ───────────────────────────────────────────────────────────────
 form.addEventListener('submit', e => { e.preventDefault(); startSearch(); });
+h2hForm.addEventListener('submit', e => { e.preventDefault(); startHeadToHeadSearch(); });
 stopBtn.addEventListener('click', () => {
   if (evtSource) { evtSource.close(); evtSource = null; }
   progressText.textContent = '已停止';
@@ -295,14 +384,26 @@ function buildCard(msg) {
           const oppLink = m.opponent
             ? `<a href="/?name=${encodeURIComponent(m.opponent)}&province=${encodeURIComponent(currentProvince)}" target="_blank" class="opp-link">${esc(m.opponent)}</a>`
             : '';
+          const h2hLink = m.opponent
+            ? `<button type="button" class="h2h-link" data-opponent="${esc(m.opponent)}">交手</button>`
+            : '';
           return `<tr>
             <td class="bout-num">第${m.bout}轮</td>
             <td>${resultLabel} ${scoreStr}</td>
-            <td class="opponent-name">${oppLink}</td>
+            <td class="opponent-name">${oppLink}${h2hLink}</td>
             <td class="opponent-org">${esc(m.opponent_org || '')}</td>
           </tr>`;
         }).join('');
         panel.innerHTML = `<table class="matches-table"><tbody>${rows}</tbody></table>`;
+        panel.querySelectorAll('.h2h-link').forEach(link => {
+          link.addEventListener('click', () => {
+            const playerA = nameInput.value.trim() || player.name;
+            const playerB = link.dataset.opponent || '';
+            h2hPlayerAInput.value = playerA;
+            h2hPlayerBInput.value = playerB;
+            startHeadToHeadSearch(playerA, playerB);
+          });
+        });
       } catch (e) {
         panel.innerHTML = `<div class="matches-empty">加载失败，<a href="${esc(event.detail_url)}" target="_blank">查看对阵表 →</a></div>`;
       }

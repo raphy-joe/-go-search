@@ -62,6 +62,23 @@
       </div>
     </form>
 
+    <form id="h2hForm" class="search-card h2h-card" autocomplete="on">
+      <div class="form-row">
+        <div class="form-group flex-2">
+          <label>棋手 A <span class="required">*</span></label>
+          <input id="h2hPlayerA" name="h2hPlayerA" type="text" placeholder="请输入精确姓名" required autocomplete="on">
+        </div>
+        <div class="form-group flex-2">
+          <label>棋手 B <span class="required">*</span></label>
+          <input id="h2hPlayerB" name="h2hPlayerB" type="text" placeholder="请输入精确姓名" required autocomplete="on">
+        </div>
+      </div>
+      <div class="form-actions">
+        <button type="submit" id="h2hBtn">查询交手记录</button>
+      </div>
+      <div id="h2hResult" class="h2h-result" style="display:none"></div>
+    </form>
+
     <!-- Progress section -->
     <div id="progressSection" style="display:none" class="progress-section">
       <div class="progress-header">

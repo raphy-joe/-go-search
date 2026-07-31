@@ -115,6 +115,34 @@ const initPromise = new Promise((res, rej) =>
       last_error         TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_indexed_events_error_event ON indexed_events (last_error, event_id);
+
+    CREATE TABLE IF NOT EXISTS group_match_cache (
+      group_id      TEXT NOT NULL DEFAULT '',
+      bout          INTEGER NOT NULL DEFAULT 0,
+      p1_id         TEXT NOT NULL DEFAULT '',
+      p2_id         TEXT NOT NULL DEFAULT '',
+      p1_name       TEXT NOT NULL DEFAULT '',
+      p2_name       TEXT NOT NULL DEFAULT '',
+      p1_org        TEXT NOT NULL DEFAULT '',
+      p2_org        TEXT NOT NULL DEFAULT '',
+      p1_result     TEXT NOT NULL DEFAULT '',
+      p2_result     TEXT NOT NULL DEFAULT '',
+      p1_score      REAL NOT NULL DEFAULT 0,
+      p2_score      REAL NOT NULL DEFAULT 0,
+      updated_at    INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (group_id, bout, p1_id, p2_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_group_match_cache_group ON group_match_cache (group_id, bout);
+    CREATE INDEX IF NOT EXISTS idx_group_match_cache_p1 ON group_match_cache (p1_name, p2_name);
+    CREATE INDEX IF NOT EXISTS idx_group_match_cache_p2 ON group_match_cache (p2_name, p1_name);
+
+    CREATE TABLE IF NOT EXISTS group_match_cache_status (
+      group_id      TEXT PRIMARY KEY,
+      rounds        INTEGER NOT NULL DEFAULT 0,
+      updated_at    INTEGER NOT NULL DEFAULT 0,
+      last_error    TEXT NOT NULL DEFAULT ''
+    );
   `, err => err ? rej(err) : res())
 );
 
@@ -234,6 +262,85 @@ async function queryParticipants({ name, province = '', dateFrom, dateTo }) {
   );
 }
 
+async function queryHeadToHeadCandidates({ playerA, playerB, province = '', dateFrom, dateTo, limit = 250 }) {
+  await initPromise;
+  const params = [playerA, playerB];
+  const conds = [
+    'p1.participant_name = ?',
+    'p2.participant_name = ?',
+    'p1.participant_id <> p2.participant_id',
+  ];
+
+  if (province) { conds.push('e.provincename = ?'); params.push(province); }
+  if (dateFrom) { conds.push('e.min_time >= ?'); params.push(dateFrom); }
+  if (dateTo) { conds.push('e.min_time <= ?'); params.push(dateTo); }
+
+  params.push(limit);
+
+  return all(
+    `SELECT
+       e.event_id, e.title, e.min_time, e.provincename, e.city_name, e.cname,
+       p1.group_id, p1.group_name,
+       p1.participant_id AS player_a_id, p1.participant_name AS player_a_name, p1.org AS player_a_org,
+       p2.participant_id AS player_b_id, p2.participant_name AS player_b_name, p2.org AS player_b_org,
+       (p1.win + p1.lose + p1.draw) AS player_a_rounds,
+       (p2.win + p2.lose + p2.draw) AS player_b_rounds
+     FROM participant_index p1
+     JOIN participant_index p2
+       ON p2.event_id = p1.event_id
+      AND p2.group_id = p1.group_id
+     JOIN events e ON e.event_id = p1.event_id
+     WHERE ${conds.join(' AND ')}
+     ORDER BY e.min_time DESC
+     LIMIT ?`,
+    params
+  );
+}
+
+async function getGroupMatchCache(group_id) {
+  await initPromise;
+  const [status, rows] = await Promise.all([
+    get(`SELECT group_id, rounds, updated_at, last_error FROM group_match_cache_status WHERE group_id = ?`, [String(group_id)]),
+    all(`SELECT * FROM group_match_cache WHERE group_id = ? ORDER BY bout ASC`, [String(group_id)]),
+  ]);
+  return { status: status || null, rows };
+}
+
+async function replaceGroupMatchCache({ group_id, rounds, rows, last_error = '', updated_at = Date.now() }) {
+  return withWriteLock(async () => {
+    await initPromise;
+    const sql = `
+      INSERT OR REPLACE INTO group_match_cache
+        (group_id, bout, p1_id, p2_id, p1_name, p2_name, p1_org, p2_org, p1_result, p2_result, p1_score, p2_score, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+    await run('BEGIN IMMEDIATE');
+    try {
+      await run('DELETE FROM group_match_cache WHERE group_id = ?', [String(group_id)]);
+      for (const r of rows) {
+        await run(sql, [
+          String(group_id), parseInt(r.bout) || 0,
+          String(r.p1_id || ''), String(r.p2_id || ''),
+          r.p1_name || '', r.p2_name || '', r.p1_org || '', r.p2_org || '',
+          String(r.p1_result ?? ''), String(r.p2_result ?? ''),
+          parseFloat(r.p1_score) || 0, parseFloat(r.p2_score) || 0,
+          updated_at,
+        ]);
+      }
+      await run(
+        `INSERT OR REPLACE INTO group_match_cache_status
+          (group_id, rounds, updated_at, last_error)
+         VALUES (?, ?, ?, ?)`,
+        [String(group_id), parseInt(rounds) || 0, updated_at, last_error || '']
+      );
+      await run('COMMIT');
+    } catch (err) {
+      await run('ROLLBACK');
+      throw err;
+    }
+  });
+}
+
 async function upsertIndexedEvent({ event_id, group_count = 0, participant_count = 0, last_error = '', indexed_at = Date.now() }) {
   return withWriteLock(async () => {
     await initPromise;
@@ -324,6 +431,9 @@ module.exports = {
   queryUnindexedEvents,
   getIndexCoverage,
   queryParticipants,
+  queryHeadToHeadCandidates,
+  getGroupMatchCache,
+  replaceGroupMatchCache,
   upsertIndexedEvent,
   upsertEventGroups,
   replaceParticipantsForEvent,
