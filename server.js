@@ -483,9 +483,19 @@ app.get('/api/crawl/status', async (_req, res) => {
 app.post('/api/crawl/start', express.json(), (req, res) => {
   if (getCrawlerState().running)
     return res.status(409).json({ error: '爬虫正在运行' });
-  const { eventType = '2', province = '' } = req.body || {};
-  runCrawl({ eventType, province }).catch(console.error);
-  res.json({ started: true });
+  const { eventType = '2', province = '', indexAfter = true } = req.body || {};
+  runCrawl({ eventType, province })
+    .then(() => {
+      const crawlState = getCrawlerState();
+      if (indexAfter === false || crawlState.stopRequested || crawlState.eventsStored === 0) return;
+      if (getIndexerState().running) {
+        console.log('[Crawler] Index backfill skipped because indexer is already running.');
+        return;
+      }
+      return runIndex({ province });
+    })
+    .catch(console.error);
+  res.json({ started: true, indexAfter: indexAfter !== false });
 });
 
 app.post('/api/crawl/stop', (_req, res) => {
