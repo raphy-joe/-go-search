@@ -12,9 +12,10 @@ const fetch  = require('node-fetch');
 const { upsertEvents, getStats } = require('./db');
 
 const EVENTS_API       = 'https://data-center.yunbisai.com/api/lswl-events';
-const PAGE_CONCURRENCY = 5;
-const PAGE_DELAY_MS    = 100;
-const TIMEOUT_MS       = 12000;
+const PAGE_CONCURRENCY = parseInt(process.env.CRAWL_PAGE_CONCURRENCY || '2', 10);
+const PAGE_DELAY_MS    = parseInt(process.env.CRAWL_PAGE_DELAY_MS || '350', 10);
+const TIMEOUT_MS       = parseInt(process.env.CRAWL_TIMEOUT_MS || '15000', 10);
+const PAGE_RETRIES     = parseInt(process.env.CRAWL_PAGE_RETRIES || '4', 10);
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
 const activeControllers = new Set();
@@ -26,6 +27,7 @@ let state = {
   pagesLoaded: 0,
   totalPages:  0,
   eventsStored: 0,
+  failedPages: [],
   lastError:  null,
   stopRequested: false,
 };
@@ -62,6 +64,26 @@ async function fetchPage(eventType, province, page) {
   }
 }
 
+async function fetchPageWithRetry(eventType, province, page) {
+  let lastErr;
+  for (let attempt = 0; attempt <= PAGE_RETRIES; attempt++) {
+    try {
+      return await fetchPage(eventType, province, page);
+    } catch (err) {
+      if (err.message === 'CRAWL_STOPPED' || err.name === 'AbortError') throw err;
+      lastErr = err;
+      const isRateLimited = /HTTP 429/.test(err.message);
+      const isRetryable = isRateLimited || /timeout|socket hang up|ECONNRESET|ETIMEDOUT/i.test(err.message);
+      if (!isRetryable || attempt === PAGE_RETRIES) break;
+      const backoff = (isRateLimited ? 2500 : 800) * Math.pow(1.8, attempt);
+      const jitter = Math.floor(Math.random() * 400);
+      console.warn(`[Crawler] page ${page} failed (${err.message}), retry ${attempt + 1}/${PAGE_RETRIES} after ${Math.round(backoff + jitter)}ms.`);
+      await delay(backoff + jitter);
+    }
+  }
+  throw lastErr;
+}
+
 // ── 主入口 ────────────────────────────────────────────────────────────────────
 async function runCrawl({ eventType = '2', province = '' } = {}) {
   if (state.running) { console.log('[Crawler] Already running.'); return; }
@@ -72,6 +94,7 @@ async function runCrawl({ eventType = '2', province = '' } = {}) {
     pagesLoaded: 0,
     totalPages: 0,
     eventsStored: 0,
+    failedPages: [],
     lastError: null,
     stopRequested: false,
   };
@@ -79,7 +102,7 @@ async function runCrawl({ eventType = '2', province = '' } = {}) {
 
   try {
     // 第 1 页：获取总页数
-    const first = await fetchPage(eventType, province, 1);
+    const first = await fetchPageWithRetry(eventType, province, 1);
     state.totalPages  = first.TotalPage || 1;
     state.pagesLoaded = 1;
     const allRows = [...(first.rows || [])];
@@ -89,16 +112,27 @@ async function runCrawl({ eventType = '2', province = '' } = {}) {
     while (remaining.length) {
       throwIfStopped();
       const batch = remaining.splice(0, PAGE_CONCURRENCY);
-      const pages = await Promise.all(batch.map(p => fetchPage(eventType, province, p)));
+      const pages = await Promise.all(batch.map(async page => {
+        try {
+          return { page, data: await fetchPageWithRetry(eventType, province, page) };
+        } catch (err) {
+          if (err.message === 'CRAWL_STOPPED' || err.name === 'AbortError') throw err;
+          state.failedPages.push({ page, error: err.message });
+          state.lastError = `page ${page}: ${err.message}`;
+          console.warn(`[Crawler] page ${page} skipped after retries: ${err.message}`);
+          return { page, data: null };
+        }
+      }));
       throwIfStopped();
-      for (const pg of pages) {
-        allRows.push(...(pg.rows || []));
+      for (const pg of pages.filter(p => p.data)) {
+        allRows.push(...(pg.data.rows || []));
         state.pagesLoaded++;
       }
       await delay(PAGE_DELAY_MS);
     }
 
-    console.log(`[Crawler] ${allRows.length} events fetched, saving to DB...`);
+    const failedCount = state.failedPages.length;
+    console.log(`[Crawler] ${allRows.length} events fetched${failedCount ? ` (${failedCount} pages failed)` : ''}, saving to DB...`);
 
     // 持久化
     throwIfStopped();
@@ -116,6 +150,10 @@ async function runCrawl({ eventType = '2', province = '' } = {}) {
 
     state.eventsStored = allRows.length;
     const stats = await getStats();
+    if (failedCount) {
+      const sample = state.failedPages.slice(0, 12).map(p => `${p.page}:${p.error}`).join(', ');
+      console.warn(`[Crawler] Done with ${failedCount} failed pages. Sample: ${sample}`);
+    }
     console.log(`[Crawler] Done. DB now has ${stats.eventCount} events.`);
 
   } catch (err) {
