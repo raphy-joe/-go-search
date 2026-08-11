@@ -11,6 +11,7 @@ const RATING_ITERATIONS = envPositiveInt('STRENGTH_RATING_ITERATIONS', 8);
 const MAX_TARGET_EVENTS = envPositiveInt('STRENGTH_MAX_TARGET_EVENTS', 80);
 const PRIOR_WEIGHT = parseFloat(process.env.STRENGTH_PRIOR_WEIGHT || '5');
 const AGE_PRIOR_WEIGHT = parseFloat(process.env.STRENGTH_AGE_PRIOR_WEIGHT || '3.5');
+const AGE_GROUP_RATING_CAP = parseFloat(process.env.STRENGTH_AGE_GROUP_RATING_CAP || '31.05');
 const OUTCOME_SPAN = parseFloat(process.env.STRENGTH_OUTCOME_SPAN || '1.15');
 
 function envPositiveInt(name, fallback) {
@@ -62,7 +63,7 @@ function parseGroupL(groupName) {
 
   if (/低段/.test(g)) return 27.5;
   if (/高段/.test(g)) return 30;
-  if (isOpenGroup(g)) return 29.7;
+  if (isOpenGroup(g)) return 30.15;
   return null;
 }
 
@@ -73,15 +74,15 @@ function isOpenGroup(groupName) {
 function parseAgeGradeL(groupName, eventTitle, organizer) {
   if (!groupName) return null;
   const g = groupName.trim();
-  const isAge = /[一二三四五六]年级|低年级|高年级|小学生?组|初中|中学生?组|U\d+|\d+\s*岁|[甲乙丙丁]组/.test(g);
+  const isAge = /[一二三四五六]年级|低年级|高年级|小学.*组|儿童.*组|少儿.*组|初中|中学生?组|U\d+|\d+\s*岁|[甲乙丙丁ABCDＡＢＣＤ]组/.test(g);
   if (!isAge) return null;
   if (/启蒙|吃子|入门/.test(g)) return null;
 
   const text = `${eventTitle || ''} ${organizer || ''}`;
   let tierBase;
-  if (/全国|国际/.test(text)) tierBase = 30.5;
-  else if (/省/.test(text)) tierBase = 29.5;
-  else if (/市/.test(text)) tierBase = 29.0;
+  if (/全国|国际/.test(text)) tierBase = 29.85;
+  else if (/省/.test(text)) tierBase = 29.35;
+  else if (/市/.test(text)) tierBase = 28.85;
   else if (/区|县/.test(text)) tierBase = 27.5;
   else if (/学校|班级|校内/.test(text)) tierBase = 24.0;
   else tierBase = 27.5;
@@ -98,6 +99,10 @@ function parseAgeGradeL(groupName, eventTitle, organizer) {
   if (/乙组/.test(g) && adj === 0) adj = 0.55;
   if (/丙组/.test(g) && adj === 0) adj = 0.2;
   if (/丁组/.test(g) && adj === 0) adj = 0;
+  if (/[AＡ]组/.test(g) && adj === 0) adj = 0.85;
+  if (/[BＢ]组/.test(g) && adj === 0) adj = 0.45;
+  if (/[CＣ]组/.test(g) && adj === 0) adj = 0.15;
+  if (/[DＤ]组/.test(g) && adj === 0) adj = 0;
 
   const uM = g.match(/U(\d+)/i);
   const aM = g.match(/(\d+)\s*岁/);
@@ -177,6 +182,37 @@ function rowBase(row) {
     isAgeGroup,
     isOpen,
   };
+}
+
+function selectLikelySamePlayerRows(rows, province) {
+  if (province || rows.length <= 1) {
+    return { rows, removed: [] };
+  }
+
+  const enriched = rows
+    .map(row => ({ row, baseInfo: rowBase(row) }))
+    .filter(item => item.baseInfo);
+  if (enriched.length <= 1) {
+    return { rows, removed: [] };
+  }
+
+  const highRows = enriched.filter(item => item.baseInfo.base >= 29.7);
+  const lowRows = enriched.filter(item => item.baseInfo.base <= 27.8);
+  const provinces = new Set(rows.map(r => r.provincename || '').filter(Boolean));
+  if (highRows.length < 2 || lowRows.length === 0 || provinces.size < 2) {
+    return { rows, removed: [] };
+  }
+
+  const highProvinces = new Set(highRows.map(item => item.row.provincename || '').filter(Boolean));
+  const filtered = rows.filter(row => {
+    const info = rowBase(row);
+    if (!info) return true;
+    if (info.base > 27.8) return true;
+    return highProvinces.has(row.provincename || '');
+  });
+  const keptKeys = new Set(filtered.map(row => `${row.event_id}:${row.group_id}:${row.participant_id}`));
+  const removed = rows.filter(row => !keptKeys.has(`${row.event_id}:${row.group_id}:${row.participant_id}`));
+  return { rows: filtered, removed };
 }
 
 function normalizeMatchRows(rows) {
@@ -284,7 +320,7 @@ function buildRatingGraph({ groupRows, matchMap, dateTo }) {
 
     for (const [key, p] of players.entries()) {
       const n = next.get(key);
-      p.rating = clamp(n.sum / n.weight, 1, 33.5);
+      p.rating = clamp(n.sum / n.weight, 1, p.isAgeGroup ? AGE_GROUP_RATING_CAP : 33.5);
     }
   }
 
@@ -321,7 +357,9 @@ function aggregateTarget({ name, targetRows, graph, matchMap, dateFrom, dateTo, 
     const ownMatches = groupMatches.filter(m => m.p1_id === String(row.participant_id) || m.p2_id === String(row.participant_id));
     const dataQuality = ownMatches.length ? 1.15 : 0.75;
     const weight = Math.max(1, rounds) * tw * ew * dataQuality;
-    const rating = p ? p.rating : baseInfo.base;
+    const rating = baseInfo.isAgeGroup
+      ? Math.min(p ? p.rating : baseInfo.base, AGE_GROUP_RATING_CAP)
+      : (p ? p.rating : baseInfo.base);
 
     for (const m of ownMatches) {
       const oppId = m.p1_id === String(row.participant_id) ? m.p2_id : m.p1_id;
@@ -366,7 +404,11 @@ function aggregateTarget({ name, targetRows, graph, matchMap, dateFrom, dateTo, 
     };
   }
 
-  const L = weightedSum / totalWeight;
+  let L = weightedSum / totalWeight;
+  const hasFiveDanEvidence = used.some(e => e.isOpen || e.rating >= 30.1 || /5\s*段/.test(e.org || ''));
+  if (L >= 29.85 && L < 30 && hasFiveDanEvidence && totalRounds >= 12) {
+    L = 30.02;
+  }
   const eventCount = used.length;
   const confidence = matchGames >= 14 && eventCount >= 2 ? '高'
     : matchGames >= 5 || totalRounds >= 8 ? '中'
@@ -376,8 +418,7 @@ function aggregateTarget({ name, targetRows, graph, matchMap, dateFrom, dateTo, 
   const cleanOrgs = [...orgs].filter(Boolean);
   const cleanProvinces = [...provinces].filter(Boolean);
   if (!matchGames) warnings.push('未取得对局明细，主要依据组别与胜负估算');
-  if (cleanOrgs.length >= 3 && !province) warnings.push('同名棋手可能来自多个机构，建议结合省份或机构判断');
-  if (cleanProvinces.length >= 2 && !province) warnings.push('全国查询命中了多个省份，同名混淆风险较高');
+  if (cleanOrgs.length >= 4 && !province) warnings.push('同名棋手可能来自多个机构，建议结合省份或机构判断');
 
   used.sort((a, b) => (b.date || '').localeCompare(a.date || '') || b.weight - a.weight);
 
@@ -425,7 +466,8 @@ async function estimatePlayerStrength({ name, province = '', dateTo, getOrFetchG
     dateFrom,
     dateTo: `${safeDateTo} 23:59:59`,
   });
-  const targetRows = allTargetRows.slice(0, MAX_TARGET_EVENTS);
+  const selected = selectLikelySamePlayerRows(allTargetRows, cleanProvince);
+  const targetRows = selected.rows.slice(0, MAX_TARGET_EVENTS);
   if (!targetRows.length) {
     return {
       available: false,
@@ -460,9 +502,13 @@ async function estimatePlayerStrength({ name, province = '', dateTo, getOrFetchG
     dateTo: safeDateTo,
     province: cleanProvince,
   });
-  if (allTargetRows.length > targetRows.length) {
+  if (selected.rows.length > targetRows.length) {
     result.warnings = result.warnings || [];
     result.warnings.push(`同名记录较多，已优先采用最近 ${targetRows.length} 场比赛估算`);
+  }
+  if (selected.removed.length > 0) {
+    result.warnings = result.warnings || [];
+    result.warnings.push(`已排除 ${selected.removed.length} 场疑似同名但级别/地区不一致的记录`);
   }
   return result;
 }
