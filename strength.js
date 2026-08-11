@@ -161,6 +161,36 @@ function recordScore(record) {
   return total ? ((record.win || 0) + 0.5 * (record.draw || 0)) / total : 0;
 }
 
+function isFiveDanGroupName(value) {
+  return /5\s*段/.test(String(value || ''));
+}
+
+function eliteYouthPromotion(used, totalRounds, currentL) {
+  const ageEvents = used.filter(e => e.isAgeGroup);
+  const skillEvents = used.filter(e => !e.isAgeGroup);
+  const strongAgeEvents = ageEvents.filter(e => recordScore(e.record) >= 0.75 && recordRounds(e.record) >= 7);
+  if (totalRounds < 20 || strongAgeEvents.length < 2) return currentL;
+
+  const hasNegativeSkillEvidence = skillEvents.some(e => recordScore(e.record) < 0.5);
+  if (hasNegativeSkillEvidence) return currentL;
+
+  const hasFiveDanProof = skillEvents.some(e => {
+    return isFiveDanGroupName(e.group) && recordScore(e.record) >= 0.5 && recordRounds(e.record) >= 5;
+  });
+  const canPromoteBySkill = hasFiveDanProof && strongAgeEvents.length >= 2;
+  const canPromoteByAgeOnly = skillEvents.length === 0 && strongAgeEvents.length >= 3;
+  if (!canPromoteBySkill && !canPromoteByAgeOnly) return currentL;
+
+  const strongRounds = strongAgeEvents.reduce((sum, e) => sum + recordRounds(e.record), 0);
+  const strongScore = strongAgeEvents.reduce((sum, e) => {
+    return sum + recordScore(e.record) * recordRounds(e.record);
+  }, 0) / strongRounds;
+  const bonusBase = canPromoteBySkill ? 0.28 : 0.43;
+  const bonus = bonusBase + clamp(strongScore - 0.75, 0, 0.18);
+  const cap = canPromoteBySkill ? 31.18 : 31.12;
+  return Math.max(currentL, Math.min(cap, currentL + bonus));
+}
+
 function rowBase(row) {
   const skillL = parseGroupL(row.group_name);
   const ageL = skillL === null ? parseAgeGradeL(row.group_name, row.title, row.cname) : null;
@@ -428,6 +458,7 @@ function aggregateTarget({ name, targetRows, graph, matchMap, dateFrom, dateTo, 
   }
 
   let L = weightedSum / totalWeight;
+  L = eliteYouthPromotion(used, totalRounds, L);
   const hasFiveDanEvidence = used.some(e => e.isOpen || e.rating >= 30.1 || /5\s*段/.test(e.org || ''));
   if (L >= 29.85 && L < 30 && hasFiveDanEvidence && totalRounds >= 12) {
     L = 30.02;
