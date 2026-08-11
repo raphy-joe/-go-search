@@ -156,6 +156,11 @@ function recordRounds(row) {
   return (parseInt(row.win, 10) || 0) + (parseInt(row.lose, 10) || 0) + (parseInt(row.draw, 10) || 0);
 }
 
+function recordScore(record) {
+  const total = (record.win || 0) + (record.lose || 0) + (record.draw || 0);
+  return total ? ((record.win || 0) + 0.5 * (record.draw || 0)) / total : 0;
+}
+
 function rowBase(row) {
   const skillL = parseGroupL(row.group_name);
   const ageL = skillL === null ? parseAgeGradeL(row.group_name, row.title, row.cname) : null;
@@ -328,7 +333,6 @@ function buildRatingGraph({ groupRows, matchMap, dateTo }) {
 }
 
 function aggregateTarget({ name, targetRows, graph, matchMap, dateFrom, dateTo, province }) {
-  const targetKeys = new Set(targetRows.map(rowKey));
   const used = [];
   let totalWeight = 0;
   let weightedSum = 0;
@@ -369,8 +373,6 @@ function aggregateTarget({ name, targetRows, graph, matchMap, dateFrom, dateTo, 
 
     matchGames += ownMatches.length;
     totalRounds += rounds;
-    totalWeight += weight;
-    weightedSum += rating * weight;
     used.push({
       event_id: String(row.event_id),
       title: row.title,
@@ -394,7 +396,7 @@ function aggregateTarget({ name, targetRows, graph, matchMap, dateFrom, dateTo, 
     });
   }
 
-  if (totalWeight === 0) {
+  if (used.length === 0) {
     return {
       available: false,
       reason: '近180天内缺少可用棋力样本',
@@ -402,6 +404,27 @@ function aggregateTarget({ name, targetRows, graph, matchMap, dateFrom, dateTo, 
       scope: { province: province || '__ALL__', dateFrom, dateTo },
       groups: [...groups].filter(Boolean),
     };
+  }
+
+  const skillAnchorEvents = used.filter(e => !e.isAgeGroup);
+  let skillAnchor = null;
+  if (skillAnchorEvents.length > 0) {
+    const skillWeight = skillAnchorEvents.reduce((sum, e) => sum + e.weight, 0);
+    if (skillWeight > 0) {
+      skillAnchor = skillAnchorEvents.reduce((sum, e) => sum + e.rating * e.weight, 0) / skillWeight;
+    }
+  }
+
+  if (skillAnchor !== null) {
+    for (const e of used) {
+      if (!e.isAgeGroup || recordScore(e.record) < 0.5) continue;
+      e.rating = Math.max(e.rating, Math.min(AGE_GROUP_RATING_CAP, skillAnchor - 0.05));
+    }
+  }
+
+  for (const e of used) {
+    totalWeight += e.weight;
+    weightedSum += e.rating * e.weight;
   }
 
   let L = weightedSum / totalWeight;
