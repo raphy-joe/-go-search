@@ -60,6 +60,9 @@ const NEEDS_INDEX_COND = `(
   OR ie.last_error LIKE '%database is locked%'
   OR ie.last_error LIKE '%cannot start a transaction%'
   OR ie.last_error LIKE '%timeout%'
+  OR ie.last_error LIKE '%socket hang up%'
+  OR ie.last_error LIKE '%ECONNRESET%'
+  OR ie.last_error LIKE '%ETIMEDOUT%'
   OR ie.last_error LIKE 'HTTP %'
 )`;
 
