@@ -41,8 +41,21 @@ function withWriteLock(fn) {
   return next;
 }
 
-const RETRYABLE_INDEX_COND = `(
+function envNonNegativeInt(name, fallback) {
+  const value = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+const INDEX_REFRESH_PAST_DAYS = envNonNegativeInt('INDEX_REFRESH_PAST_DAYS', 45);
+const INDEX_REFRESH_FUTURE_DAYS = envNonNegativeInt('INDEX_REFRESH_FUTURE_DAYS', 14);
+const RECENT_EVENT_REFRESH_COND = `(
+  e.updated_at > COALESCE(ie.indexed_at, 0)
+  AND date(e.min_time) BETWEEN date('now', '-${INDEX_REFRESH_PAST_DAYS} days') AND date('now', '+${INDEX_REFRESH_FUTURE_DAYS} days')
+)`;
+
+const NEEDS_INDEX_COND = `(
   ie.event_id IS NULL
+  OR ${RECENT_EVENT_REFRESH_COND}
   OR ie.last_error LIKE 'SQLITE_%'
   OR ie.last_error LIKE '%database is locked%'
   OR ie.last_error LIKE '%cannot start a transaction%'
@@ -202,7 +215,7 @@ async function queryEventsForIndex({ province = '', dateFrom, dateTo, force = fa
   if (province) { conds.push('e.provincename = ?'); params.push(province); }
   if (dateFrom) { conds.push('e.min_time >= ?');     params.push(dateFrom); }
   if (dateTo)   { conds.push('e.min_time <= ?');     params.push(dateTo); }
-  if (!force) conds.push(RETRYABLE_INDEX_COND);
+  if (!force) conds.push(NEEDS_INDEX_COND);
 
   const limitClause = limit ? ' LIMIT ?' : '';
   if (limit) params.push(limit);
@@ -232,8 +245,8 @@ async function getIndexCoverage({ province = '', dateFrom, dateTo }) {
   return get(
     `SELECT
        COUNT(*) AS eventCount,
-       SUM(CASE WHEN ${RETRYABLE_INDEX_COND} THEN 0 ELSE 1 END) AS indexedEventCount,
-       SUM(CASE WHEN ${RETRYABLE_INDEX_COND} THEN 1 ELSE 0 END) AS unindexedEventCount
+       SUM(CASE WHEN ${NEEDS_INDEX_COND} THEN 0 ELSE 1 END) AS indexedEventCount,
+       SUM(CASE WHEN ${NEEDS_INDEX_COND} THEN 1 ELSE 0 END) AS unindexedEventCount
      FROM events e
      LEFT JOIN indexed_events ie ON ie.event_id = e.event_id
      WHERE ${conds.join(' AND ')}`,
