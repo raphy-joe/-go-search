@@ -84,18 +84,24 @@ input:focus, select:focus {
   display: flex;
   gap: 10px;
   margin-top: 4px;
+  flex-wrap: wrap;
 }
 
-button[type=submit], .btn-stop {
+button[type=submit], .btn-stop, .btn-secondary {
   padding: 10px 28px;
-  border: none;
   border-radius: 8px;
   font-size: 1rem;
   font-weight: 600;
   cursor: pointer;
   transition: opacity .2s, transform .1s;
+  font-family: inherit;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 button[type=submit] {
+  border: none;
   background: #4f6ef7;
   color: #fff;
 }
@@ -108,6 +114,13 @@ button[type=submit]:disabled { opacity: .5; cursor: not-allowed; transform: none
   border: 1.5px solid #e53e3e;
 }
 .btn-stop:hover { background: #fff5f5; }
+
+.btn-secondary {
+  background: #fff;
+  color: #4f6ef7;
+  border: 1.5px solid #c5d0fa;
+}
+.btn-secondary:hover { background: #eef1fd; transform: translateY(-1px); }
 
 /* ── Progress ────────────────────────────────────────────────────────────── */
 .progress-section {
@@ -323,6 +336,7 @@ button[type=submit]:disabled { opacity: .5; cursor: not-allowed; transform: none
   font-size: .8rem;
   cursor: pointer;
   font-family: inherit;
+  text-decoration: none;
 }
 .h2h-clear:hover { background: #f9fafc; color: #1a2332; }
 .h2h-result {

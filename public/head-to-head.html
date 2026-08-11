@@ -3,27 +3,36 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>云比赛 · 选手历史查询</title>
+  <title>云比赛 · 棋手交手记录</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <div class="container">
     <header>
-      <h1>云比赛 · 选手历史查询</h1>
-      <p class="subtitle">查询选手近两年的围棋比赛记录</p>
+      <h1>棋手交手记录</h1>
+      <p class="subtitle">查询两位棋手近两年的同组直接对局</p>
     </header>
 
-    <form id="searchForm" class="search-card" autocomplete="on">
+    <form id="h2hForm" class="search-card h2h-card" autocomplete="on">
+      <div class="h2h-heading">
+        <div class="h2h-title">交手查询</div>
+        <a href="index.html" class="h2h-clear">返回首页</a>
+      </div>
       <div class="form-row">
         <div class="form-group flex-2">
-          <label>选手姓名 <span class="required">*</span></label>
-          <input id="name" name="playerName" type="text" placeholder="请输入精确姓名（如：张三）" required autocomplete="on">
+          <label>棋手 A <span class="required">*</span></label>
+          <input id="h2hPlayerA" name="h2hPlayerA" type="text" placeholder="请输入精确姓名" required autocomplete="on">
         </div>
         <div class="form-group flex-2">
-          <label>省份 <span class="required">*</span></label>
-          <select id="province" required>
-            <option value="" disabled selected>请选择省份</option>
-            <option value="__ALL__">🌏 全国（所有省份）</option>
+          <label>棋手 B <span class="required">*</span></label>
+          <input id="h2hPlayerB" name="h2hPlayerB" type="text" placeholder="请输入精确姓名" required autocomplete="on">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group flex-2">
+          <label>查询范围 <span class="required">*</span></label>
+          <select id="h2hProvince" required>
+            <option value="__ALL__" selected>全国（所有省份）</option>
             <option value="浙江省">浙江省</option>
             <option value="广东省">广东省</option>
             <option value="江苏省">江苏省</option>
@@ -57,33 +66,13 @@
         </div>
       </div>
       <div class="form-actions">
-        <button type="submit" id="searchBtn">查询近两年记录</button>
-        <button type="button" id="stopBtn" class="btn-stop" style="display:none">停止</button>
-        <a href="head-to-head.html" class="btn-secondary">棋手交手记录</a>
+        <button type="submit" id="h2hBtn">查询交手记录</button>
+        <button type="button" id="h2hClearBtn" class="btn-secondary">清空</button>
       </div>
+      <div id="h2hResult" class="h2h-result" style="display:none"></div>
     </form>
-
-    <!-- Progress section -->
-    <div id="progressSection" style="display:none" class="progress-section">
-      <div class="progress-header">
-        <span id="progressText">准备中...</span>
-        <span id="progressCount"></span>
-      </div>
-      <div class="progress-bar-wrap">
-        <div id="progressBar" class="progress-bar"></div>
-      </div>
-    </div>
-
-    <!-- Results section -->
-    <div id="resultsSection" style="display:none">
-      <div class="results-header">
-        <h2 id="resultsTitle">查询结果</h2>
-        <span id="resultCount" class="badge">0</span>
-      </div>
-      <div id="resultsList"></div>
-    </div>
   </div>
 
-  <script src="app.js"></script>
+  <script src="h2h.js"></script>
 </body>
 </html>

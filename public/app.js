@@ -77,7 +77,19 @@ function getRecentTwoYearRange() {
   };
 }
 
-async function startHeadToHeadSearch(playerA = h2hPlayerAInput.value.trim(), playerB = h2hPlayerBInput.value.trim(), options = {}) {
+function openHeadToHeadPage(playerA = '', playerB = '') {
+  const province = currentProvince || provinceSelect?.value || '__ALL__';
+  const params = new URLSearchParams({ playerA, playerB, province });
+  window.open(`/head-to-head.html?${params}`, '_blank');
+}
+
+async function startHeadToHeadSearch(playerA = '', playerB = '', options = {}) {
+  if (!h2hForm) {
+    openHeadToHeadPage(playerA, playerB);
+    return;
+  }
+  if (!playerA) playerA = h2hPlayerAInput.value.trim();
+  if (!playerB) playerB = h2hPlayerBInput.value.trim();
   playerA = playerA.trim();
   playerB = playerB.trim();
   const shouldFocusPanel = Boolean(options.focusPanel);
@@ -117,6 +129,7 @@ async function startHeadToHeadSearch(playerA = h2hPlayerAInput.value.trim(), pla
 }
 
 function clearHeadToHeadResult({ clearPlayers = false } = {}) {
+  if (!h2hForm || !h2hResult) return;
   if (clearPlayers) {
     h2hPlayerAInput.value = '';
     h2hPlayerBInput.value = '';
@@ -127,6 +140,7 @@ function clearHeadToHeadResult({ clearPlayers = false } = {}) {
 }
 
 function focusHeadToHeadPanel() {
+  if (!h2hForm) return;
   h2hForm.classList.remove('h2h-card--flash');
   void h2hForm.offsetWidth;
   h2hForm.classList.add('h2h-card--flash');
@@ -134,6 +148,7 @@ function focusHeadToHeadPanel() {
 }
 
 function showHeadToHeadLoading(playerA, playerB) {
+  if (!h2hResult) return;
   h2hResult.style.display = 'block';
   h2hResult.innerHTML = `
     <div class="h2h-context">正在查询「${esc(playerA)}」与「${esc(playerB)}」的交手记录</div>
@@ -141,6 +156,7 @@ function showHeadToHeadLoading(playerA, playerB) {
 }
 
 function showHeadToHeadMessage(msg) {
+  if (!h2hResult) return;
   h2hResult.style.display = 'block';
   h2hResult.innerHTML = `<div class="matches-empty">${msg}</div>`;
 }
@@ -187,8 +203,8 @@ function renderHeadToHeadResult(data) {
 
 // ── Form submit ───────────────────────────────────────────────────────────────
 form.addEventListener('submit', e => { e.preventDefault(); startSearch(); });
-h2hForm.addEventListener('submit', e => { e.preventDefault(); startHeadToHeadSearch(); });
-h2hClearBtn.addEventListener('click', () => clearHeadToHeadResult({ clearPlayers: true }));
+if (h2hForm) h2hForm.addEventListener('submit', e => { e.preventDefault(); startHeadToHeadSearch(); });
+if (h2hClearBtn) h2hClearBtn.addEventListener('click', () => clearHeadToHeadResult({ clearPlayers: true }));
 stopBtn.addEventListener('click', () => {
   if (evtSource) { evtSource.close(); evtSource = null; }
   progressText.textContent = '已停止';
@@ -427,9 +443,7 @@ function buildCard(msg) {
           link.addEventListener('click', () => {
             const playerA = nameInput.value.trim() || player.name;
             const playerB = link.dataset.opponent || '';
-            h2hPlayerAInput.value = playerA;
-            h2hPlayerBInput.value = playerB;
-            startHeadToHeadSearch(playerA, playerB, { focusPanel: true });
+            openHeadToHeadPage(playerA, playerB);
           });
         });
       } catch (e) {
