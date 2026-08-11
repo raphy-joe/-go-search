@@ -807,6 +807,77 @@ function renderCurrentBasicStrength(seq, playerName) {
   }
 }
 
+async function fetchBackendStrength(playerName) {
+  const { dateTo } = getRecentTwoYearRange();
+  const params = new URLSearchParams({
+    name: playerName,
+    province: currentProvince || provinceSelect.value || '__ALL__',
+    dateTo,
+  });
+  const resp = await fetch(`/api/strength?${params}`);
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(data.error || 'strength estimate failed');
+  return data;
+}
+
+function renderBackendStrengthCard(result) {
+  clearStrengthCard();
+
+  if (!result?.available) {
+    const card = document.createElement('div');
+    card.id = 'strengthCard';
+    card.className = 'strength-card strength-card--unknown';
+    const groups = (result?.groups || []).filter(Boolean);
+    card.innerHTML = `
+      <div class="strength-header">
+        <div class="strength-label strength-label--unknown">棋力待估</div>
+        <div class="strength-meta">${esc(result?.reason || '近180天内缺少可用棋力样本')}</div>
+      </div>
+      ${groups.length ? `<div class="strength-note">识别到的组别：${groups.map(g => `<b>${esc(g)}</b>`).join('、')}</div>` : ''}`;
+    resultsList.before(card);
+    return;
+  }
+
+  const confColor = result.confidence === '高' ? '#2e7d32' : result.confidence === '中' ? '#e65100' : '#c62828';
+  const basisItems = (result.events || []).slice(0, 5).map(e => {
+    const record = e.record || {};
+    const diff = (Number(e.rating || 0) - Number(e.base || 0));
+    const diffStr = `${diff >= 0 ? '+' : ''}${diff.toFixed(2)}`;
+    const title = (e.title || '').length > 24 ? e.title.slice(0, 24) + '…' : e.title;
+    const tags = [
+      e.matchGames ? `<span class="tag-match">对局${e.matchGames}盘</span>` : '',
+      e.isAgeGroup ? '<span class="tag-age">年龄组</span>' : '',
+      e.isOpen ? '<span class="tag-opp">公开组</span>' : '',
+    ].filter(Boolean).join(' ');
+    return `<li><b>${esc(title)}</b> · ${esc(e.group || '?')} · ${record.win || 0}胜${record.lose || 0}负${record.draw ? record.draw + '和' : ''} → <b>L=${Number(e.rating || 0).toFixed(2)}</b>（组别先验${Number(e.base || 0).toFixed(2)}，对手图谱修正${diffStr}）${tags ? ' ' + tags : ''}</li>`;
+  }).join('');
+
+  const range = result.range || {};
+  const stats = result.stats || {};
+  const warnings = (result.warnings || []).map(w => `<div class="strength-note">${esc(w)}</div>`).join('');
+  const graphNote = stats.matchGames
+    ? `<div class="strength-note strength-note--good">已纳入 ${stats.matchGames} 盘对局、${stats.opponents || 0} 位对手，并在 ${stats.graphPlayers || 0} 名同组棋手图谱中迭代评估。</div>`
+    : '<div class="strength-note">暂未取得对局明细，当前为后端组别/胜负模型估算。</div>';
+
+  const card = document.createElement('div');
+  card.id = 'strengthCard';
+  card.className = 'strength-card';
+  card.innerHTML = `
+    <div class="strength-header">
+      <div class="strength-label">${esc(result.label || '棋力待估')}</div>
+      <div class="strength-meta">
+        L值 <b>${Number(result.L || 0).toFixed(2)}</b>
+        &nbsp;·&nbsp; 范围 <b>${esc(range.lowLabel || '')} - ${esc(range.highLabel || '')}</b>
+        &nbsp;·&nbsp; 置信度 <span style="color:${confColor};font-weight:700">${esc(result.confidence || '低')}</span>
+        &nbsp;·&nbsp; 依据 ${stats.events || 0} 场赛事 / ${stats.rounds || 0} 轮
+      </div>
+    </div>
+    <ul class="strength-basis">${basisItems}</ul>
+    ${graphNote}${warnings}`;
+
+  resultsList.before(card);
+}
+
 async function showStrengthEstimate(hits, seq, playerName) {
   if (seq !== searchSeq) return;
   const evalVersion = ++strengthEvalVersion;
@@ -820,6 +891,21 @@ async function showStrengthEstimate(hits, seq, playerName) {
   const basicResult = estimateStrength(hits, null);
   if (seq !== searchSeq || evalVersion !== strengthEvalVersion) return;
   renderStrengthCard(basicResult, hits, allGroups, hasRecent, '（正在加载对局数据…）');
+
+  try {
+    const backendResult = await fetchBackendStrength(playerName);
+    if (seq !== searchSeq || evalVersion !== strengthEvalVersion) return;
+    renderBackendStrengthCard(backendResult);
+    if (backendResult?.available) {
+      playerStrengthCache.set(
+        playerName,
+        { L: backendResult.L, confidence: backendResult.confidence }
+      );
+      return;
+    }
+  } catch (_) {
+    // Keep the previous browser-side estimator as a fallback.
+  }
 
   // Phase 2: fetch all match data in parallel, re-render enhanced estimate
   const matchMap = await fetchAllMatchData(hits);

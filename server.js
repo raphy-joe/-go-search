@@ -17,6 +17,7 @@ const {
 } = require('./db');
 const { runCrawl, stopCrawl, getState: getCrawlerState } = require('./crawler');
 const { runIndex, stopIndex, getState: getIndexerState } = require('./indexer');
+const { estimatePlayerStrength } = require('./strength');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -337,6 +338,27 @@ app.get('/api/head-to-head', async (req, res) => {
       games,
     });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/strength', async (req, res) => {
+  const name = String(req.query.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'missing player name' });
+
+  const province = req.query.province === '__ALL__' ? '' : String(req.query.province || '');
+  const dateTo = req.query.dateTo || undefined;
+
+  try {
+    const result = await estimatePlayerStrength({
+      name,
+      province,
+      dateTo,
+      getOrFetchGroupMatches,
+    });
+    res.json(result);
+  } catch (err) {
+    console.warn(`[Strength] ${name} failed: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
 });

@@ -278,6 +278,24 @@ async function queryParticipants({ name, province = '', dateFrom, dateTo }) {
   );
 }
 
+async function queryParticipantsForGroups(groupIds) {
+  await initPromise;
+  const ids = [...new Set((groupIds || []).map(String).filter(Boolean))];
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => '?').join(',');
+
+  return all(
+    `SELECT
+       e.event_id, e.title, e.min_time, e.provincename, e.city_name, e.cname,
+       p.group_id, p.group_name, p.participant_id, p.participant_name,
+       p.org, p.win, p.lose, p.draw, p.score
+     FROM participant_index p
+     JOIN events e ON e.event_id = p.event_id
+     WHERE p.group_id IN (${placeholders})`,
+    ids
+  );
+}
+
 async function queryHeadToHeadCandidates({ playerA, playerB, province = '', dateFrom, dateTo, limit = 250 }) {
   await initPromise;
   const params = [playerA, playerB];
@@ -447,6 +465,7 @@ module.exports = {
   queryUnindexedEvents,
   getIndexCoverage,
   queryParticipants,
+  queryParticipantsForGroups,
   queryHeadToHeadCandidates,
   getGroupMatchCache,
   replaceGroupMatchCache,
