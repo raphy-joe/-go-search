@@ -687,7 +687,7 @@ function isAssociationBackedPublicRankEvent(row) {
   ].join(' ');
   if (!/围棋/.test(text)) return false;
   if (!/公开赛|冠军赛|大奖赛|争霸赛/.test(title)) return false;
-  return /围棋协会|棋类协会|棋院|智力运动中心|体育局/.test(text);
+  return /围棋(?:爱好者)?协会|棋类协会|棋院|智力运动中心|体育局/.test(text);
 }
 
 function hasPromotionLikeRecord(row, stats = {}) {
