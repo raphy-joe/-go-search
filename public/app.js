@@ -541,6 +541,10 @@ function renderPromotionCard(data) {
     const rank = item.rank && item.groupSize
       ? `第${item.rank}名 / ${item.groupSize}人`
       : item.rank ? `第${item.rank}名` : '名次待确认';
+    const meta = [item.date || '', item.group || '', rank].filter(Boolean);
+    if (record && (record.win || record.lose || record.draw)) {
+      meta.push(`${record.win || 0}胜${record.lose || 0}负${record.draw ? record.draw + '和' : ''}`);
+    }
     return `
       <li class="promotion-item">
         <div class="promotion-item-main">
@@ -549,7 +553,7 @@ function renderPromotionCard(data) {
             <a href="${esc(item.detail_url)}" target="_blank">${esc(title)}</a>
           </div>
           <div class="promotion-item-meta">
-            ${esc(item.date || '')} · ${esc(item.group || '')} · ${rank} · ${record.win || 0}胜${record.lose || 0}负${record.draw ? record.draw + '和' : ''}
+            ${esc(meta.join(' · '))}
           </div>
         </div>
       </li>`;

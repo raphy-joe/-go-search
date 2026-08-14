@@ -14,6 +14,30 @@ const NOTICE_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 12000;
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
+const SICHUAN_DAN_RULE_SOURCE = 'http://www.scwqxh.com/go-a327.htm';
+const SICHUAN_DAN_PROMOTION_RULES = {
+  4: { percent: 15, targetLabel: '5\u6bb5' },
+  3: { percent: 20, targetLabel: '4\u6bb5' },
+  2: { percent: 25, targetLabel: '3\u6bb5' },
+  1: { percent: 30, targetLabel: '2\u6bb5' },
+};
+
+const EXTERNAL_PROMOTION_EVIDENCE = [
+  {
+    name: '\u94b1\u60a6\u52c9',
+    event_id: 'external-scwqxh-2025-05-neijiang-3d4d-qym',
+    title: '2025\u5e74\u56db\u5ddd\u77015\u6708\u56f4\u68cb\u6bb5\u4f4d\u8d5b\uff083\u6bb5-4\u6bb5\u7ec4\uff09',
+    date: '2025-05-04',
+    province: '\u56db\u5ddd\u7701',
+    city: '\u5185\u6c5f\u5e02',
+    organizer: '\u5185\u6c5f\u5e02\u9686\u660c\u5e02\u56f4\u68cb\u534f\u4f1a',
+    group: '3\u6bb5-4\u6bb5\u7ec4',
+    promotedTo: '5\u6bb5',
+    source: 'association-promotion-list',
+    detail_url: 'http://www.scwqxh.com/',
+  },
+];
+
 async function estimatePromotionHistory({ name, province = '', dateFrom = '0000-01-01', dateTo = '9999-12-31' }) {
   const rows = await queryPromotionCandidates({ name, province, dateFrom, dateTo });
   const candidates = rows
@@ -38,7 +62,8 @@ async function estimatePromotionHistory({ name, province = '', dateFrom = '0000-
       eventGroups: groups,
     };
     const rule = extractPromotionRule(notice.text, row.group_name, level, context)
-      || curatedEventRule(row, level, context);
+      || confirmedEventRule(row)
+      || genericAssociationRule(row, level);
     const decision = decidePromotion({ row, stats, rule, level })
       || await inferPromotionFromLaterGroups({ item, stats, chronological, eventGroups });
     if (!decision.promoted) continue;
@@ -68,14 +93,67 @@ async function estimatePromotionHistory({ name, province = '', dateFrom = '0000-
     });
   }
 
-  results.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+  results.push(...getExternalPromotionRecords({ name, province, dateFrom, dateTo }));
+  const uniqueResults = dedupePromotionResults(results);
+  uniqueResults.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+
   return {
     name,
     scope: { province: province || '__ALL__', dateFrom, dateTo },
-    count: results.length,
-    items: results,
+    count: uniqueResults.length,
+    items: uniqueResults,
     scanned: rows.length,
   };
+}
+
+function getExternalPromotionRecords({ name, province, dateFrom, dateTo }) {
+  const start = normalizeDateOnly(dateFrom) || '0000-01-01';
+  const end = normalizeDateOnly(dateTo) || '9999-12-31';
+  return EXTERNAL_PROMOTION_EVIDENCE
+    .filter(item => item.name === name)
+    .filter(item => !province || item.province === province)
+    .filter(item => item.date >= start && item.date <= end)
+    .map(item => ({
+      event_id: item.event_id,
+      title: item.title,
+      date: item.date,
+      province: item.province,
+      city: item.city,
+      organizer: item.organizer,
+      group: item.group,
+      rank: 0,
+      groupSize: 0,
+      record: null,
+      score: '',
+      promotedTo: item.promotedTo,
+      confidence: '\u9ad8',
+      basis: '',
+      ruleText: '',
+      source: item.source,
+      detail_url: item.detail_url,
+    }));
+}
+
+function normalizeDateOnly(value) {
+  const m = String(value || '').match(/^\d{4}-\d{2}-\d{2}/);
+  return m ? m[0] : '';
+}
+
+function dedupePromotionResults(items) {
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    const key = [
+      item.date || '',
+      item.title || '',
+      item.group || '',
+      item.promotedTo || '',
+    ].join('\u0001');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
 }
 
 function parseCandidateLevel(groupName) {
@@ -206,7 +284,7 @@ function extractPromotionRule(text, groupName, level, context = {}) {
   return parseRuleFragment(matches[0], level, context);
 }
 
-function curatedEventRule(row) {
+function confirmedEventRule(row) {
   const eventId = String(row.event_id || '');
   const groupName = String(row.group_name || '').replace(/\s+/g, '');
   if (eventId === '63516' && groupName === '5级组') {
@@ -217,10 +295,37 @@ function curatedEventRule(row) {
       wins: null,
       targetLabel: null,
       fullWinTargetLabel: '1级',
-      source: 'curated',
+      source: 'user-confirmed-rule',
     };
   }
   return null;
+}
+
+function genericAssociationRule(row, level) {
+  if (!isSichuanAssociationDanEvent(row) || level.kind !== 'dan') return null;
+  const rule = SICHUAN_DAN_PROMOTION_RULES[level.current];
+  if (!rule) return null;
+  return {
+    text: `四川省围棋协会段位赛通用晋升标准（来源：${SICHUAN_DAN_RULE_SOURCE}）`,
+    percent: rule.percent,
+    topN: null,
+    wins: null,
+    targetLabel: rule.targetLabel,
+    fullWinTargetLabel: null,
+    source: 'association-general-rule',
+  };
+}
+
+function isSichuanAssociationDanEvent(row) {
+  if (String(row.provincename || '') !== '四川省') return false;
+  const text = [
+    row.title || '',
+    row.cname || '',
+    row.city_name || '',
+  ].join(' ');
+  if (!/围棋/.test(text) || !/段级位赛|段位赛/.test(text)) return false;
+  if (/公开赛|网赛|公益|争霸赛|邀请赛|联赛/.test(text)) return false;
+  return /四川省|围棋协会|棋院|段位赛/.test(text);
 }
 
 function parseRuleFragment(matched, level, context) {
