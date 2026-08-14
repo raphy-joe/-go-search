@@ -13,6 +13,9 @@ const EVENTPART_API = 'https://api.yunbisai.com/request/Group/Eventpart';
 const NOTICE_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 12000;
 const delay = ms => new Promise(r => setTimeout(r, ms));
+const CONFIRMED_PUBLIC_ASSOCIATION_RULE_EVENTS = new Set([
+  '54734',
+]);
 
 const PROVINCIAL_ASSOCIATION_RULES = {
   '\u56db\u5ddd\u7701': {
@@ -22,8 +25,8 @@ const PROVINCIAL_ASSOCIATION_RULES = {
     danRules: {
       4: { percent: 15, targetLabel: '5\u6bb5' },
       3: { percent: 20, targetLabel: '4\u6bb5' },
-      2: { percent: 25, targetLabel: '3\u6bb5' },
-      1: { percent: 30, targetLabel: '2\u6bb5' },
+      2: { percent: 25, targetLabel: '3\u6bb5', fullWinTargetLabel: '4\u6bb5' },
+      1: { percent: 30, targetLabel: '2\u6bb5', fullWinTargetLabel: '3\u6bb5' },
     },
     levelRules: {
       1: { percent: 35, targetLabel: '1\u6bb5', fullWinTargetLabel: '2\u6bb5' },
@@ -414,7 +417,8 @@ function confirmedEventRule(row) {
 }
 
 function genericAssociationRule(row, level) {
-  if (!isProvincialAssociationRankEvent(row)) return null;
+  const isRankEvent = isProvincialAssociationRankEvent(row);
+  if (!isRankEvent && !canUseAssociationRuleForBackedPublicEvent(row, level)) return null;
   const config = PROVINCIAL_ASSOCIATION_RULES[String(row.provincename || '')];
   if (!config) return null;
   const rule = level.kind === 'dan'
@@ -688,6 +692,12 @@ function isAssociationBackedPublicRankEvent(row) {
   if (!/围棋/.test(text)) return false;
   if (!/公开赛|冠军赛|大奖赛|争霸赛/.test(title)) return false;
   return /围棋(?:爱好者)?协会|棋类协会|棋院|智力运动中心|体育局/.test(text);
+}
+
+function canUseAssociationRuleForBackedPublicEvent(row, level) {
+  if (!isAssociationBackedPublicRankEvent(row)) return false;
+  if (!CONFIRMED_PUBLIC_ASSOCIATION_RULE_EVENTS.has(String(row.event_id || ''))) return false;
+  return level?.kind === 'dan' && level.current >= 3;
 }
 
 function hasPromotionLikeRecord(row, stats = {}) {
