@@ -237,7 +237,7 @@ function decidePromotion({ row, stats, rule, level, hasNotice }) {
     if (rule.percent && rank && groupSize) {
       const quota = Math.max(1, Math.ceil(groupSize * rule.percent / 100));
       promoted = rank <= quota;
-      basis = `规程写明${row.group_name}前${rule.percent}%晋升；本组${groupSize}人，名额约${quota}人，选手第${rank}名`;
+      basis = `规程写明${row.group_name}前${rule.percent}%晋升；本组${groupSize}人，按比例向上取整为${quota}个名额，选手第${rank}名`;
       ruleWasEvaluated = true;
     } else if (rule.topN && rank) {
       promoted = rank <= rule.topN;
