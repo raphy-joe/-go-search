@@ -14,12 +14,43 @@ const NOTICE_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 12000;
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
-const SICHUAN_DAN_RULE_SOURCE = 'http://www.scwqxh.com/go-a327.htm';
-const SICHUAN_DAN_PROMOTION_RULES = {
-  4: { percent: 15, targetLabel: '5\u6bb5' },
-  3: { percent: 20, targetLabel: '4\u6bb5' },
-  2: { percent: 25, targetLabel: '3\u6bb5' },
-  1: { percent: 30, targetLabel: '2\u6bb5' },
+const PROVINCIAL_ASSOCIATION_RULES = {
+  '\u56db\u5ddd\u7701': {
+    source: 'http://www.scwqxh.com/go-a327.htm',
+    rounding: 'ceil',
+    minRounds: 7,
+    danRules: {
+      4: { percent: 15, targetLabel: '5\u6bb5' },
+      3: { percent: 20, targetLabel: '4\u6bb5' },
+      2: { percent: 25, targetLabel: '3\u6bb5' },
+      1: { percent: 30, targetLabel: '2\u6bb5' },
+    },
+    levelRules: {
+      1: { percent: 35, targetLabel: '1\u6bb5', fullWinTargetLabel: '2\u6bb5' },
+      2: { percent: 50, targetLabel: '1\u7ea7', fullWinTargetLabel: '1\u6bb5' },
+      5: { percent: 50, targetLabel: '2\u7ea7', fullWinTargetLabel: '1\u7ea7' },
+    },
+  },
+  '\u6cb3\u5317\u7701': {
+    source: 'https://sport.hebei.gov.cn/m/view.php?aid=8392',
+    rounding: 'round',
+    minRounds: 7,
+    danRules: {
+      4: { percent: 15, targetLabel: '5\u6bb5' },
+      3: { percent: 30, targetLabel: '4\u6bb5' },
+      2: { percent: 50, targetLabel: '3\u6bb5' },
+      1: { percent: 65, targetLabel: '2\u6bb5' },
+    },
+    levelRules: {
+      1: { percent: 75, targetLabel: '1\u6bb5' },
+      2: { percent: 75, targetLabel: '1\u7ea7' },
+      3: { percent: 80, targetLabel: '2\u7ea7' },
+      4: { percent: 80, targetLabel: '3\u7ea7' },
+      5: { percent: 85, targetLabel: '4\u7ea7' },
+      6: { percent: 85, targetLabel: '5\u7ea7' },
+      7: { percent: 90, targetLabel: '6\u7ea7' },
+    },
+  },
 };
 
 const EXTERNAL_PROMOTION_EVIDENCE = [
@@ -184,16 +215,25 @@ function parseDanLabel(label) {
 }
 
 function parseCandidateLevel(groupName) {
-  const g = String(groupName || '').trim();
-  const dan = g.match(/(\d+)\s*段组/);
+  const g = String(groupName || '').replace(/\s+/g, '').trim();
+  if (isMixedLevelGroup(g)) return null;
+  const dan = g.match(/^(\d+)段.*组/);
   if (dan) {
     const current = parseInt(dan[1], 10);
     if (current >= 1 && current <= 5) return { kind: 'dan', current };
   }
-  const level = g.match(/(\d+)\s*级组/);
+  const level = g.match(/^(\d+)级.*组/);
   if (level) return { kind: 'level', current: parseInt(level[1], 10) };
   if (/一级组|定段组/.test(g)) return { kind: 'level', current: 1 };
   return null;
+}
+
+function isMixedLevelGroup(groupName) {
+  const g = String(groupName || '');
+  if (/\d+\s*[-—－~～至到]\s*\d+\s*[段级]/.test(g)) return true;
+  const danMentions = g.match(/\d+段/g) || [];
+  const levelMentions = g.match(/\d+级/g) || [];
+  return danMentions.length + levelMentions.length > 1;
 }
 
 async function getGroupsForEvent(eventId, cache) {
@@ -233,7 +273,8 @@ async function getOrFetchEventNotice(eventId) {
   const cached = await getEventNoticeCache(eventId);
   const fresh = cached && cached.updated_at && Date.now() - cached.updated_at < NOTICE_CACHE_TTL_MS;
   if (fresh && !cached.last_error) {
-    return { text: cached.notice_text || '', hasNotice: Boolean(cached.notice_text) };
+    const cachedText = normalizeNoticeText(cached.notice_text || '');
+    return { text: cachedText, hasNotice: Boolean(cachedText) };
   }
 
   try {
@@ -251,7 +292,8 @@ async function getOrFetchEventNotice(eventId) {
     return { text: noticeText, hasNotice: Boolean(noticeText) };
   } catch (err) {
     await replaceEventNoticeCache({ event_id: eventId, notice_text: cached?.notice_text || '', last_error: err.message });
-    return { text: cached?.notice_text || '', hasNotice: Boolean(cached?.notice_text) };
+    const cachedText = normalizeNoticeText(cached?.notice_text || '');
+    return { text: cachedText, hasNotice: Boolean(cachedText) };
   }
 }
 
@@ -261,13 +303,25 @@ function parseNoticePayload(payload) {
   try {
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed)) {
-      return parsed.map(item => `${item.t || ''}: ${stripHtml(item.h || '')}`).join('\n').trim();
+      return parsed.map(item => {
+        const html = decodeUriComponentSafe(item.h || '');
+        return `${item.t || ''}: ${stripHtml(html)}`;
+      }).join('\n').trim();
     }
   } catch (_) {}
+  return stripHtml(decodeUriComponentSafe(raw));
+}
+
+function normalizeNoticeText(text) {
+  return stripHtml(decodeUriComponentSafe(text || ''));
+}
+
+function decodeUriComponentSafe(value) {
   try {
-    raw = decodeURIComponent(raw);
-  } catch (_) {}
-  return stripHtml(raw);
+    return decodeURIComponent(String(value || ''));
+  } catch (_) {
+    return String(value || '');
+  }
 }
 
 function stripHtml(html) {
@@ -329,22 +383,28 @@ function confirmedEventRule(row) {
 }
 
 function genericAssociationRule(row, level) {
-  if (!isSichuanAssociationDanEvent(row) || level.kind !== 'dan') return null;
-  const rule = SICHUAN_DAN_PROMOTION_RULES[level.current];
+  if (!isProvincialAssociationRankEvent(row)) return null;
+  const config = PROVINCIAL_ASSOCIATION_RULES[String(row.provincename || '')];
+  if (!config) return null;
+  const rule = level.kind === 'dan'
+    ? config.danRules?.[level.current]
+    : config.levelRules?.[level.current];
   if (!rule) return null;
   return {
-    text: `四川省围棋协会段位赛通用晋升标准（来源：${SICHUAN_DAN_RULE_SOURCE}）`,
+    text: `${row.provincename}围棋段级位赛通用晋升标准（来源：${config.source}）`,
     percent: rule.percent,
     topN: null,
     wins: null,
     targetLabel: rule.targetLabel,
-    fullWinTargetLabel: null,
+    fullWinTargetLabel: rule.fullWinTargetLabel || null,
+    rounding: rule.rounding || config.rounding || 'ceil',
+    minRounds: rule.minRounds || config.minRounds || 0,
     source: 'association-general-rule',
   };
 }
 
-function isSichuanAssociationDanEvent(row) {
-  if (String(row.provincename || '') !== '四川省') return false;
+function isProvincialAssociationRankEvent(row) {
+  if (!PROVINCIAL_ASSOCIATION_RULES[String(row.provincename || '')]) return false;
   const text = [
     row.title || '',
     row.cname || '',
@@ -352,12 +412,12 @@ function isSichuanAssociationDanEvent(row) {
   ].join(' ');
   if (!/围棋/.test(text) || !/段级位赛|段位赛/.test(text)) return false;
   if (/公开赛|网赛|公益|争霸赛|邀请赛|联赛/.test(text)) return false;
-  return /四川省|围棋协会|棋院|段位赛/.test(text);
+  return /省|围棋协会|棋院|段位赛|段级位赛|级位赛/.test(text);
 }
 
 function parseRuleFragment(matched, level, context) {
-  const fullWinExplicit = targetLabelFromMatch(matched.match(/全胜[^。；;]*(?:晋升|升)(?:为|至)?(\d+)\s*(段|级)/));
-  const fullWinSteps = numberFromMatch(matched.match(/全胜[^。；;]*(?:晋升|升)(\d+)个级别/));
+  const fullWinExplicit = targetLabelFromMatch(matched.match(/(?:全胜|\d+连胜)[^。；;]*(?:跳升|晋升|升)(?:为|至)?(\d+)\s*(段|级)/));
+  const fullWinSteps = numberFromMatch(matched.match(/(?:全胜|\d+连胜)[^。；;]*(?:跳升|晋升|升)(\d+)个级别/));
   const explicitTarget = targetLabelFromMatch(matched.match(/(?:晋升|升)(?:为|至)?(\d+)\s*(段|级)/));
   const applyTarget = targetLabelFromMatch(matched.match(/申请(\d+)\s*(级)/));
   const percent = numberFromMatch(matched.match(/前\s*(\d+(?:\.\d+)?)\s*%/));
@@ -379,10 +439,10 @@ function parseRuleFragment(matched, level, context) {
 }
 
 function groupMentionMatches(fragment, groupName) {
-  const m = groupName.match(/(\d+)(段|级)组/);
-  if (!m) return false;
-  const n = m[1];
-  const unit = m[2];
+  const level = parseCandidateLevel(groupName);
+  if (!level) return false;
+  const n = String(level.current);
+  const unit = level.kind === 'dan' ? '段' : '级';
   return fragment.includes(`${n}${unit}组`);
 }
 
@@ -455,7 +515,7 @@ function canInferPromotionFromLaterGroups(row) {
     row.city_name || '',
   ].join(' ');
   if (/公益|慈善|网赛|网络赛|线上|邀请赛|交流赛|联谊/.test(text)) return false;
-  return /段级位赛|段位赛|级位赛|定级|定段|争霸赛|分站赛|冠军赛|公开赛/.test(text);
+  return /段级位赛|段位赛|级位赛|定级|定段/.test(text);
 }
 
 function hasPromotionLikeRecord(row, stats = {}) {
@@ -508,19 +568,20 @@ function decidePromotion({ row, stats, rule, level }) {
 
   let promoted = false;
   let basis = '';
-  if (rule.percent && rank && groupSize) {
-    const quota = Math.max(1, Math.ceil(groupSize * rule.percent / 100));
+  if (rule.minRounds && rounds < rule.minRounds) return { promoted: false };
+  if (targetFromFullWin) {
+    promoted = true;
+    basis = `规程写明全胜特殊晋升；选手${win}胜全胜`;
+  } else if (rule.percent && rank && groupSize) {
+    const quota = promotionQuota(groupSize, rule.percent, rule.rounding);
     promoted = rank <= quota;
-    basis = `规程写明${row.group_name}前${rule.percent}%晋升；本组${groupSize}人，按比例向上取整为${quota}个名额，选手第${rank}名`;
+    basis = `规程写明${row.group_name}前${rule.percent}%晋升；本组${groupSize}人，${roundingLabel(rule.rounding)}为${quota}个名额，选手第${rank}名`;
   } else if (rule.topN && rank) {
     promoted = rank <= rule.topN;
     basis = `规程写明${row.group_name}前${rule.topN}名晋升；选手第${rank}名`;
   } else if (rule.wins) {
     promoted = win >= rule.wins;
     basis = `规程写明达到${rule.wins}胜晋升；选手${win}胜${lose}负${draw ? draw + '和' : ''}`;
-  } else if (targetFromFullWin) {
-    promoted = true;
-    basis = `规程写明全胜特殊晋升；选手${win}胜全胜`;
   }
 
   if (!promoted) return { promoted: false };
@@ -533,6 +594,19 @@ function decidePromotion({ row, stats, rule, level }) {
     ruleText: rule.text,
     source: rule.source || 'notice',
   };
+}
+
+function promotionQuota(groupSize, percent, rounding = 'ceil') {
+  const raw = groupSize * percent / 100;
+  if (rounding === 'round') return Math.max(1, Math.round(raw));
+  if (rounding === 'floor') return Math.max(1, Math.floor(raw));
+  return Math.max(1, Math.ceil(raw));
+}
+
+function roundingLabel(rounding = 'ceil') {
+  if (rounding === 'round') return '按比例四舍五入';
+  if (rounding === 'floor') return '按比例向下取整';
+  return '按比例向上取整';
 }
 
 async function fetchGroupParticipants(groupId) {
