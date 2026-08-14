@@ -149,6 +149,7 @@ async function indexEvent(event) {
         lose: row.faisum,
         draw: row.deusum,
         score: row.integral,
+        rank: row.compositor,
         updated_at: now,
       });
     }

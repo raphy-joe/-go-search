@@ -113,6 +113,7 @@ const initPromise = new Promise((res, rej) =>
       lose             INTEGER NOT NULL DEFAULT 0,
       draw             INTEGER NOT NULL DEFAULT 0,
       score            TEXT NOT NULL DEFAULT '',
+      rank             INTEGER NOT NULL DEFAULT 0,
       updated_at       INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (event_id, group_id, participant_id)
     );
@@ -159,8 +160,21 @@ const initPromise = new Promise((res, rej) =>
       updated_at    INTEGER NOT NULL DEFAULT 0,
       last_error    TEXT NOT NULL DEFAULT ''
     );
+
+    CREATE TABLE IF NOT EXISTS event_notice_cache (
+      event_id      TEXT PRIMARY KEY,
+      notice_text   TEXT NOT NULL DEFAULT '',
+      updated_at    INTEGER NOT NULL DEFAULT 0,
+      last_error    TEXT NOT NULL DEFAULT ''
+    );
   `, err => err ? rej(err) : res())
-);
+).then(ensureParticipantRankColumn);
+
+async function ensureParticipantRankColumn() {
+  const cols = await all('PRAGMA table_info(participant_index)');
+  if (cols.some(c => c.name === 'rank')) return;
+  await run('ALTER TABLE participant_index ADD COLUMN rank INTEGER NOT NULL DEFAULT 0');
+}
 
 // ── Queries ───────────────────────────────────────────────────────────────────
 
@@ -270,7 +284,7 @@ async function queryParticipants({ name, province = '', dateFrom, dateTo }) {
     `SELECT
        e.event_id, e.title, e.min_time, e.provincename, e.city_name, e.cname,
        p.group_id, p.group_name, p.participant_id, p.participant_name,
-       p.org, p.win, p.lose, p.draw, p.score
+       p.org, p.win, p.lose, p.draw, p.score, p.rank
      FROM participant_index p
      JOIN events e ON e.event_id = p.event_id
      WHERE ${conds.join(' AND ')} ORDER BY e.min_time DESC`,
@@ -288,7 +302,7 @@ async function queryParticipantsForGroups(groupIds) {
     `SELECT
        e.event_id, e.title, e.min_time, e.provincename, e.city_name, e.cname,
        p.group_id, p.group_name, p.participant_id, p.participant_name,
-       p.org, p.win, p.lose, p.draw, p.score
+       p.org, p.win, p.lose, p.draw, p.score, p.rank
      FROM participant_index p
      JOIN events e ON e.event_id = p.event_id
      WHERE p.group_id IN (${placeholders})`,
@@ -331,6 +345,31 @@ async function queryHeadToHeadCandidates({ playerA, playerB, province = '', date
   );
 }
 
+async function queryPromotionCandidates({ name, province = '', dateFrom, dateTo }) {
+  await initPromise;
+  const params = [name];
+  const conds = ['p.participant_name = ?'];
+
+  if (province) { conds.push('e.provincename = ?'); params.push(province); }
+  if (dateFrom) { conds.push('e.min_time >= ?'); params.push(dateFrom); }
+  if (dateTo) { conds.push('e.min_time <= ?'); params.push(dateTo); }
+
+  return all(
+    `SELECT
+       e.event_id, e.title, e.min_time, e.provincename, e.city_name, e.cname,
+       p.group_id, p.group_name, p.participant_id, p.participant_name,
+       p.org, p.win, p.lose, p.draw, p.score, p.rank,
+       eg.pnumber AS group_size,
+       (SELECT COUNT(*) FROM participant_index px WHERE px.group_id = p.group_id) AS indexed_group_size
+     FROM participant_index p
+     JOIN events e ON e.event_id = p.event_id
+     LEFT JOIN event_groups eg ON eg.group_id = p.group_id
+     WHERE ${conds.join(' AND ')}
+     ORDER BY e.min_time DESC`,
+    params
+  );
+}
+
 async function getGroupMatchCache(group_id) {
   await initPromise;
   const [status, rows] = await Promise.all([
@@ -338,6 +377,27 @@ async function getGroupMatchCache(group_id) {
     all(`SELECT * FROM group_match_cache WHERE group_id = ? ORDER BY bout ASC`, [String(group_id)]),
   ]);
   return { status: status || null, rows };
+}
+
+async function getEventNoticeCache(event_id) {
+  await initPromise;
+  return get(
+    `SELECT event_id, notice_text, updated_at, last_error
+     FROM event_notice_cache WHERE event_id = ?`,
+    [String(event_id)]
+  );
+}
+
+async function replaceEventNoticeCache({ event_id, notice_text = '', last_error = '', updated_at = Date.now() }) {
+  return withWriteLock(async () => {
+    await initPromise;
+    return run(
+      `INSERT OR REPLACE INTO event_notice_cache
+         (event_id, notice_text, updated_at, last_error)
+       VALUES (?, ?, ?, ?)`,
+      [String(event_id), notice_text || '', updated_at, last_error || '']
+    );
+  });
 }
 
 async function replaceGroupMatchCache({ group_id, rounds, rows, last_error = '', updated_at = Date.now() }) {
@@ -416,8 +476,8 @@ async function replaceParticipantsForEvent(event_id, participants) {
     await initPromise;
     const sql = `
       INSERT OR REPLACE INTO participant_index
-        (event_id, group_id, group_name, participant_id, participant_name, org, short_no, win, lose, draw, score, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (event_id, group_id, group_name, participant_id, participant_name, org, short_no, win, lose, draw, score, rank, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
     await run('BEGIN IMMEDIATE');
     try {
@@ -427,7 +487,7 @@ async function replaceParticipantsForEvent(event_id, participants) {
           String(p.event_id), String(p.group_id), p.group_name || '',
           String(p.participant_id), p.participant_name || '', p.org || '', p.short_no || '',
           parseInt(p.win) || 0, parseInt(p.lose) || 0, parseInt(p.draw) || 0,
-          String(p.score ?? ''), p.updated_at || Date.now(),
+          String(p.score ?? ''), parseInt(p.rank) || 0, p.updated_at || Date.now(),
         ]);
       }
       await run('COMMIT');
@@ -466,9 +526,12 @@ module.exports = {
   getIndexCoverage,
   queryParticipants,
   queryParticipantsForGroups,
+  queryPromotionCandidates,
   queryHeadToHeadCandidates,
   getGroupMatchCache,
   replaceGroupMatchCache,
+  getEventNoticeCache,
+  replaceEventNoticeCache,
   upsertIndexedEvent,
   upsertEventGroups,
   replaceParticipantsForEvent,

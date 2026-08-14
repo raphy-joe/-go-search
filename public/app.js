@@ -240,6 +240,7 @@ function startSearch() {
   resultsList.innerHTML = '';
   const oldCard = document.getElementById('strengthCard');
   if (oldCard) oldCard.remove();
+  clearPromotionCard();
   resultCount.textContent = '0';
   progressBar.style.width = '0%';
   progressText.textContent = '正在连接...';
@@ -249,6 +250,7 @@ function startSearch() {
   const provinceLabel = province === '__ALL__' ? '全国' : province;
   resultsTitle.textContent = `${esc(name)} · ${esc(provinceLabel)} · ${dateLabel}`;
   renderStrengthPending(name);
+  renderPromotionPending(name);
   searchBtn.disabled = true;
   stopBtn.style.display = 'inline-block';
 
@@ -326,9 +328,11 @@ function startSearch() {
         }
         if (hits === 0) {
           clearStrengthCard();
+          clearPromotionCard();
           showEmpty(name, province, msg.partial);
         } else {
           showStrengthEstimate([...allHits], seq, name);
+          showPromotionHistory(seq, name, province, dateFrom, dateTo);
         }
         evtSource.close(); evtSource = null;
         searchBtn.disabled = false;
@@ -378,6 +382,7 @@ function buildCard(msg) {
         <span class="score-tag lose">负 ${loseNum}</span>
         ${drawNum > 0 ? `<span class="score-tag draw">和 ${drawNum}</span>` : ''}
         <span class="score-tag score">积分 ${esc(player.score)}</span>
+        ${player.rank ? `<span class="score-tag rank">名次 ${esc(player.rank)}</span>` : ''}
       </div>
     </div>
     <div class="card-links">
@@ -471,6 +476,111 @@ function showEmpty(name, province, partial = false) {
 // Level scale L: 25级=1, 24级=2, …, 1级=25, 1段=26, 2段=27, …, 8段=33
 
 // ── Path A: skill-level groups (1级组, 3段组, 定段组, 公开组…) ────────────────
+async function showPromotionHistory(seq, playerName, province, dateFrom, dateTo) {
+  if (seq !== searchSeq) return;
+  renderPromotionPending(playerName);
+  try {
+    const params = new URLSearchParams({ name: playerName, province, dateFrom, dateTo });
+    const resp = await fetch(`/api/promotions?${params}`);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || '升段历史查询失败');
+    if (seq !== searchSeq) return;
+    renderPromotionCard(data);
+  } catch (err) {
+    if (seq !== searchSeq) return;
+    renderPromotionError(err);
+  }
+}
+
+function renderPromotionPending(name) {
+  clearPromotionCard();
+  const card = document.createElement('div');
+  card.id = 'promotionCard';
+  card.className = 'promotion-card promotion-card--unknown';
+  card.innerHTML = `
+    <div class="promotion-header">
+      <div class="promotion-title">可能升段历史</div>
+      <div class="promotion-meta">正在等待「${esc(name)}」的参赛记录和赛事规程</div>
+    </div>`;
+  resultsList.before(card);
+}
+
+function renderPromotionError(err) {
+  clearPromotionCard();
+  const card = document.createElement('div');
+  card.id = 'promotionCard';
+  card.className = 'promotion-card promotion-card--unknown';
+  card.innerHTML = `
+    <div class="promotion-header">
+      <div class="promotion-title">可能升段历史</div>
+      <div class="promotion-meta">分析失败：${esc(err.message || err)}</div>
+    </div>`;
+  resultsList.before(card);
+}
+
+function renderPromotionCard(data) {
+  clearPromotionCard();
+  const card = document.createElement('div');
+  card.id = 'promotionCard';
+  card.className = 'promotion-card';
+
+  const items = data.items || [];
+  if (!items.length) {
+    card.classList.add('promotion-card--unknown');
+    card.innerHTML = `
+      <div class="promotion-header">
+        <div class="promotion-title">可能升段历史</div>
+        <div class="promotion-meta">已检查 ${data.scanned || 0} 条参赛记录，暂未发现明确或高概率升段记录</div>
+      </div>
+      <div class="promotion-note">只有能识别到段位组/1级组，并且成绩满足规程或常见升段条件的记录才会显示。</div>`;
+    resultsList.before(card);
+    return;
+  }
+
+  const rows = items.map(item => {
+    const record = item.record || {};
+    const confClass = item.confidence === '高' ? 'promotion-conf--high'
+      : item.confidence === '中' ? 'promotion-conf--mid'
+      : 'promotion-conf--low';
+    const title = (item.title || '').length > 28 ? item.title.slice(0, 28) + '…' : item.title;
+    const rule = item.ruleText
+      ? `<div class="promotion-rule">${esc(item.ruleText)}</div>`
+      : '';
+    const rank = item.rank && item.groupSize
+      ? `第${item.rank}名 / ${item.groupSize}人`
+      : item.rank ? `第${item.rank}名` : '名次待确认';
+    return `
+      <li class="promotion-item">
+        <div class="promotion-item-main">
+          <div class="promotion-item-title">
+            <span class="promotion-target">升至 ${esc(item.promotedTo)}</span>
+            <a href="${esc(item.detail_url)}" target="_blank">${esc(title)}</a>
+          </div>
+          <div class="promotion-item-meta">
+            ${esc(item.date || '')} · ${esc(item.group || '')} · ${rank} · ${record.win || 0}胜${record.lose || 0}负${record.draw ? record.draw + '和' : ''}
+          </div>
+          <div class="promotion-basis">${esc(item.basis || '')}</div>
+          ${rule}
+        </div>
+        <span class="promotion-conf ${confClass}">${esc(item.confidence || '低')}置信</span>
+      </li>`;
+  }).join('');
+
+  card.innerHTML = `
+    <div class="promotion-header">
+      <div class="promotion-title">可能升段历史</div>
+      <div class="promotion-meta">识别到 ${items.length} 条可能升段记录</div>
+    </div>
+    <ul class="promotion-list">${rows}</ul>
+    <div class="promotion-note">说明：优先依据赛事规程判断；未发布或未解析到规程时，只显示高成绩的低/中置信推测。</div>`;
+  resultsList.before(card);
+}
+
+function clearPromotionCard() {
+  const old = document.getElementById('promotionCard');
+  if (old) old.remove();
+}
+
 function parseGroupL(groupName) {
   if (!groupName) return null;
   const g = groupName.trim();

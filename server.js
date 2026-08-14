@@ -18,6 +18,7 @@ const {
 const { runCrawl, stopCrawl, getState: getCrawlerState } = require('./crawler');
 const { runIndex, stopIndex, getState: getIndexerState } = require('./indexer');
 const { estimatePlayerStrength } = require('./strength');
+const { estimatePromotionHistory } = require('./promotions');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -179,6 +180,7 @@ function indexedRowToHit(row) {
       lose:          String(row.lose),
       draw:          String(row.draw),
       score:         row.score,
+      rank:          String(row.rank || ''),
       groupid:       String(row.group_id),
       participantid: String(row.participant_id),
       detail_url:    `https://m.yunbisai.com/memberData/personInfo/${randomStr()}?id=${row.group_id}&pID=${row.participant_id}&eventid=${row.event_id}`,
@@ -233,6 +235,7 @@ async function doSearch(event, name, send) {
               lose:          p.faisum,
               draw:          p.deusum,
               score:         p.integral,
+              rank:          String(p.compositor || ''),
               groupid:       String(p.groupid),
               participantid: String(p.participantid),
               detail_url:    `https://m.yunbisai.com/memberData/personInfo/${randomStr()}?id=${p.groupid}&pID=${p.participantid}&eventid=${event.event_id}`,
@@ -295,7 +298,8 @@ app.get('/api/head-to-head', async (req, res) => {
 
   const province = req.query.province === '__ALL__' ? '' : String(req.query.province || '');
   const dateFrom = req.query.dateFrom || '0000-01-01';
-  const dateTo = req.query.dateTo || '9999-12-31';
+  const rawDateTo = req.query.dateTo || '9999-12-31';
+  const dateTo = /^\d{4}-\d{2}-\d{2}$/.test(rawDateTo) ? `${rawDateTo} 23:59:59` : rawDateTo;
   const limit = Math.min(parseInt(req.query.limit) || 300, 600);
 
   try {
@@ -359,6 +363,24 @@ app.get('/api/strength', async (req, res) => {
     res.json(result);
   } catch (err) {
     console.warn(`[Strength] ${name} failed: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/promotions', async (req, res) => {
+  const name = String(req.query.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'missing player name' });
+
+  const province = req.query.province === '__ALL__' ? '' : String(req.query.province || '');
+  const dateFrom = req.query.dateFrom || '0000-01-01';
+  const rawDateTo = req.query.dateTo || '9999-12-31';
+  const dateTo = /^\d{4}-\d{2}-\d{2}$/.test(rawDateTo) ? `${rawDateTo} 23:59:59` : rawDateTo;
+
+  try {
+    const result = await estimatePromotionHistory({ name, province, dateFrom, dateTo });
+    res.json(result);
+  } catch (err) {
+    console.warn(`[Promotions] ${name} failed: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
 });
