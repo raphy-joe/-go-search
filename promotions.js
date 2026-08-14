@@ -216,7 +216,24 @@ function parseDanLabel(label) {
 
 function parseCandidateLevel(groupName) {
   const g = String(groupName || '').replace(/\s+/g, '').trim();
+  if (!g || !/组/.test(g)) return null;
+  const fixedDan = g.match(/^定(\d+)段.*组/);
+  if (fixedDan) {
+    const target = parseInt(fixedDan[1], 10) || 0;
+    if (target === 1) return { kind: 'level', current: 1 };
+    if (target >= 2 && target <= 6) return { kind: 'dan', current: target - 1 };
+  }
+  const upgradeToDan = g.match(/^(\d+)级升\d+段.*组/);
+  if (upgradeToDan) return { kind: 'level', current: parseInt(upgradeToDan[1], 10) };
   if (isMixedLevelGroup(g)) return null;
+
+  const mentions = parseGroupLevelMentions(g);
+  if (mentions.length === 1) {
+    const [{ kind, current }] = mentions;
+    if (kind === 'dan' && current >= 1 && current <= 5) return { kind, current };
+    if (kind === 'level') return { kind, current };
+  }
+
   const dan = g.match(/^(\d+)段.*组/);
   if (dan) {
     const current = parseInt(dan[1], 10);
@@ -230,10 +247,20 @@ function parseCandidateLevel(groupName) {
 
 function isMixedLevelGroup(groupName) {
   const g = String(groupName || '');
-  if (/\d+\s*[-—－~～至到]\s*\d+\s*[段级]/.test(g)) return true;
-  const danMentions = g.match(/\d+段/g) || [];
-  const levelMentions = g.match(/\d+级/g) || [];
-  return danMentions.length + levelMentions.length > 1;
+  if (/^\d+级升\d+段.*组/.test(g)) return false;
+  if (/\d+\s*[段级]?\s*[-—－~～至到]\s*\d+\s*[段级]/.test(g)) return true;
+  if (/\d+\s*[段级]\s*[-—－~～至到]\s*\d+\s*[段级]?/.test(g)) return true;
+  return parseGroupLevelMentions(g).length > 1;
+}
+
+function parseGroupLevelMentions(groupName) {
+  const g = String(groupName || '');
+  return [...g.matchAll(/(\d+)\s*(段|级)/g)]
+    .map(match => ({
+      kind: match[2] === '段' ? 'dan' : 'level',
+      current: parseInt(match[1], 10) || 0,
+    }))
+    .filter(item => item.current > 0);
 }
 
 async function getGroupsForEvent(eventId, cache) {
@@ -355,7 +382,9 @@ function extractPromotionRule(text, groupName, level, context = {}) {
   const promotionFragments = fragments.filter(x => /升段|升级|晋升|升为|升至|升\d+[段级]|申请\d+级/.test(x));
   const searchFragments = promotionFragments.length ? promotionFragments : fragments;
 
-  const matches = searchFragments.filter(f => f.includes(g) || groupMentionMatches(f, g));
+  const matches = searchFragments
+    .filter(f => fragmentMentionsGroup(f, g, level))
+    .map(f => narrowFragmentToGroup(f, g, level));
   if (!matches.length) return null;
 
   for (const fragment of matches) {
@@ -418,10 +447,11 @@ function isProvincialAssociationRankEvent(row) {
 function parseRuleFragment(matched, level, context) {
   const fullWinExplicit = targetLabelFromMatch(matched.match(/(?:全胜|\d+连胜)[^。；;]*(?:跳升|晋升|升)(?:为|至)?(\d+)\s*(段|级)/));
   const fullWinSteps = numberFromMatch(matched.match(/(?:全胜|\d+连胜)[^。；;]*(?:跳升|晋升|升)(\d+)个级别/));
+  const topNTarget = topNTargetFromMatch(matched.match(/(?:第\s*(\d+)\s*名|前\s*(\d+)\s*名)[^。；;]*(?:晋升|升)(?:为|至)?(\d+)\s*(段|级)/));
   const explicitTarget = targetLabelFromMatch(matched.match(/(?:晋升|升)(?:为|至)?(\d+)\s*(段|级)/));
   const applyTarget = targetLabelFromMatch(matched.match(/申请(\d+)\s*(级)/));
-  const percent = numberFromMatch(matched.match(/前\s*(\d+(?:\.\d+)?)\s*%/));
-  const topN = numberFromMatch(matched.match(/前\s*(\d+)\s*名/));
+  const percent = numberFromMatch(matched.match(/(?:前|按|按照)?\s*(\d+(?:\.\d+)?)\s*%\s*(?:的)?(?:比例)?/));
+  const topN = topNTarget?.topN || numberFromMatch(matched.match(/前\s*(\d+)\s*名/));
   const wins = numberFromMatch(matched.match(/胜\s*(\d+)\s*盘/) || matched.match(/(\d+)\s*胜/));
   const champion = /冠军/.test(matched);
   const stepMatch = matched.match(/(?:晋升|升)(\d+)个(?:级别|段位)/);
@@ -433,17 +463,58 @@ function parseRuleFragment(matched, level, context) {
     percent,
     topN: champion && !topN ? 1 : topN,
     wins,
+    topNTargetLabel: topNTarget?.targetLabel || null,
     targetLabel: explicitTarget || applyTarget || (steps ? targetLabelBySteps(level, steps, context) : null),
     fullWinTargetLabel: fullWinExplicit || (fullWinSteps ? targetLabelBySteps(level, fullWinSteps, context) : null),
   };
 }
 
+function narrowFragmentToGroup(fragment, groupName, level) {
+  const labels = candidateGroupLabels(groupName, level);
+  const starts = labels
+    .map(label => ({ label, start: fragment.indexOf(label) }))
+    .filter(item => item.start >= 0)
+    .sort((a, b) => a.start - b.start || b.label.length - a.label.length);
+  if (!starts.length) return fragment;
+
+  const { label, start } = starts[0];
+  if (start < 0) return fragment;
+
+  const minEnd = start + label.length;
+  const tail = fragment.slice(minEnd);
+  for (const match of tail.matchAll(/\d+\s*[段级]组/g)) {
+    const idx = minEnd + match.index;
+    const beforeNextGroup = fragment.slice(start, idx);
+    if (/%|晋升|升为|升至|申请|前\d+名|第\d+名|\d+胜/.test(beforeNextGroup)) {
+      return beforeNextGroup;
+    }
+  }
+  return fragment.slice(start);
+}
+
+function fragmentMentionsGroup(fragment, groupName, level) {
+  return candidateGroupLabels(groupName, level).some(label => fragment.includes(label));
+}
+
+function candidateGroupLabels(groupName, level) {
+  const labels = [];
+  const rawGroup = String(groupName || '').replace(/\s+/g, '');
+  if (rawGroup) labels.push(rawGroup);
+
+  const fixedDan = rawGroup.match(/^定(\d+)段/);
+  if (fixedDan) {
+    labels.push(`定${fixedDan[1]}段组`, `定${fixedDan[1]}段`);
+  } else if (level) {
+    labels.push(`${level.current}${level.kind === 'dan' ? '段' : '级'}组`);
+  }
+
+  return [...new Set(labels.filter(Boolean))];
+}
+
 function groupMentionMatches(fragment, groupName) {
   const level = parseCandidateLevel(groupName);
   if (!level) return false;
-  const n = String(level.current);
-  const unit = level.kind === 'dan' ? '段' : '级';
-  return fragment.includes(`${n}${unit}组`);
+  return fragmentMentionsGroup(fragment, String(groupName || '').replace(/\s+/g, ''), level);
 }
 
 function targetFromMatch(match) {
@@ -452,6 +523,17 @@ function targetFromMatch(match) {
 
 function targetLabelFromMatch(match) {
   return match ? `${parseInt(match[1], 10)}${match[2]}` : null;
+}
+
+function topNTargetFromMatch(match) {
+  if (!match) return null;
+  const topN = parseInt(match[1] || match[2], 10) || 0;
+  const target = parseInt(match[3], 10) || 0;
+  if (!topN || !target) return null;
+  return {
+    topN,
+    targetLabel: `${target}${match[4]}`,
+  };
 }
 
 function numberFromMatch(match) {
@@ -515,7 +597,21 @@ function canInferPromotionFromLaterGroups(row) {
     row.city_name || '',
   ].join(' ');
   if (/公益|慈善|网赛|网络赛|线上|邀请赛|交流赛|联谊/.test(text)) return false;
-  return /段级位赛|段位赛|级位赛|定级|定段/.test(text);
+  return /段级位赛|段位赛|级位赛|定级|定段/.test(text)
+    || isAssociationBackedPublicRankEvent(row);
+}
+
+function isAssociationBackedPublicRankEvent(row) {
+  if (!PROVINCIAL_ASSOCIATION_RULES[String(row.provincename || '')]) return false;
+  const title = String(row.title || '');
+  const text = [
+    title,
+    row.cname || '',
+    row.city_name || '',
+  ].join(' ');
+  if (!/围棋/.test(text)) return false;
+  if (!/公开赛|冠军赛|大奖赛|争霸赛/.test(title)) return false;
+  return /围棋协会|棋类协会|棋院|智力运动中心|体育局/.test(text);
 }
 
 function hasPromotionLikeRecord(row, stats = {}) {
@@ -562,16 +658,20 @@ function decidePromotion({ row, stats, rule, level }) {
   const rank = stats.rank || 0;
   const groupSize = stats.groupSize || 0;
   const targetFromFullWin = rule?.fullWinTargetLabel && rounds > 0 && win === rounds ? rule.fullWinTargetLabel : null;
-  const target = targetFromFullWin || rule?.targetLabel;
 
-  if (!rule || !target) return null;
+  if (!rule) return null;
 
   let promoted = false;
   let basis = '';
+  let target = targetFromFullWin || rule.targetLabel;
   if (rule.minRounds && rounds < rule.minRounds) return { promoted: false };
   if (targetFromFullWin) {
     promoted = true;
     basis = `规程写明全胜特殊晋升；选手${win}胜全胜`;
+  } else if (rule.topNTargetLabel && rule.topN && rank && rank <= rule.topN) {
+    promoted = true;
+    target = rule.topNTargetLabel;
+    basis = `规程写明${row.group_name}前${rule.topN}名晋升至${target}；选手第${rank}名`;
   } else if (rule.percent && rank && groupSize) {
     const quota = promotionQuota(groupSize, rule.percent, rule.rounding);
     promoted = rank <= quota;
@@ -584,7 +684,7 @@ function decidePromotion({ row, stats, rule, level }) {
     basis = `规程写明达到${rule.wins}胜晋升；选手${win}胜${lose}负${draw ? draw + '和' : ''}`;
   }
 
-  if (!promoted) return { promoted: false };
+  if (!promoted || !target) return { promoted: false };
 
   return {
     promoted: true,
