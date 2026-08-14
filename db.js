@@ -345,6 +345,17 @@ async function queryHeadToHeadCandidates({ playerA, playerB, province = '', date
   );
 }
 
+async function queryEventGroups(eventId) {
+  await initPromise;
+  return all(
+    `SELECT group_id, event_id, group_name, team_type, pnumber
+     FROM event_groups
+     WHERE event_id = ?
+     ORDER BY CAST(group_id AS INTEGER) ASC`,
+    [String(eventId)]
+  );
+}
+
 async function queryPromotionCandidates({ name, province = '', dateFrom, dateTo }) {
   await initPromise;
   const params = [name];
@@ -526,6 +537,7 @@ module.exports = {
   getIndexCoverage,
   queryParticipants,
   queryParticipantsForGroups,
+  queryEventGroups,
   queryPromotionCandidates,
   queryHeadToHeadCandidates,
   getGroupMatchCache,
