@@ -94,7 +94,7 @@ async function estimatePromotionHistory({ name, province = '', dateFrom = '0000-
   }
 
   results.push(...getExternalPromotionRecords({ name, province, dateFrom, dateTo }));
-  const uniqueResults = dedupePromotionResults(results);
+  const uniqueResults = normalizePromotionSequence(dedupePromotionResults(results));
   uniqueResults.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
 
   return {
@@ -154,6 +154,33 @@ function dedupePromotionResults(items) {
     out.push(item);
   }
   return out;
+}
+
+function normalizePromotionSequence(items) {
+  const chronological = [...items].sort((a, b) => {
+    return (a.date || '').localeCompare(b.date || '')
+      || String(a.event_id || '').localeCompare(String(b.event_id || ''));
+  });
+  const out = [];
+  const seenDanTargets = new Set();
+  let highestDan = 0;
+
+  for (const item of chronological) {
+    const targetDan = parseDanLabel(item.promotedTo);
+    if (targetDan) {
+      if (seenDanTargets.has(targetDan) || targetDan <= highestDan) continue;
+      seenDanTargets.add(targetDan);
+      highestDan = targetDan;
+    }
+    out.push(item);
+  }
+
+  return out;
+}
+
+function parseDanLabel(label) {
+  const m = String(label || '').match(/^(\d+)\s*段$/);
+  return m ? parseInt(m[1], 10) || 0 : 0;
 }
 
 function parseCandidateLevel(groupName) {
@@ -396,6 +423,7 @@ function inferLevelLadder(eventGroups) {
 
 async function inferPromotionFromLaterGroups({ item, stats, chronological, eventGroups }) {
   const currentDate = item.row.min_time || '';
+  if (!canInferPromotionFromLaterGroups(item.row)) return { promoted: false };
   if (!hasPromotionLikeRecord(item.row, stats)) return { promoted: false };
 
   const currentGroups = await getGroupsForEvent(item.row.event_id, eventGroups);
@@ -418,6 +446,16 @@ async function inferPromotionFromLaterGroups({ item, stats, chronological, event
   }
 
   return { promoted: false };
+}
+
+function canInferPromotionFromLaterGroups(row) {
+  const text = [
+    row.title || '',
+    row.cname || '',
+    row.city_name || '',
+  ].join(' ');
+  if (/公益|慈善|网赛|网络赛|线上|邀请赛|交流赛|联谊/.test(text)) return false;
+  return /段级位赛|段位赛|级位赛|定级|定段|争霸赛|分站赛|冠军赛|公开赛/.test(text);
 }
 
 function hasPromotionLikeRecord(row, stats = {}) {
