@@ -95,8 +95,10 @@ async function estimatePromotionHistory({ name, province = '', dateFrom = '0000-
     const rule = extractPromotionRule(notice.text, row.group_name, level, context)
       || confirmedEventRule(row)
       || genericAssociationRule(row, level);
-    const decision = decidePromotion({ row, stats, rule, level })
-      || await inferPromotionFromLaterGroups({ item, stats, chronological, eventGroups });
+    let decision = decidePromotion({ row, stats, rule, level });
+    if (!decision?.promoted) {
+      decision = await inferPromotionFromLaterGroups({ item, stats, rule, chronological, eventGroups });
+    }
     if (!decision.promoted) continue;
 
     results.push({
@@ -446,24 +448,25 @@ function isProvincialAssociationRankEvent(row) {
 
 function parseRuleFragment(matched, level, context) {
   const fullWinExplicit = targetLabelFromMatch(matched.match(/(?:全胜|\d+连胜)[^。；;]*(?:跳升|晋升|升)(?:为|至)?(\d+)\s*(段|级)/));
-  const fullWinSteps = numberFromMatch(matched.match(/(?:全胜|\d+连胜)[^。；;]*(?:跳升|晋升|升)(\d+)个级别/));
+  const fullWinSteps = promotionStepCountFromMatch(matched.match(/(?:全胜|\d+连胜)[^。；;]*(?:跳升|晋升|升)([一二两三\d]+)个级别/));
   const topNTarget = topNTargetFromMatch(matched.match(/(?:第\s*(\d+)\s*名|前\s*(\d+)\s*名)[^。；;]*(?:晋升|升)(?:为|至)?(\d+)\s*(段|级)/));
+  const topNSteps = topNStepsFromMatch(matched.match(/(?:各组)?(?:第\s*(\d+)\s*名|第([一二三四五六七八九十]+)名|第一)[^。；;]*(?:晋升|升)([一二两三\d]+)个(?:级别|段位)/));
   const explicitTarget = targetLabelFromMatch(matched.match(/(?:晋升|升)(?:为|至)?(\d+)\s*(段|级)/));
   const applyTarget = targetLabelFromMatch(matched.match(/申请(\d+)\s*(级)/));
   const percent = numberFromMatch(matched.match(/(?:前|按|按照)?\s*(\d+(?:\.\d+)?)\s*%\s*(?:的)?(?:比例)?/));
-  const topN = topNTarget?.topN || numberFromMatch(matched.match(/前\s*(\d+)\s*名/));
+  const topN = topNTarget?.topN || topNSteps?.topN || numberFromMatch(matched.match(/前\s*(\d+)\s*名/));
   const wins = numberFromMatch(matched.match(/胜\s*(\d+)\s*盘/) || matched.match(/(\d+)\s*胜/));
   const champion = /冠军/.test(matched);
-  const stepMatch = matched.match(/(?:晋升|升)(\d+)个(?:级别|段位)/);
-  const oneLevel = /(?:晋升|升)(?:为)?1个(?:级别|段位)|(?:晋升|升)1个/.test(matched);
-  const steps = numberFromMatch(stepMatch) || (oneLevel ? 1 : null);
+  const stepMatch = matched.match(/(?:晋升|升)([一二两三\d]+)个(?:级别|段位)/);
+  const oneLevel = /(?:晋升|升)(?:为)?(?:1|一)个(?:级别|段位)|(?:晋升|升)(?:1|一)个/.test(matched);
+  const steps = promotionStepCountFromMatch(stepMatch) || (oneLevel ? 1 : null);
 
   return {
     text: matched,
     percent,
     topN: champion && !topN ? 1 : topN,
     wins,
-    topNTargetLabel: topNTarget?.targetLabel || null,
+    topNTargetLabel: topNTarget?.targetLabel || (topNSteps ? targetLabelBySteps(level, topNSteps.steps, context) : null),
     targetLabel: explicitTarget || applyTarget || (steps ? targetLabelBySteps(level, steps, context) : null),
     fullWinTargetLabel: fullWinExplicit || (fullWinSteps ? targetLabelBySteps(level, fullWinSteps, context) : null),
   };
@@ -536,6 +539,46 @@ function topNTargetFromMatch(match) {
   };
 }
 
+function topNStepsFromMatch(match) {
+  if (!match) return null;
+  const topN = match[0].includes('第一')
+    ? 1
+    : (parseInt(match[1], 10) || chineseNumber(match[2]));
+  const steps = promotionStepCount(match[3]);
+  if (!topN || !steps) return null;
+  return { topN, steps };
+}
+
+function promotionStepCountFromMatch(match) {
+  return match ? promotionStepCount(match[1]) : null;
+}
+
+function promotionStepCount(value) {
+  const s = String(value || '').trim();
+  const digit = parseInt(s, 10);
+  if (Number.isFinite(digit) && digit > 0) return digit;
+  return chineseNumber(s);
+}
+
+function chineseNumber(value) {
+  const s = String(value || '').trim();
+  if (!s) return null;
+  const map = {
+    一: 1,
+    二: 2,
+    两: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9,
+    十: 10,
+  };
+  return map[s] || null;
+}
+
 function numberFromMatch(match) {
   return match ? parseFloat(match[1]) || null : null;
 }
@@ -563,20 +606,21 @@ function inferLevelLadder(eventGroups) {
   return levels.sort((a, b) => b - a);
 }
 
-async function inferPromotionFromLaterGroups({ item, stats, chronological, eventGroups }) {
+async function inferPromotionFromLaterGroups({ item, stats, rule, chronological, eventGroups }) {
   const currentDate = item.row.min_time || '';
-  if (!canInferPromotionFromLaterGroups(item.row)) return { promoted: false };
-  if (!hasPromotionLikeRecord(item.row, stats)) return { promoted: false };
+  if (!canInferPromotionFromLaterGroups(item.row, rule)) return { promoted: false };
 
   const currentGroups = await getGroupsForEvent(item.row.event_id, eventGroups);
   const currentLadder = inferLevelLadder(currentGroups);
 
   for (const later of chronological) {
     if ((later.row.min_time || '') <= currentDate) continue;
+    if (!canUseLaterGroupAsPromotionEvidence(later.row)) continue;
     const step = promotionStep(item.level, later.level, currentLadder);
     if (step === null) continue;
     if (step < 1) return { promoted: false };
     if (step > 2) return { promoted: false };
+    if (!hasSubsequentPromotionRecord(item.row, stats, step)) return { promoted: false };
     return {
       promoted: true,
       promotedTo: levelLabel(later.level),
@@ -590,7 +634,27 @@ async function inferPromotionFromLaterGroups({ item, stats, chronological, event
   return { promoted: false };
 }
 
-function canInferPromotionFromLaterGroups(row) {
+function canUseLaterGroupAsPromotionEvidence(row) {
+  const text = [
+    row.title || '',
+    row.cname || '',
+    row.city_name || '',
+  ].join(' ');
+  return !/公益|慈善|网赛|网络赛|线上|邀请赛|交流赛|联谊/.test(text);
+}
+
+function hasSubsequentPromotionRecord(row, stats, step) {
+  if (hasPromotionLikeRecord(row, stats)) return true;
+  const win = parseInt(row.win, 10) || 0;
+  const lose = parseInt(row.lose, 10) || 0;
+  const draw = parseInt(row.draw, 10) || 0;
+  const rounds = win + lose + draw;
+  if (step !== 1 || rounds < 5) return false;
+  const rate = (win + 0.5 * draw) / rounds;
+  return win > lose && rate >= 2 / 3;
+}
+
+function canInferPromotionFromLaterGroups(row, rule = null) {
   const text = [
     row.title || '',
     row.cname || '',
@@ -598,7 +662,19 @@ function canInferPromotionFromLaterGroups(row) {
   ].join(' ');
   if (/公益|慈善|网赛|网络赛|线上|邀请赛|交流赛|联谊/.test(text)) return false;
   return /段级位赛|段位赛|级位赛|定级|定段/.test(text)
-    || isAssociationBackedPublicRankEvent(row);
+    || isAssociationBackedPublicRankEvent(row)
+    || hasExplicitPromotionRule(rule);
+}
+
+function hasExplicitPromotionRule(rule) {
+  return Boolean(rule && (
+    rule.percent
+    || rule.topN
+    || rule.wins
+    || rule.targetLabel
+    || rule.fullWinTargetLabel
+    || rule.topNTargetLabel
+  ));
 }
 
 function isAssociationBackedPublicRankEvent(row) {
