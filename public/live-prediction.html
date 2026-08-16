@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>云比赛 · 赛中名次预测</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container live-container">
+    <header>
+      <h1>赛中名次预测</h1>
+      <p class="subtitle">同步查询正在进行的比赛，按云比赛总得分规则模拟最终名次</p>
+    </header>
+
+    <section class="search-card live-toolbar">
+      <div class="h2h-heading">
+        <div class="h2h-title">正在进行的比赛</div>
+        <a href="index.html" class="h2h-clear">返回首页</a>
+      </div>
+      <div class="form-row">
+        <div class="form-group flex-2">
+          <label>省份</label>
+          <select id="liveProvince">
+            <option value="四川省" selected>四川省</option>
+            <option value="__ALL__">全国（所有省份）</option>
+            <option value="浙江省">浙江省</option>
+            <option value="广东省">广东省</option>
+            <option value="江苏省">江苏省</option>
+            <option value="安徽省">安徽省</option>
+            <option value="广西">广西</option>
+            <option value="湖南省">湖南省</option>
+            <option value="福建省">福建省</option>
+            <option value="北京市">北京市</option>
+            <option value="重庆市">重庆市</option>
+            <option value="河北省">河北省</option>
+            <option value="山东省">山东省</option>
+            <option value="江西省">江西省</option>
+            <option value="陕西省">陕西省</option>
+            <option value="山西省">山西省</option>
+            <option value="海南省">海南省</option>
+            <option value="甘肃省">甘肃省</option>
+            <option value="新疆">新疆</option>
+            <option value="上海市">上海市</option>
+            <option value="湖北省">湖北省</option>
+            <option value="黑龙江省">黑龙江省</option>
+            <option value="云南省">云南省</option>
+            <option value="辽宁省">辽宁省</option>
+            <option value="河南省">河南省</option>
+            <option value="贵州省">贵州省</option>
+            <option value="内蒙古">内蒙古</option>
+            <option value="吉林省">吉林省</option>
+            <option value="宁夏">宁夏</option>
+            <option value="天津市">天津市</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-actions">
+        <button type="button" id="loadLiveEventsBtn">确定</button>
+      </div>
+    </section>
+
+    <section id="liveEventsSection" class="live-section" style="display:none">
+      <div class="results-header">
+        <h2>比赛列表</h2>
+        <span id="liveEventCount" class="badge">0</span>
+      </div>
+      <div id="liveEventsList" class="live-event-list"></div>
+    </section>
+
+    <section id="liveGroupSection" class="live-section" style="display:none">
+      <div class="search-card live-group-card">
+        <div class="h2h-heading">
+          <div>
+            <div id="selectedEventTitle" class="h2h-title"></div>
+            <div id="selectedEventMeta" class="live-muted"></div>
+          </div>
+          <div class="live-heading-actions">
+            <a id="backToLiveList" href="live-prediction.html" class="h2h-clear" style="display:none">返回赛事列表</a>
+            <a id="selectedEventLink" href="#" target="_blank" class="h2h-clear">云比赛页面</a>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group flex-2">
+            <label>组别</label>
+            <select id="liveGroupSelect"></select>
+          </div>
+        </div>
+        <div class="form-actions">
+          <button type="button" id="refreshLiveGroupBtn">同步刷新本组</button>
+        </div>
+      </div>
+
+      <div id="livePlayersPanel" class="live-panel"></div>
+    </section>
+
+    <section id="livePredictionSection" class="live-section" style="display:none">
+      <div id="livePredictionPanel" class="live-panel"></div>
+    </section>
+  </div>
+
+  <script src="live-prediction.js"></script>
+</body>
+</html>

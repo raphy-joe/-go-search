@@ -24,8 +24,10 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 
 const SEARCH_API      = 'https://api.yunbisai.com/request/event/SearchInfo';
+const EVENTS_API      = 'https://data-center.yunbisai.com/api/lswl-events';
 const DETAIL_BASE     = 'https://www.yunbisai.com/tpl/eventFeatures/eventDetail-';
 const AGAINSTPLAN_API = 'https://api.yunbisai.com/request/Group/Againstplan';
+const EVENTPART_API   = 'https://api.yunbisai.com/request/Group/Eventpart';
 const SEARCH_TIMEOUT_MS = 15000;
 const SEARCH_RETRIES    = 1;
 const LIVE_FALLBACK_LIMIT = parseInt(process.env.SEARCH_LIVE_FALLBACK_LIMIT || '250', 10);
@@ -290,6 +292,117 @@ app.get('/api/matches', async (req, res) => {
   res.json({ matches: [] });
 });
 
+app.get('/api/live-events', async (req, res) => {
+  const province = req.query.province === '__ALL__' ? '' : String(req.query.province || '');
+  const dateFrom = req.query.dateFrom || formatDateOffset(-2);
+  const dateTo = req.query.dateTo || formatDateOffset(7);
+  const limit = Math.min(parseInt(req.query.limit) || 60, 120);
+  const now = Date.now();
+
+  try {
+    const candidates = await fetchLiveEventCandidates({ province, dateFrom, dateTo, limit });
+    const events = [];
+    await mapLimit(candidates, 4, async event => {
+      try {
+        const groups = await fetchLiveEventGroups(event.event_id);
+        const liveGroups = groups.filter(g => isLiveGroup(g, now));
+        const status = liveGroups.length
+          ? 'live'
+          : eventStatusFromTimes(event.min_time, event.max_time, now);
+        if (status === 'old') return;
+        events.push({
+          event_id: String(event.event_id),
+          title: event.title,
+          date: (event.min_time || '').substring(0, 10),
+          province: event.provincename,
+          city: event.city_name,
+          organizer: event.cname,
+          detail_url: `${DETAIL_BASE}${event.event_id}.html`,
+          group_count: groups.length,
+          live_group_count: liveGroups.length,
+          status,
+          status_label: liveEventStatusLabel(status),
+          begins_at: minDateValue(groups.map(g => g.bt)) || event.min_time || '',
+          ends_at: maxDateValue(groups.map(g => g.et)) || event.max_time || '',
+        });
+      } catch (err) {
+        console.warn(`[LiveEvents] event ${event.event_id} failed: ${err.message}`);
+      }
+    });
+    events.sort((a, b) =>
+      liveStatusOrder(a.status) - liveStatusOrder(b.status) ||
+      (b.date || '').localeCompare(a.date || '') ||
+      String(b.event_id).localeCompare(String(a.event_id))
+    );
+    res.json({ events, scope: { province: province || '__ALL__', dateFrom, dateTo } });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/live-event', async (req, res) => {
+  const eventId = String(req.query.event_id || '').trim();
+  if (!eventId) return res.status(400).json({ error: 'missing event_id' });
+
+  try {
+    const groups = await fetchLiveEventGroups(eventId);
+    const now = Date.now();
+    res.json({
+      event_id: eventId,
+      groups: groups.map(g => ({
+        group_id: String(g.groupid),
+        group_name: g.groupname || '',
+        pnumber: parseInt(g.pnumber) || 0,
+        group_state: String(g.groupstate || ''),
+        begins_at: g.bt || '',
+        ends_at: g.et || '',
+        live: isLiveGroup(g, now),
+      })),
+    });
+  } catch (err) {
+    console.warn(`[LiveEvent] ${eventId} failed: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/live-group', async (req, res) => {
+  const groupId = String(req.query.group_id || '').trim();
+  if (!groupId) return res.status(400).json({ error: 'missing group_id' });
+
+  try {
+    const [players, matchData] = await Promise.all([
+      fetchGroupParticipantsLive(groupId),
+      fetchGroupMatchesLive(groupId),
+    ]);
+    const current = computeCurrentRanking(players, matchData.rows, Math.max(matchData.completedRounds || 0, 1));
+    res.json({
+      group_id: groupId,
+      total_rounds: matchData.totalRounds,
+      completed_rounds: matchData.completedRounds,
+      known_pairing_rounds: matchData.knownPairingRounds,
+      players: current,
+    });
+  } catch (err) {
+    console.warn(`[LiveGroup] ${groupId} failed: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/live-prediction', async (req, res) => {
+  const groupId = String(req.query.group_id || '').trim();
+  const participantId = String(req.query.participant_id || '').trim();
+  const simulations = Math.min(Math.max(parseInt(req.query.simulations) || 2000, 200), 8000);
+  if (!groupId || !participantId) return res.status(400).json({ error: 'missing params' });
+
+  try {
+    const result = await predictPlayerRank({ groupId, participantId, simulations });
+    res.json(result);
+  } catch (err) {
+    console.warn(`[LivePrediction] group ${groupId} player ${participantId} failed: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/head-to-head', async (req, res) => {
   const playerA = String(req.query.playerA || '').trim();
   const playerB = String(req.query.playerB || '').trim();
@@ -473,6 +586,460 @@ function parseJsonp(text) {
   const s = text.trim()
     .replace(/^[^(]+\(/, '').replace(/\);\s*$/, '').replace(/\)\s*$/, '');
   return JSON.parse(s);
+}
+
+function formatDateOffset(offsetDays) {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+async function fetchLiveEventCandidates({ province = '', dateFrom, dateTo, limit = 60 }) {
+  const rows = [];
+  const pageSize = Math.min(Math.max(limit, 20), 100);
+  const maxPages = province ? 2 : 4;
+  for (let page = 1; page <= maxPages && rows.length < limit; page++) {
+    const params = new URLSearchParams({
+      page,
+      PageSize: pageSize,
+      eventType: '2',
+      areaNum: province || '',
+    });
+    const text = await fetchTextWithRetry(`${EVENTS_API}?${params}`, {
+      timeout: SEARCH_TIMEOUT_MS,
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+    }, 1);
+    const json = JSON.parse(text);
+    const pageRows = json.datArr?.rows || [];
+    for (const row of pageRows) {
+      const start = (row.min_time || '').substring(0, 10);
+      const end = (row.max_time || row.min_time || '').substring(0, 10);
+      if (dateFrom && end < dateFrom) continue;
+      if (dateTo && start > dateTo) continue;
+      rows.push({
+        event_id: String(row.event_id),
+        title: row.title || '',
+        min_time: row.min_time || '',
+        max_time: row.max_time || '',
+        provincename: row.provincename || '',
+        city_name: row.city_name || '',
+        cname: row.cname || '',
+        play_num: parseInt(row.play_num) || 0,
+      });
+      if (rows.length >= limit) break;
+    }
+    if (!pageRows.length) break;
+    await delay(80);
+  }
+  return rows;
+}
+
+function eventStatusFromTimes(minTime, maxTime, now = Date.now()) {
+  const start = parseChinaTime(minTime);
+  const end = parseChinaTime(maxTime || minTime);
+  if (start && end && start <= now && now <= end) return 'live';
+  if (start && now < start) return 'upcoming';
+  if (end && now - end <= 8 * 3600000) return 'today-ended';
+  if (end && now - end <= 2 * 24 * 3600000) return 'recent-ended';
+  return 'old';
+}
+
+function liveEventStatusLabel(status) {
+  return {
+    live: '进行中',
+    upcoming: '即将开始',
+    'today-ended': '今日结束',
+    'recent-ended': '近期结束',
+  }[status] || '可查询';
+}
+
+function liveStatusOrder(status) {
+  return {
+    live: 0,
+    upcoming: 1,
+    'today-ended': 2,
+    'recent-ended': 3,
+  }[status] ?? 9;
+}
+
+async function mapLimit(items, limit, fn) {
+  const queue = [...items];
+  async function worker() {
+    while (queue.length) {
+      const item = queue.shift();
+      if (item) await fn(item);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+}
+
+async function fetchLiveEventGroups(eventId) {
+  const html = await fetchTextWithRetry(`${DETAIL_BASE}${eventId}.html`, {
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    timeout: SEARCH_TIMEOUT_MS,
+  }, 1);
+  const groups = [];
+  const seen = new Set();
+  const anchorRe = /<a\b[^>]*data-groupid=["']?\d+["']?[^>]*>/gi;
+  let m;
+  while ((m = anchorRe.exec(html))) {
+    const attrs = parseDataAttrs(m[0]);
+    if (!attrs.groupid || seen.has(attrs.groupid)) continue;
+    seen.add(attrs.groupid);
+    groups.push(attrs);
+  }
+  if (groups.length === 0) throw new Error('no groups found');
+  return groups;
+}
+
+function parseDataAttrs(html) {
+  const attrs = {};
+  const re = /data-([a-z0-9_-]+)=["']([^"']*)["']/gi;
+  let m;
+  while ((m = re.exec(html))) attrs[m[1].replace(/-/g, '')] = htmlDecode(m[2]);
+  return attrs;
+}
+
+function htmlDecode(s) {
+  return String(s || '')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
+
+function parseChinaTime(value) {
+  if (!value) return null;
+  const cleaned = String(value).trim().replace(/\.\d+$/, '');
+  const m = cleaned.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/);
+  if (!m) return null;
+  const [, y, mo, d, h = '0', mi = '0', s = '0'] = m;
+  return Date.UTC(+y, +mo - 1, +d, +h - 8, +mi, +s);
+}
+
+function isLiveGroup(group, now = Date.now()) {
+  const begin = parseChinaTime(group.bt);
+  const end = parseChinaTime(group.et);
+  if (begin && end) return begin <= now && now <= end;
+  if (begin) return begin <= now && now - begin < 3 * 24 * 3600000;
+  return String(group.groupstate || '') === '0';
+}
+
+function minDateValue(values) {
+  return values.filter(Boolean).sort()[0] || '';
+}
+
+function maxDateValue(values) {
+  return values.filter(Boolean).sort().pop() || '';
+}
+
+async function fetchGroupParticipantsLive(groupId) {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const params = new URLSearchParams({ groupid: String(groupId), callback: 'cb' });
+    const text = await fetchTextWithRetry(`${EVENTPART_API}?${params}`, {
+      headers: { Referer: 'https://www.yunbisai.com/' },
+      timeout: SEARCH_TIMEOUT_MS,
+    }, 1);
+    const data = parseJsonp(text);
+    if (data.datArr === 'wait') {
+      await delay(800);
+      continue;
+    }
+    if (data.error !== 0) throw new Error(data.msg || 'Eventpart API error');
+    return (data.datArr?.rows || []).map(row => ({
+      id: String(row.participantid || row.id || row.pid || ''),
+      name: row.participantname || row.name || '',
+      org: row.teamname || row.othername || '',
+      short_no: String(row.short || ''),
+      win: parseInt(row.vicsum) || 0,
+      lose: parseInt(row.faisum) || 0,
+      draw: parseInt(row.deusum) || 0,
+      score: parseFloat(row.integral) || 0,
+      cloud_rank: parseInt(row.compositor) || 0,
+    })).filter(p => p.id && p.name);
+  }
+  throw new Error(`participants wait timeout for group ${groupId}`);
+}
+
+async function fetchGroupMatchesLive(groupId) {
+  const first = await fetchGroupRoundLive(groupId, 1);
+  const totalRounds = parseInt(first.total_bout) || inferTotalRoundsFromRows(first.rows || []);
+  const allRows = normalizeLiveRoundRows(groupId, 1, first.rows || []);
+
+  for (let bout = 2; bout <= totalRounds; bout++) {
+    const data = await fetchGroupRoundLive(groupId, bout);
+    allRows.push(...normalizeLiveRoundRows(groupId, bout, data.rows || []));
+    await delay(25);
+  }
+
+  const knownPairingRounds = Math.max(0, ...allRows.map(r => r.bout));
+  const rounds = new Map();
+  for (const row of allRows) {
+    if (!rounds.has(row.bout)) rounds.set(row.bout, []);
+    rounds.get(row.bout).push(row);
+  }
+  let completedRounds = 0;
+  for (let bout = 1; bout <= totalRounds; bout++) {
+    const rows = rounds.get(bout) || [];
+    if (rows.length && rows.every(isPlayedMatch)) completedRounds = bout;
+  }
+
+  return { rows: allRows, totalRounds, completedRounds, knownPairingRounds };
+}
+
+async function fetchGroupRoundLive(groupId, bout) {
+  const params = new URLSearchParams({ groupid: String(groupId), team: 0, bout, callback: 'cb' });
+  const text = await fetchTextWithRetry(`${AGAINSTPLAN_API}?${params}`, {
+    headers: AGAINSTPLAN_HEADERS,
+    timeout: 8000,
+  }, 1);
+  const data = parseJsonp(text);
+  if (data.error && data.error !== 0) throw new Error(data.msg || 'Againstplan API error');
+  return data.datArr || { rows: [] };
+}
+
+function inferTotalRoundsFromRows(rows) {
+  const n = rows?.length ? rows.length * 2 : 0;
+  if (n <= 8) return 5;
+  if (n <= 32) return 7;
+  return 9;
+}
+
+function normalizeLiveRoundRows(groupId, bout, rows) {
+  return rows
+    .filter(row => row.p1id && row.p2id)
+    .map(row => ({
+      group_id: String(groupId),
+      bout,
+      seat: parseInt(row.seatnum) || 0,
+      p1_id: String(row.p1id),
+      p2_id: String(row.p2id),
+      p1_name: row.p1 || '',
+      p2_name: row.p2 || '',
+      p1_org: row.p1_teamname || '',
+      p2_org: row.p2_teamname || '',
+      p1_result: String(row.p1_result ?? ''),
+      p2_result: String(row.p2_result ?? ''),
+      p1_score: parseFloat(row.p1_score) || 0,
+      p2_score: parseFloat(row.p2_score) || 0,
+    }));
+}
+
+function isPlayedMatch(row) {
+  return isResultCode(row.p1_result) || isResultCode(row.p2_result) || row.p1_score > 0 || row.p2_score > 0;
+}
+
+function isResultCode(value) {
+  return ['1', '2', '3'].includes(String(value));
+}
+
+function computeCurrentRanking(players, matches, totalRounds) {
+  const playerMap = new Map(players.map(p => [String(p.id), p]));
+  const scoreMap = new Map(players.map(p => [String(p.id), parseFloat(p.score) || 0]));
+  const opponentSets = buildInitialOpponentSets(players, matches);
+  const rows = rankPlayersFromScores(players, scoreMap, opponentSets, Math.max(totalRounds || 0, 1));
+  return rows.map(row => ({
+    ...row,
+    cloud_rank: playerMap.get(row.id)?.cloud_rank || 0,
+    win: playerMap.get(row.id)?.win || 0,
+    lose: playerMap.get(row.id)?.lose || 0,
+    draw: playerMap.get(row.id)?.draw || 0,
+  }));
+}
+
+async function predictPlayerRank({ groupId, participantId, simulations }) {
+  const [players, matchData] = await Promise.all([
+    fetchGroupParticipantsLive(groupId),
+    fetchGroupMatchesLive(groupId),
+  ]);
+  const selected = players.find(p => String(p.id) === String(participantId));
+  if (!selected) throw new Error('player not found in group');
+
+  const currentRows = computeCurrentRanking(players, matchData.rows, Math.max(matchData.completedRounds || 0, 1));
+  const current = currentRows.find(p => p.id === String(participantId));
+  const totalRounds = Math.max(matchData.totalRounds || matchData.completedRounds || 1, 1);
+  const rowsByBout = groupMatchesByBout(matchData.rows);
+  const counts = new Map();
+
+  for (let i = 0; i < simulations; i++) {
+    const scoreMap = new Map(players.map(p => [String(p.id), parseFloat(p.score) || 0]));
+    const opponentSets = buildInitialOpponentSets(players, matchData.rows);
+    const playedKeys = new Set(matchData.rows.filter(isPlayedMatch).map(matchKey));
+
+    for (let bout = 1; bout <= totalRounds; bout++) {
+      const rows = rowsByBout.get(bout) || [];
+      const unplayedRows = rows.filter(row => !playedKeys.has(matchKey(row)) && !isPlayedMatch(row));
+      if (unplayedRows.length) {
+        for (const row of unplayedRows) simulateKnownPairing(row, scoreMap, opponentSets);
+        continue;
+      }
+      if (rows.length) continue;
+      const pairings = buildSwissPairings(players, scoreMap, opponentSets);
+      for (const pairing of pairings) simulateGeneratedPairing(pairing, scoreMap, opponentSets);
+    }
+
+    const ranked = rankPlayersFromScores(players, scoreMap, opponentSets, totalRounds);
+    const target = ranked.find(p => p.id === String(participantId));
+    counts.set(target.rank, (counts.get(target.rank) || 0) + 1);
+  }
+
+  const probabilities = [...counts.entries()]
+    .map(([rank, count]) => ({
+      rank,
+      count,
+      probability: count / simulations,
+    }))
+    .sort((a, b) => b.probability - a.probability || a.rank - b.rank)
+    .slice(0, 5);
+
+  return {
+    group_id: String(groupId),
+    total_rounds: totalRounds,
+    completed_rounds: matchData.completedRounds,
+    known_pairing_rounds: matchData.knownPairingRounds,
+    simulations,
+    model: {
+      pairing: 'real-pairings-then-swiss',
+      win_probability: 'equal-strength-50-50',
+      ranking_rule: 'cloud-total-score',
+    },
+    player: {
+      id: String(selected.id),
+      name: selected.name,
+      org: selected.org,
+    },
+    current,
+    probabilities,
+  };
+}
+
+function groupMatchesByBout(rows) {
+  const map = new Map();
+  for (const row of rows) {
+    if (!map.has(row.bout)) map.set(row.bout, []);
+    map.get(row.bout).push(row);
+  }
+  return map;
+}
+
+function buildInitialOpponentSets(players, rows) {
+  const sets = new Map(players.map(p => [String(p.id), new Set()]));
+  for (const row of rows) {
+    if (!isPlayedMatch(row)) continue;
+    if (!sets.has(row.p1_id) || !sets.has(row.p2_id)) continue;
+    sets.get(row.p1_id).add(row.p2_id);
+    sets.get(row.p2_id).add(row.p1_id);
+  }
+  return sets;
+}
+
+function matchKey(row) {
+  return `${row.bout}:${row.p1_id}:${row.p2_id}`;
+}
+
+function simulateKnownPairing(row, scoreMap, opponentSets) {
+  addOpponents(row.p1_id, row.p2_id, opponentSets);
+  if (Math.random() < 0.5) {
+    addScore(row.p1_id, 2, scoreMap);
+  } else {
+    addScore(row.p2_id, 2, scoreMap);
+  }
+}
+
+function simulateGeneratedPairing(pairing, scoreMap, opponentSets) {
+  if (pairing.bye) {
+    addScore(pairing.bye, 2, scoreMap);
+    return;
+  }
+  addOpponents(pairing.p1, pairing.p2, opponentSets);
+  if (Math.random() < 0.5) {
+    addScore(pairing.p1, 2, scoreMap);
+  } else {
+    addScore(pairing.p2, 2, scoreMap);
+  }
+}
+
+function addScore(id, score, scoreMap) {
+  scoreMap.set(String(id), (scoreMap.get(String(id)) || 0) + score);
+}
+
+function addOpponents(a, b, opponentSets) {
+  if (!opponentSets.has(String(a)) || !opponentSets.has(String(b))) return;
+  opponentSets.get(String(a)).add(String(b));
+  opponentSets.get(String(b)).add(String(a));
+}
+
+function buildSwissPairings(players, scoreMap, opponentSets) {
+  const queue = players
+    .map(p => ({ id: String(p.id), score: scoreMap.get(String(p.id)) || 0, short: parseInt(p.short_no) || 9999, jitter: Math.random() }))
+    .sort((a, b) => b.score - a.score || a.short - b.short || a.jitter - b.jitter);
+  const pairings = [];
+
+  while (queue.length > 1) {
+    const p = queue.shift();
+    let bestIdx = 0;
+    for (let i = 0; i < queue.length; i++) {
+      if (!opponentSets.get(p.id)?.has(queue[i].id)) {
+        bestIdx = i;
+        break;
+      }
+    }
+    const opp = queue.splice(bestIdx, 1)[0];
+    pairings.push({ p1: p.id, p2: opp.id });
+  }
+  if (queue.length) pairings.push({ bye: queue[0].id });
+  return pairings;
+}
+
+function rankPlayersFromScores(players, scoreMap, opponentSets, roundsForFormula) {
+  const maxScore = Math.max(1, ...players.map(p => scoreMap.get(String(p.id)) || 0));
+  const rows = players.map(p => {
+    const id = String(p.id);
+    const score = scoreMap.get(id) || 0;
+    const opponentScore = [...(opponentSets.get(id) || [])].reduce((sum, oppId) => sum + (scoreMap.get(String(oppId)) || 0), 0);
+    const totalScore = score + (opponentScore * 2 / maxScore - roundsForFormula);
+    return {
+      id,
+      name: p.name,
+      org: p.org,
+      short_no: p.short_no,
+      score: roundNumber(score),
+      opponent_score: roundNumber(opponentScore),
+      total_score: roundNumber(totalScore, 5),
+    };
+  });
+
+  rows.sort((a, b) =>
+    b.total_score - a.total_score ||
+    b.score - a.score ||
+    (parseInt(a.short_no) || 9999) - (parseInt(b.short_no) || 9999) ||
+    a.name.localeCompare(b.name, 'zh-CN')
+  );
+
+  let last = null;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (last && nearlyEqual(row.total_score, last.total_score) && nearlyEqual(row.score, last.score)) {
+      row.rank = last.rank;
+    } else {
+      row.rank = i + 1;
+    }
+    last = row;
+  }
+  return rows;
+}
+
+function nearlyEqual(a, b) {
+  return Math.abs((a || 0) - (b || 0)) < 0.00001;
+}
+
+function roundNumber(value, digits = 2) {
+  const base = Math.pow(10, digits);
+  return Math.round((parseFloat(value) || 0) * base) / base;
 }
 
 function findHeadToHeadGames(rows, playerAId, playerBId, candidate) {
