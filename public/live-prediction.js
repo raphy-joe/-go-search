@@ -279,7 +279,7 @@ function initFromUrl() {
   const params = new URLSearchParams(window.location.search);
   const eventId = params.get('event_id');
   if (!eventId) {
-    loadLiveEvents();
+    liveEventsSection.style.display = 'none';
     return;
   }
 

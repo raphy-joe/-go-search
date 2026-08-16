@@ -87,7 +87,7 @@ input:focus, select:focus {
   flex-wrap: wrap;
 }
 
-button[type=submit], .btn-stop, .btn-secondary {
+button[type=submit], .btn-primary, .btn-stop, .btn-secondary {
   padding: 10px 28px;
   border-radius: 8px;
   font-size: 1rem;
@@ -100,13 +100,13 @@ button[type=submit], .btn-stop, .btn-secondary {
   align-items: center;
   justify-content: center;
 }
-button[type=submit] {
+button[type=submit], .btn-primary {
   border: none;
   background: #4f6ef7;
   color: #fff;
 }
-button[type=submit]:hover { opacity: .88; transform: translateY(-1px); }
-button[type=submit]:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+button[type=submit]:hover, .btn-primary:hover { opacity: .88; transform: translateY(-1px); }
+button[type=submit]:disabled, .btn-primary:disabled { opacity: .5; cursor: not-allowed; transform: none; }
 
 .btn-stop {
   background: #fff;
@@ -612,6 +612,23 @@ button[type=submit]:disabled { opacity: .5; cursor: not-allowed; transform: none
 .live-toolbar {
   margin-bottom: 18px;
 }
+.live-toolbar .h2h-heading {
+  margin-bottom: 16px;
+}
+.live-filter-row {
+  align-items: flex-end;
+  margin-bottom: 12px;
+}
+.live-province-group {
+  flex: 0 0 280px;
+  max-width: 280px;
+}
+.live-toolbar .form-actions {
+  margin-top: 0;
+}
+.live-toolbar .btn-primary {
+  min-width: 88px;
+}
 .live-event-list {
   display: flex;
   flex-direction: column;
@@ -752,6 +769,10 @@ button[type=submit]:disabled { opacity: .5; cursor: not-allowed; transform: none
 }
 
 @media (max-width: 640px) {
+  .live-province-group {
+    flex: 1 1 100%;
+    max-width: none;
+  }
   .live-event-item {
     flex-direction: column;
     align-items: flex-start;
