@@ -3,74 +3,99 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>云比赛 · 棋手交手记录</title>
+  <meta name="color-scheme" content="light">
+  <title>Go-Search · 棋手交手记录</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <div class="container">
-    <header>
-      <h1>棋手交手记录</h1>
-      <p class="subtitle">查询两位棋手近两年的同组直接对局</p>
-    </header>
+  <div class="app-shell">
+    <aside class="app-sidebar">
+      <a href="index.html" class="brand" aria-label="Go-Search 首页">
+        <span class="brand-mark" aria-hidden="true">弈</span>
+        <span class="brand-text">Go-Search<small>围棋赛事数据</small></span>
+      </a>
 
-    <form id="h2hForm" class="search-card h2h-card" autocomplete="on">
-      <div class="h2h-heading">
-        <div class="h2h-title">交手查询</div>
-        <a href="index.html" class="h2h-clear">返回首页</a>
+      <nav class="app-nav" aria-label="主导航">
+        <a href="index.html"><span class="nav-index">01</span>选手查询</a>
+        <a href="head-to-head.html" class="active" aria-current="page"><span class="nav-index">02</span>交手记录</a>
+        <a href="live-prediction.html"><span class="nav-index">03</span>赛中预测</a>
+      </nav>
+
+      <div class="sidebar-note">
+        <span class="sidebar-dot" aria-hidden="true"></span>
+        <span>赛事数据索引</span>
       </div>
-      <div class="form-row">
-        <div class="form-group flex-2">
-          <label>棋手 A <span class="required">*</span></label>
-          <input id="h2hPlayerA" name="h2hPlayerA" type="text" placeholder="请输入精确姓名" required autocomplete="on">
+    </aside>
+
+    <main class="app-main">
+      <header class="page-top">
+        <div>
+          <p class="eyebrow">HEAD TO HEAD</p>
+          <h1>棋手交手记录</h1>
+          <p class="subtitle">近两年同组直接对局</p>
         </div>
-        <div class="form-group flex-2">
-          <label>棋手 B <span class="required">*</span></label>
-          <input id="h2hPlayerB" name="h2hPlayerB" type="text" placeholder="请输入精确姓名" required autocomplete="on">
+        <div class="page-chip">近两年</div>
+      </header>
+
+      <form id="h2hForm" class="search-card h2h-card" autocomplete="on">
+        <div class="section-heading">
+          <h2>交手查询</h2>
         </div>
-      </div>
-      <div class="form-row">
-        <div class="form-group flex-2">
-          <label>查询范围 <span class="required">*</span></label>
-          <select id="h2hProvince" required>
-            <option value="__ALL__" selected>全国（所有省份）</option>
-            <option value="浙江省">浙江省</option>
-            <option value="广东省">广东省</option>
-            <option value="江苏省">江苏省</option>
-            <option value="安徽省">安徽省</option>
-            <option value="四川省">四川省</option>
-            <option value="广西">广西</option>
-            <option value="湖南省">湖南省</option>
-            <option value="福建省">福建省</option>
-            <option value="北京市">北京市</option>
-            <option value="重庆市">重庆市</option>
-            <option value="河北省">河北省</option>
-            <option value="山东省">山东省</option>
-            <option value="江西省">江西省</option>
-            <option value="陕西省">陕西省</option>
-            <option value="山西省">山西省</option>
-            <option value="海南省">海南省</option>
-            <option value="甘肃省">甘肃省</option>
-            <option value="新疆">新疆</option>
-            <option value="上海市">上海市</option>
-            <option value="湖北省">湖北省</option>
-            <option value="黑龙江省">黑龙江省</option>
-            <option value="云南省">云南省</option>
-            <option value="辽宁省">辽宁省</option>
-            <option value="河南省">河南省</option>
-            <option value="贵州省">贵州省</option>
-            <option value="内蒙古">内蒙古</option>
-            <option value="吉林省">吉林省</option>
-            <option value="宁夏">宁夏</option>
-            <option value="天津市">天津市</option>
-          </select>
+
+        <div class="form-row h2h-player-row">
+          <div class="form-group flex-2">
+            <label for="h2hPlayerA">棋手 A <span class="required">*</span></label>
+            <input id="h2hPlayerA" name="h2hPlayerA" type="text" placeholder="请输入精确姓名" required autocomplete="name">
+          </div>
+          <div class="h2h-versus" aria-hidden="true">对</div>
+          <div class="form-group flex-2">
+            <label for="h2hPlayerB">棋手 B <span class="required">*</span></label>
+            <input id="h2hPlayerB" name="h2hPlayerB" type="text" placeholder="请输入精确姓名" required autocomplete="name">
+          </div>
+          <div class="form-group h2h-province-group">
+            <label for="h2hProvince">查询范围 <span class="required">*</span></label>
+            <select id="h2hProvince" required>
+              <option value="__ALL__" selected>全国（所有省份）</option>
+              <option value="浙江省">浙江省</option>
+              <option value="广东省">广东省</option>
+              <option value="江苏省">江苏省</option>
+              <option value="安徽省">安徽省</option>
+              <option value="四川省">四川省</option>
+              <option value="广西">广西</option>
+              <option value="湖南省">湖南省</option>
+              <option value="福建省">福建省</option>
+              <option value="北京市">北京市</option>
+              <option value="重庆市">重庆市</option>
+              <option value="河北省">河北省</option>
+              <option value="山东省">山东省</option>
+              <option value="江西省">江西省</option>
+              <option value="陕西省">陕西省</option>
+              <option value="山西省">山西省</option>
+              <option value="海南省">海南省</option>
+              <option value="甘肃省">甘肃省</option>
+              <option value="新疆">新疆</option>
+              <option value="上海市">上海市</option>
+              <option value="湖北省">湖北省</option>
+              <option value="黑龙江省">黑龙江省</option>
+              <option value="云南省">云南省</option>
+              <option value="辽宁省">辽宁省</option>
+              <option value="河南省">河南省</option>
+              <option value="贵州省">贵州省</option>
+              <option value="内蒙古">内蒙古</option>
+              <option value="吉林省">吉林省</option>
+              <option value="宁夏">宁夏</option>
+              <option value="天津市">天津市</option>
+            </select>
+          </div>
+          <div class="form-actions search-actions">
+            <button type="submit" id="h2hBtn" class="btn-primary">查询</button>
+            <button type="button" id="h2hClearBtn" class="btn-secondary">清空</button>
+          </div>
         </div>
-      </div>
-      <div class="form-actions">
-        <button type="submit" id="h2hBtn">查询交手记录</button>
-        <button type="button" id="h2hClearBtn" class="btn-secondary">清空</button>
-      </div>
-      <div id="h2hResult" class="h2h-result" style="display:none"></div>
-    </form>
+      </form>
+
+      <section id="h2hResult" class="h2h-result" style="display:none" aria-live="polite"></section>
+    </main>
   </div>
 
   <script src="h2h.js"></script>

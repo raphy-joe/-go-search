@@ -36,7 +36,14 @@ function showMessage(target, message) {
 }
 
 async function loadLiveEvents() {
-  const province = liveProvinceSelect.value || '四川省';
+  const province = liveProvinceSelect.value;
+  if (!province) {
+    liveProvinceSelect.setCustomValidity('请选择省份');
+    liveProvinceSelect.reportValidity();
+    liveProvinceSelect.focus();
+    return;
+  }
+  liveProvinceSelect.setCustomValidity('');
   selectedEvent = null;
   selectedGroup = null;
   liveGroupSection.style.display = 'none';
@@ -248,13 +255,16 @@ async function startPrediction(participantId) {
 
 function renderPrediction(data) {
   const items = data.probabilities || [];
-  const rows = items.map(item => `
-    <tr>
-      <td>第 ${item.rank} 名</td>
-      <td>${pct(item.probability)}</td>
-      <td>${item.count}/${data.simulations}</td>
-    </tr>
-  `).join('');
+  const rows = items.map(item => {
+    const probability = Math.max(0, Math.min(1, Number(item.probability) || 0));
+    const barWidth = probability > 0 ? Math.max(2, probability * 100) : 0;
+    return `
+      <div class="live-probability-row" aria-label="第 ${item.rank} 名，概率 ${pct(probability)}，模拟 ${item.count}/${data.simulations} 次">
+        <span class="live-probability-rank">第 ${item.rank} 名</span>
+        <span class="live-probability-track" aria-hidden="true"><span class="live-probability-fill" style="width:${barWidth}%"></span></span>
+        <span class="live-probability-value">${pct(probability)}</span>
+      </div>`;
+  }).join('');
   const current = data.current || {};
 
   livePredictionPanel.innerHTML = `
@@ -264,14 +274,12 @@ function renderPrediction(data) {
         <div class="live-muted">当前第 ${current.cloud_rank || current.rank || '-'} 名 · 大分 ${current.score ?? '-'} · 小分 ${current.opponent_score ?? '-'} · 总得分 ${current.total_score ?? '-'}</div>
       </div>
     </div>
-    <table class="live-table live-prob-table">
-      <thead><tr><th>可能名次</th><th>概率</th><th>模拟次数</th></tr></thead>
-      <tbody>${rows}</tbody>
-    </table>
+    <div class="live-probability-list">${rows}</div>
     <div class="live-note">模型：已公布对阵按真实对阵模拟，未公布轮次按简化瑞士制配对；单盘按等强 50/50 估计。</div>`;
 }
 
 loadLiveEventsBtn.addEventListener('click', loadLiveEvents);
+liveProvinceSelect.addEventListener('change', () => liveProvinceSelect.setCustomValidity(''));
 liveGroupSelect.addEventListener('change', () => loadGroup(liveGroupSelect.value));
 refreshLiveGroupBtn.addEventListener('click', () => loadGroup(liveGroupSelect.value));
 
