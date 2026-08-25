@@ -1457,3 +1457,222 @@ button:disabled {
     gap: 8px;
   }
 }
+/* Live prediction round and scenario controls */
+.live-round-summary {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 3px;
+}
+
+.live-round-editor {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.live-round-input {
+  width: 64px;
+  height: 34px;
+  padding: 0 7px;
+  border: 1px solid #c9d4e1;
+  border-radius: 6px;
+  color: var(--text-strong);
+  background: var(--surface);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.live-round-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+.live-prediction-heading {
+  gap: 16px;
+}
+
+.live-next-opponent {
+  margin: 0 -20px 16px;
+  padding: 15px 20px 16px;
+  border-top: 1px solid var(--border-soft);
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--surface-soft);
+}
+
+.live-next-label,
+.live-result-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.live-next-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+  color: var(--text-strong);
+}
+
+.live-next-main strong {
+  font-size: 18px;
+}
+
+.live-next-round,
+.live-next-seat {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 8px;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.live-next-round {
+  color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.live-next-seat {
+  color: var(--purple);
+  background: var(--purple-soft);
+}
+
+.live-next-meta,
+.live-next-empty {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.live-result-scenario {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) auto minmax(210px, 1fr);
+  align-items: center;
+  gap: 14px;
+  margin-top: 14px;
+  padding-top: 13px;
+  border-top: 1px solid var(--border);
+}
+
+.live-result-copy {
+  display: grid;
+  gap: 1px;
+}
+
+.live-result-segment {
+  display: inline-grid;
+  grid-template-columns: repeat(3, minmax(64px, 1fr));
+  overflow: hidden;
+  min-height: 34px;
+  border: 1px solid #c9d4e1;
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.live-result-option {
+  min-width: 64px;
+  padding: 0 10px;
+  border: 0;
+  border-left: 1px solid var(--border);
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.live-result-option:first-child {
+  border-left: 0;
+}
+
+.live-result-option:hover {
+  color: var(--primary);
+  background: var(--surface-hover);
+}
+
+.live-result-option.is-active {
+  color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.live-result-option.is-active.is-win {
+  color: var(--green);
+  background: var(--green-soft);
+}
+
+.live-result-option.is-active.is-loss {
+  color: var(--red);
+  background: var(--red-soft);
+}
+
+.live-result-option:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
+.live-scenario-status {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+}
+
+.live-probability-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 3px;
+}
+
+.live-panel.is-updating .live-probability-list {
+  opacity: 0.46;
+  transition: opacity 120ms ease;
+}
+
+@media (max-width: 760px) {
+  .live-result-scenario {
+    grid-template-columns: 1fr auto;
+  }
+
+  .live-scenario-status {
+    grid-column: 1 / -1;
+    text-align: left;
+  }
+}
+
+@media (max-width: 560px) {
+  .live-round-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .live-next-opponent {
+    margin-right: -16px;
+    margin-left: -16px;
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  .live-result-scenario {
+    grid-template-columns: 1fr;
+  }
+
+  .live-result-segment {
+    width: 100%;
+  }
+
+  .live-scenario-status {
+    grid-column: auto;
+  }
+}

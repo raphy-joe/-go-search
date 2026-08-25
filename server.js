@@ -19,6 +19,7 @@ const { runCrawl, stopCrawl, getState: getCrawlerState } = require('./crawler');
 const { runIndex, stopIndex, getState: getIndexerState } = require('./indexer');
 const { estimatePlayerStrength } = require('./strength');
 const { estimatePromotionHistory } = require('./promotions');
+const liveEventSettings = require('./live-event-settings.json');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -33,6 +34,11 @@ const SEARCH_RETRIES    = 1;
 const LIVE_FALLBACK_LIMIT = parseInt(process.env.SEARCH_LIVE_FALLBACK_LIMIT || '250', 10);
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
+
+function configuredLiveEventTotalRounds(eventId) {
+  const rounds = parseInt(liveEventSettings[String(eventId)]?.total_rounds) || 0;
+  return Math.min(Math.max(rounds, 0), 30);
+}
 
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -312,6 +318,7 @@ app.get('/api/live-events', async (req, res) => {
         if (status === 'old') return;
         events.push({
           event_id: String(event.event_id),
+          total_rounds: configuredLiveEventTotalRounds(event.event_id),
           title: event.title,
           date: (event.min_time || '').substring(0, 10),
           province: event.provincename,
@@ -349,6 +356,7 @@ app.get('/api/live-event', async (req, res) => {
     const now = Date.now();
     res.json({
       event_id: eventId,
+      total_rounds: configuredLiveEventTotalRounds(eventId),
       groups: groups.map(g => ({
         group_id: String(g.groupid),
         group_name: g.groupname || '',
@@ -367,19 +375,27 @@ app.get('/api/live-event', async (req, res) => {
 
 app.get('/api/live-group', async (req, res) => {
   const groupId = String(req.query.group_id || '').trim();
+  const requestedTotalRounds = Math.min(Math.max(parseInt(req.query.total_rounds) || 0, 0), 30);
   if (!groupId) return res.status(400).json({ error: 'missing group_id' });
 
   try {
     const [players, matchData] = await Promise.all([
       fetchGroupParticipantsLive(groupId),
-      fetchGroupMatchesLive(groupId),
+      fetchGroupMatchesLive(groupId, requestedTotalRounds),
     ]);
-    const current = computeCurrentRanking(players, matchData.rows, Math.max(matchData.completedRounds || 0, 1));
+    const liveState = reconcileLivePlayers(players, matchData.rows);
+    const current = computeCurrentRanking(liveState.players, matchData.rows, Math.max(matchData.completedRounds || 0, 1));
     res.json({
       group_id: groupId,
-      total_rounds: matchData.totalRounds,
+      total_rounds: requestedTotalRounds
+        ? Math.max(requestedTotalRounds, matchData.completedRounds || 0, matchData.knownPairingRounds || 0)
+        : matchData.totalRounds,
+      total_rounds_source: requestedTotalRounds ? 'event' : matchData.totalRoundsSource,
       completed_rounds: matchData.completedRounds,
       known_pairing_rounds: matchData.knownPairingRounds,
+      score_updates_applied: liveState.updatedCount > 0,
+      score_updated_players: liveState.updatedCount,
+      score_updated_through_round: liveState.updatedThroughRound,
       players: current,
     });
   } catch (err) {
@@ -392,10 +408,12 @@ app.get('/api/live-prediction', async (req, res) => {
   const groupId = String(req.query.group_id || '').trim();
   const participantId = String(req.query.participant_id || '').trim();
   const simulations = Math.min(Math.max(parseInt(req.query.simulations) || 2000, 200), 8000);
+  const requestedTotalRounds = Math.min(Math.max(parseInt(req.query.total_rounds) || 0, 0), 30);
+  const nextResult = ['win', 'loss'].includes(req.query.next_result) ? req.query.next_result : '';
   if (!groupId || !participantId) return res.status(400).json({ error: 'missing params' });
 
   try {
-    const result = await predictPlayerRank({ groupId, participantId, simulations });
+    const result = await predictPlayerRank({ groupId, participantId, simulations, requestedTotalRounds, nextResult });
     res.json(result);
   } catch (err) {
     console.warn(`[LivePrediction] group ${groupId} player ${participantId} failed: ${err.message}`);
@@ -765,14 +783,26 @@ async function fetchGroupParticipantsLive(groupId) {
   throw new Error(`participants wait timeout for group ${groupId}`);
 }
 
-async function fetchGroupMatchesLive(groupId) {
+async function fetchGroupMatchesLive(groupId, requestedTotalRounds = 0) {
   const first = await fetchGroupRoundLive(groupId, 1);
-  const totalRounds = parseInt(first.total_bout) || inferTotalRoundsFromRows(first.rows || []);
-  const allRows = normalizeLiveRoundRows(groupId, 1, first.rows || []);
+  const cloudTotalRounds = parseInt(first.total_bout) || 0;
+  const totalRounds = cloudTotalRounds || inferTotalRoundsFromRows(first.rows || []);
+  const fetchThroughRound = Math.max(totalRounds, parseInt(requestedTotalRounds) || 0);
+  const firstRows = first.rows || [];
+  const allRows = normalizeLiveRoundRows(groupId, 1, firstRows);
+  const seenRoundPayloads = new Set();
+  const firstSignature = liveRoundPayloadSignature(firstRows);
+  if (firstSignature) seenRoundPayloads.add(firstSignature);
 
-  for (let bout = 2; bout <= totalRounds; bout++) {
+  for (let bout = 2; bout <= fetchThroughRound; bout++) {
     const data = await fetchGroupRoundLive(groupId, bout);
-    allRows.push(...normalizeLiveRoundRows(groupId, bout, data.rows || []));
+    const rawRows = data.rows || [];
+    const signature = liveRoundPayloadSignature(rawRows);
+    const isCloudFallback = bout > cloudTotalRounds && signature && seenRoundPayloads.has(signature);
+    if (!isCloudFallback) {
+      allRows.push(...normalizeLiveRoundRows(groupId, bout, rawRows));
+      if (signature) seenRoundPayloads.add(signature);
+    }
     await delay(25);
   }
 
@@ -783,12 +813,27 @@ async function fetchGroupMatchesLive(groupId) {
     rounds.get(row.bout).push(row);
   }
   let completedRounds = 0;
-  for (let bout = 1; bout <= totalRounds; bout++) {
+  for (let bout = 1; bout <= fetchThroughRound; bout++) {
     const rows = rounds.get(bout) || [];
-    if (rows.length && rows.every(isPlayedMatch)) completedRounds = bout;
+    if (!rows.length || !rows.every(isPlayedMatch)) break;
+    completedRounds = bout;
   }
 
-  return { rows: allRows, totalRounds, completedRounds, knownPairingRounds };
+  return {
+    rows: allRows,
+    totalRounds,
+    totalRoundsSource: cloudTotalRounds ? 'cloud' : 'inferred',
+    completedRounds,
+    knownPairingRounds,
+  };
+}
+
+function liveRoundPayloadSignature(rows) {
+  if (!rows?.length) return '';
+  return rows
+    .map(row => String(row.againstplanid || `${row.seatnum || ''}:${row.p1id || ''}:${row.p2id || ''}`))
+    .sort()
+    .join('|');
 }
 
 async function fetchGroupRoundLive(groupId, bout) {
@@ -837,32 +882,133 @@ function isResultCode(value) {
   return ['1', '2', '3'].includes(String(value));
 }
 
+function reconcileLivePlayers(players, matches) {
+  const matchStats = new Map(players.map(player => [String(player.id), {
+    score: 0,
+    win: 0,
+    lose: 0,
+    draw: 0,
+    games: 0,
+    throughRound: 0,
+  }]));
+
+  for (const row of matches) {
+    if (!isPlayedMatch(row)) continue;
+    applyLiveMatchResult(matchStats.get(row.p1_id), row.p1_result, row.p2_result, row.p1_score, row.p2_score, row.bout);
+    applyLiveMatchResult(matchStats.get(row.p2_id), row.p2_result, row.p1_result, row.p2_score, row.p1_score, row.bout);
+  }
+
+  let updatedCount = 0;
+  let updatedThroughRound = 0;
+  const reconciledPlayers = players.map(player => {
+    const stats = matchStats.get(String(player.id));
+    const cloudGames = (parseInt(player.win) || 0) + (parseInt(player.lose) || 0) + (parseInt(player.draw) || 0);
+    const useRoundResults = Boolean(stats && stats.games > cloudGames);
+    if (!useRoundResults) return { ...player, score_reconciled: false };
+
+    updatedCount += 1;
+    updatedThroughRound = Math.max(updatedThroughRound, stats.throughRound);
+    return {
+      ...player,
+      score: roundNumber(stats.score),
+      win: stats.win,
+      lose: stats.lose,
+      draw: stats.draw,
+      score_reconciled: true,
+    };
+  });
+
+  return {
+    players: reconciledPlayers,
+    updatedCount,
+    updatedThroughRound,
+  };
+}
+
+function applyLiveMatchResult(stats, ownResult, opponentResult, ownScore, opponentScore, bout) {
+  if (!stats) return;
+  const result = resolveLiveMatchResult(ownResult, opponentResult, ownScore, opponentScore);
+  if (!result) return;
+
+  const parsedScore = parseFloat(ownScore);
+  const fallbackScore = result === 'win' ? 2 : result === 'draw' ? 1 : 0;
+  stats.score += Number.isFinite(parsedScore) ? parsedScore : fallbackScore;
+  stats[result] += 1;
+  stats.games += 1;
+  stats.throughRound = Math.max(stats.throughRound, parseInt(bout) || 0);
+}
+
+function resolveLiveMatchResult(ownResult, opponentResult, ownScore, opponentScore) {
+  const ownCode = String(ownResult ?? '');
+  if (ownCode === '1') return 'win';
+  if (ownCode === '2') return 'lose';
+  if (ownCode === '3') return 'draw';
+
+  const opponentCode = String(opponentResult ?? '');
+  if (opponentCode === '1') return 'lose';
+  if (opponentCode === '2') return 'win';
+  if (opponentCode === '3') return 'draw';
+
+  const own = parseFloat(ownScore);
+  const opponent = parseFloat(opponentScore);
+  if (!Number.isFinite(own) || !Number.isFinite(opponent) || (own === 0 && opponent === 0)) return '';
+  if (own > opponent) return 'win';
+  if (own < opponent) return 'lose';
+  return 'draw';
+}
+
 function computeCurrentRanking(players, matches, totalRounds) {
   const playerMap = new Map(players.map(p => [String(p.id), p]));
+  const useComputedRanks = players.some(player => player.score_reconciled);
   const scoreMap = new Map(players.map(p => [String(p.id), parseFloat(p.score) || 0]));
   const opponentSets = buildInitialOpponentSets(players, matches);
   const rows = rankPlayersFromScores(players, scoreMap, opponentSets, Math.max(totalRounds || 0, 1));
   return rows.map(row => ({
     ...row,
     cloud_rank: playerMap.get(row.id)?.cloud_rank || 0,
+    display_rank: useComputedRanks ? row.rank : (playerMap.get(row.id)?.cloud_rank || row.rank),
+    score_reconciled: Boolean(playerMap.get(row.id)?.score_reconciled),
     win: playerMap.get(row.id)?.win || 0,
     lose: playerMap.get(row.id)?.lose || 0,
     draw: playerMap.get(row.id)?.draw || 0,
   }));
 }
 
-async function predictPlayerRank({ groupId, participantId, simulations }) {
-  const [players, matchData] = await Promise.all([
+async function predictPlayerRank({
+  groupId,
+  participantId,
+  simulations,
+  requestedTotalRounds = 0,
+  nextResult = '',
+}) {
+  const [rawPlayers, matchData] = await Promise.all([
     fetchGroupParticipantsLive(groupId),
-    fetchGroupMatchesLive(groupId),
+    fetchGroupMatchesLive(groupId, requestedTotalRounds),
   ]);
+  const liveState = reconcileLivePlayers(rawPlayers, matchData.rows);
+  const players = liveState.players;
   const selected = players.find(p => String(p.id) === String(participantId));
   if (!selected) throw new Error('player not found in group');
 
   const currentRows = computeCurrentRanking(players, matchData.rows, Math.max(matchData.completedRounds || 0, 1));
   const current = currentRows.find(p => p.id === String(participantId));
-  const totalRounds = Math.max(matchData.totalRounds || matchData.completedRounds || 1, 1);
+  const minimumTotalRounds = Math.max(matchData.completedRounds || 0, matchData.knownPairingRounds || 0, 1);
+  const totalRounds = requestedTotalRounds
+    ? Math.max(requestedTotalRounds, minimumTotalRounds)
+    : Math.max(matchData.totalRounds || 0, minimumTotalRounds);
   const rowsByBout = groupMatchesByBout(matchData.rows);
+  const pairingPlayers = selectActiveSimulationPlayers(players, matchData.rows, matchData.completedRounds);
+  const nextOpponent = findNextKnownOpponent({
+    participantId,
+    matches: matchData.rows,
+    players,
+    currentRows,
+    completedRounds: matchData.completedRounds,
+    totalRounds,
+  });
+  const normalizedNextResult = ['win', 'loss'].includes(nextResult) ? nextResult : '';
+  const appliedNextResult = nextOpponent ? normalizedNextResult : '';
+  const playerId = String(participantId);
   const counts = new Map();
 
   for (let i = 0; i < simulations; i++) {
@@ -874,16 +1020,25 @@ async function predictPlayerRank({ groupId, participantId, simulations }) {
       const rows = rowsByBout.get(bout) || [];
       const unplayedRows = rows.filter(row => !playedKeys.has(matchKey(row)) && !isPlayedMatch(row));
       if (unplayedRows.length) {
-        for (const row of unplayedRows) simulateKnownPairing(row, scoreMap, opponentSets);
+        for (const row of unplayedRows) {
+          const isSelectedNextMatch = appliedNextResult
+            && row.bout === nextOpponent.bout
+            && (row.p1_id === playerId || row.p2_id === playerId);
+          if (isSelectedNextMatch) {
+            simulateKnownPairingWithPlayerResult(row, playerId, appliedNextResult, scoreMap, opponentSets);
+          } else {
+            simulateKnownPairing(row, scoreMap, opponentSets);
+          }
+        }
         continue;
       }
       if (rows.length) continue;
-      const pairings = buildSwissPairings(players, scoreMap, opponentSets);
+      const pairings = buildSwissPairings(pairingPlayers, scoreMap, opponentSets);
       for (const pairing of pairings) simulateGeneratedPairing(pairing, scoreMap, opponentSets);
     }
 
     const ranked = rankPlayersFromScores(players, scoreMap, opponentSets, totalRounds);
-    const target = ranked.find(p => p.id === String(participantId));
+    const target = ranked.find(p => p.id === playerId);
     counts.set(target.rank, (counts.get(target.rank) || 0) + 1);
   }
 
@@ -899,12 +1054,21 @@ async function predictPlayerRank({ groupId, participantId, simulations }) {
   return {
     group_id: String(groupId),
     total_rounds: totalRounds,
+    detected_total_rounds: matchData.totalRounds,
+    total_rounds_source: requestedTotalRounds ? 'manual' : matchData.totalRoundsSource,
     completed_rounds: matchData.completedRounds,
     known_pairing_rounds: matchData.knownPairingRounds,
+    score_updates_applied: liveState.updatedCount > 0,
+    score_updated_players: liveState.updatedCount,
+    score_updated_through_round: liveState.updatedThroughRound,
+    next_bout: matchData.completedRounds < totalRounds ? matchData.completedRounds + 1 : null,
+    next_opponent: nextOpponent,
+    next_result: appliedNextResult,
     simulations,
     model: {
-      pairing: 'real-pairings-then-swiss',
-      win_probability: 'equal-strength-50-50',
+      pairing: 'real-pairings-then-swiss-active-roster',
+      pairing_players: pairingPlayers.length,
+      win_probability: appliedNextResult ? `next-match-fixed-${appliedNextResult}` : 'equal-strength-50-50',
       ranking_rule: 'cloud-total-score',
     },
     player: {
@@ -915,6 +1079,64 @@ async function predictPlayerRank({ groupId, participantId, simulations }) {
     current,
     probabilities,
   };
+}
+
+function simulateKnownPairingWithPlayerResult(row, participantId, result, scoreMap, opponentSets) {
+  const playerId = String(participantId);
+  const opponentId = row.p1_id === playerId ? row.p2_id : row.p1_id;
+  addOpponents(row.p1_id, row.p2_id, opponentSets);
+  addScore(result === 'win' ? playerId : opponentId, 2, scoreMap);
+}
+
+function findNextKnownOpponent({ participantId, matches, players, currentRows, completedRounds, totalRounds }) {
+  const playerId = String(participantId);
+  const nextMatch = matches
+    .filter(row => (
+      row.bout > completedRounds
+      && row.bout <= totalRounds
+      && !isPlayedMatch(row)
+      && (row.p1_id === playerId || row.p2_id === playerId)
+    ))
+    .sort((a, b) => a.bout - b.bout || a.seat - b.seat)[0];
+  if (!nextMatch) return null;
+
+  const isPlayerOne = nextMatch.p1_id === playerId;
+  const opponentId = isPlayerOne ? nextMatch.p2_id : nextMatch.p1_id;
+  const fallbackName = isPlayerOne ? nextMatch.p2_name : nextMatch.p1_name;
+  const fallbackOrg = isPlayerOne ? nextMatch.p2_org : nextMatch.p1_org;
+  const opponent = players.find(player => String(player.id) === String(opponentId));
+  const opponentCurrent = currentRows.find(player => String(player.id) === String(opponentId));
+
+  return {
+    bout: nextMatch.bout,
+    seat: nextMatch.seat,
+    id: String(opponentId),
+    name: opponent?.name || fallbackName || '',
+    org: opponent?.org || fallbackOrg || '',
+    current_rank: opponentCurrent?.display_rank || opponentCurrent?.cloud_rank || opponentCurrent?.rank || null,
+    score: opponentCurrent?.score ?? opponent?.score ?? null,
+    opponent_score: opponentCurrent?.opponent_score ?? null,
+    win: opponent?.win || 0,
+    lose: opponent?.lose || 0,
+    draw: opponent?.draw || 0,
+  };
+}
+
+const LIVE_BYE_OPPONENT_ID = '__live_bye__';
+
+function selectActiveSimulationPlayers(players, matches, completedRounds) {
+  const round = parseInt(completedRounds) || 0;
+  if (!round) return players;
+
+  const playerIds = new Set(players.map(player => String(player.id)));
+  const activeIds = new Set();
+  for (const row of matches) {
+    if (row.bout !== round) continue;
+    if (playerIds.has(row.p1_id)) activeIds.add(row.p1_id);
+    if (playerIds.has(row.p2_id)) activeIds.add(row.p2_id);
+  }
+  if (activeIds.size < 2) return players;
+  return players.filter(player => activeIds.has(String(player.id)));
 }
 
 function groupMatchesByBout(rows) {
@@ -930,7 +1152,17 @@ function buildInitialOpponentSets(players, rows) {
   const sets = new Map(players.map(p => [String(p.id), new Set()]));
   for (const row of rows) {
     if (!isPlayedMatch(row)) continue;
-    if (!sets.has(row.p1_id) || !sets.has(row.p2_id)) continue;
+    const hasP1 = sets.has(row.p1_id);
+    const hasP2 = sets.has(row.p2_id);
+    if (hasP1 && !hasP2) {
+      sets.get(row.p1_id).add(LIVE_BYE_OPPONENT_ID);
+      continue;
+    }
+    if (!hasP1 && hasP2) {
+      sets.get(row.p2_id).add(LIVE_BYE_OPPONENT_ID);
+      continue;
+    }
+    if (!hasP1 || !hasP2) continue;
     sets.get(row.p1_id).add(row.p2_id);
     sets.get(row.p2_id).add(row.p1_id);
   }
@@ -942,6 +1174,15 @@ function matchKey(row) {
 }
 
 function simulateKnownPairing(row, scoreMap, opponentSets) {
+  const hasP1 = scoreMap.has(row.p1_id);
+  const hasP2 = scoreMap.has(row.p2_id);
+  if (hasP1 !== hasP2) {
+    const byePlayer = hasP1 ? row.p1_id : row.p2_id;
+    addScore(byePlayer, 2, scoreMap);
+    opponentSets.get(byePlayer)?.add(LIVE_BYE_OPPONENT_ID);
+    return;
+  }
+
   addOpponents(row.p1_id, row.p2_id, opponentSets);
   if (Math.random() < 0.5) {
     addScore(row.p1_id, 2, scoreMap);
@@ -953,6 +1194,7 @@ function simulateKnownPairing(row, scoreMap, opponentSets) {
 function simulateGeneratedPairing(pairing, scoreMap, opponentSets) {
   if (pairing.bye) {
     addScore(pairing.bye, 2, scoreMap);
+    opponentSets.get(String(pairing.bye))?.add(LIVE_BYE_OPPONENT_ID);
     return;
   }
   addOpponents(pairing.p1, pairing.p2, opponentSets);
@@ -975,23 +1217,55 @@ function addOpponents(a, b, opponentSets) {
 
 function buildSwissPairings(players, scoreMap, opponentSets) {
   const queue = players
-    .map(p => ({ id: String(p.id), score: scoreMap.get(String(p.id)) || 0, short: parseInt(p.short_no) || 9999, jitter: Math.random() }))
-    .sort((a, b) => b.score - a.score || a.short - b.short || a.jitter - b.jitter);
+    .map(player => {
+      const id = String(player.id);
+      const opponentScore = [...(opponentSets.get(id) || [])]
+        .filter(opponentId => opponentId !== LIVE_BYE_OPPONENT_ID)
+        .reduce((sum, opponentId) => sum + (scoreMap.get(String(opponentId)) || 0), 0);
+      return {
+        id,
+        score: scoreMap.get(id) || 0,
+        opponentScore,
+        short: parseInt(player.short_no) || 9999,
+      };
+    })
+    .sort((a, b) => b.score - a.score || b.opponentScore - a.opponentScore || a.short - b.short);
   const pairings = [];
+  let byePlayer = null;
 
-  while (queue.length > 1) {
-    const p = queue.shift();
-    let bestIdx = 0;
-    for (let i = 0; i < queue.length; i++) {
-      if (!opponentSets.get(p.id)?.has(queue[i].id)) {
-        bestIdx = i;
+  if (queue.length % 2 === 1) {
+    let byeIndex = -1;
+    for (let index = queue.length - 1; index >= 0; index--) {
+      if (!opponentSets.get(queue[index].id)?.has(LIVE_BYE_OPPONENT_ID)) {
+        byeIndex = index;
         break;
       }
     }
-    const opp = queue.splice(bestIdx, 1)[0];
-    pairings.push({ p1: p.id, p2: opp.id });
+    if (byeIndex < 0) byeIndex = queue.length - 1;
+    byePlayer = queue.splice(byeIndex, 1)[0];
   }
-  if (queue.length) pairings.push({ bye: queue[0].id });
+
+  while (queue.length > 1) {
+    const player = queue.shift();
+    let bestIndex = -1;
+    let bestCost = Number.POSITIVE_INFINITY;
+    for (let index = 0; index < queue.length; index++) {
+      const opponent = queue[index];
+      if (opponentSets.get(player.id)?.has(opponent.id)) continue;
+      const cost = Math.abs(player.score - opponent.score) * 100000
+        + Math.abs(player.opponentScore - opponent.opponentScore) * 100
+        + index;
+      if (cost < bestCost) {
+        bestCost = cost;
+        bestIndex = index;
+      }
+    }
+    if (bestIndex < 0) bestIndex = 0;
+    const opponent = queue.splice(bestIndex, 1)[0];
+    pairings.push({ p1: player.id, p2: opponent.id });
+  }
+
+  if (byePlayer) pairings.push({ bye: byePlayer.id });
   return pairings;
 }
 
