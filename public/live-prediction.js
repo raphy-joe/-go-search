@@ -112,7 +112,7 @@ async function loadLiveEvents() {
 
   try {
     const params = new URLSearchParams({ province });
-    const resp = await fetch(`/api/live-events?${params}`);
+    const resp = await fetch(`/api/live-events?${params}`, { cache: 'no-store' });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || '查询失败');
     renderLiveEvents(data.events || []);
@@ -178,7 +178,7 @@ async function selectEvent(event, options = {}) {
 
   try {
     const params = new URLSearchParams({ event_id: event.event_id });
-    const resp = await fetch(`/api/live-event?${params}`);
+    const resp = await fetch(`/api/live-event?${params}`, { cache: 'no-store' });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || '组别加载失败');
     applyConfiguredEventTotalRounds(data.total_rounds);
@@ -220,7 +220,7 @@ async function loadGroup(groupId = liveGroupSelect.value, options = {}) {
   try {
     const params = new URLSearchParams({ group_id: groupId });
     if (selectedTotalRounds) params.set('total_rounds', String(selectedTotalRounds));
-    const resp = await fetch(`/api/live-group?${params}`);
+    const resp = await fetch(`/api/live-group?${params}`, { cache: 'no-store' });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || '本组加载失败');
     if (seq !== groupRequestSeq) return;
@@ -395,7 +395,7 @@ async function startPrediction(participantId, nextResult = selectedNextResult, o
     const totalRounds = readSelectedTotalRounds();
     if (totalRounds) params.set('total_rounds', String(totalRounds));
     if (normalizedResult) params.set('next_result', normalizedResult);
-    const resp = await fetch(`/api/live-prediction?${params}`);
+    const resp = await fetch(`/api/live-prediction?${params}`, { cache: 'no-store' });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || '预测失败');
     if (seq !== predictionRequestSeq) return;
@@ -430,17 +430,20 @@ function renderPrediction(data) {
   applyTotalRoundsValue(data.total_rounds, minimumRounds, false);
   selectedNextResult = normalizeNextResult(data.next_result);
   const nextOpponent = data.next_opponent;
+  const isBye = Boolean(nextOpponent?.is_bye);
   const nextRoundLabel = nextOpponent?.bout || data.next_bout;
-  const opponentMeta = nextOpponent ? [
+  const opponentMeta = nextOpponent && !isBye ? [
     nextOpponent.org && nextOpponent.org !== '--' ? nextOpponent.org : '',
     nextOpponent.current_rank ? `当前第 ${nextOpponent.current_rank} 名` : '',
     `${nextOpponent.win || 0}胜${nextOpponent.lose || 0}负${nextOpponent.draw ? `${nextOpponent.draw}和` : ''}`,
     nextOpponent.score !== null && nextOpponent.score !== undefined ? `大分 ${nextOpponent.score}` : '',
   ].filter(Boolean).join(' · ') : '';
   const resultLabel = selectedNextResult === 'win' ? '本局胜' : selectedNextResult === 'loss' ? '本局负' : '未设定';
-  const resultStatus = selectedNextResult
-    ? `已固定 ${data.player?.name || '当前棋手'} ${resultLabel}，下方概率已更新`
-    : '选择本局结果后，下方概率会自动更新';
+  const resultStatus = isBye
+    ? '本轮轮空，已自动按胜局计入概率计算'
+    : selectedNextResult
+      ? `已固定 ${data.player?.name || '当前棋手'} ${resultLabel}，下方概率已更新`
+      : '选择本局结果后，下方概率会自动更新';
 
   const resultOptions = [
     { value: '', label: '未设定' },
@@ -458,14 +461,18 @@ function renderPrediction(data) {
         ${nextOpponent.seat ? `<span class="live-next-seat">第 ${nextOpponent.seat} 台</span>` : ''}
       </div>
       ${opponentMeta ? `<div class="live-next-meta">${esc(opponentMeta)}</div>` : ''}
-      <div class="live-result-scenario">
-        <div class="live-result-copy">
-          <span class="live-result-label">设定本局结果</span>
-          <span class="live-muted">以 ${esc(data.player?.name || '当前棋手')} 为视角</span>
-        </div>
-        <div class="live-result-segment" role="group" aria-label="设定下一轮胜负结果">${resultOptions}</div>
+      ${isBye ? `
         <div id="liveScenarioStatus" class="live-scenario-status" aria-live="polite">${esc(resultStatus)}</div>
-      </div>
+      ` : `
+        <div class="live-result-scenario">
+          <div class="live-result-copy">
+            <span class="live-result-label">设定本局结果</span>
+            <span class="live-muted">以 ${esc(data.player?.name || '当前棋手')} 为视角</span>
+          </div>
+          <div class="live-result-segment" role="group" aria-label="设定下一轮胜负结果">${resultOptions}</div>
+          <div id="liveScenarioStatus" class="live-scenario-status" aria-live="polite">${esc(resultStatus)}</div>
+        </div>
+      `}
     </section>` : `
     <section class="live-next-opponent">
       <div class="live-next-label">下一轮对手</div>
@@ -490,7 +497,7 @@ function renderPrediction(data) {
       <div class="live-muted">${data.simulations} 次模拟</div>
     </div>
     <div class="live-probability-list">${rows}</div>
-    <div class="live-note">已公布对阵按真实配对模拟；未公布轮次按简化瑞士制配对。${selectedNextResult ? `下一轮已固定为${resultLabel}，` : ''}其余单盘按等强 50/50 估计。</div>`;
+    <div class="live-note">已公布对阵按真实配对模拟；未公布轮次按简化瑞士制配对。${isBye ? '轮空自动按胜局计入，' : selectedNextResult ? `下一轮已固定为${resultLabel}，` : ''}其余单盘按等强 50/50 估计。</div>`;
 
   const roundInput = bindTotalRoundsEditor('livePredictionTotalRoundsInput', minimumRounds);
   const recalculateBtn = document.getElementById('recalculatePredictionBtn');

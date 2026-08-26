@@ -13,6 +13,7 @@ const {
   queryHeadToHeadCandidates,
   getGroupMatchCache,
   replaceGroupMatchCache,
+  getLivePairingOverrides,
   getStats,
 } = require('./db');
 const { runCrawl, stopCrawl, getState: getCrawlerState } = require('./crawler');
@@ -41,6 +42,10 @@ function configuredLiveEventTotalRounds(eventId) {
 }
 
 app.use(express.static(path.join(__dirname, 'public')));
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/live-')) res.setHeader('Cache-Control', 'no-store');
+  next();
+});
 
 // ── /api/search ───────────────────────────────────────────────────────────────
 // DB 提供已过滤赛事列表 → 按姓名并发搜索
@@ -393,6 +398,7 @@ app.get('/api/live-group', async (req, res) => {
       total_rounds_source: requestedTotalRounds ? 'event' : matchData.totalRoundsSource,
       completed_rounds: matchData.completedRounds,
       known_pairing_rounds: matchData.knownPairingRounds,
+      manual_pairing_rounds: matchData.manualPairingRounds,
       score_updates_applied: liveState.updatedCount > 0,
       score_updated_players: liveState.updatedCount,
       score_updated_through_round: liveState.updatedThroughRound,
@@ -784,6 +790,7 @@ async function fetchGroupParticipantsLive(groupId) {
 }
 
 async function fetchGroupMatchesLive(groupId, requestedTotalRounds = 0) {
+  const manualRowsPromise = getLivePairingOverrides(groupId);
   const first = await fetchGroupRoundLive(groupId, 1);
   const cloudTotalRounds = parseInt(first.total_bout) || 0;
   const totalRounds = cloudTotalRounds || inferTotalRoundsFromRows(first.rows || []);
@@ -798,13 +805,23 @@ async function fetchGroupMatchesLive(groupId, requestedTotalRounds = 0) {
     const data = await fetchGroupRoundLive(groupId, bout);
     const rawRows = data.rows || [];
     const signature = liveRoundPayloadSignature(rawRows);
-    const isCloudFallback = bout > cloudTotalRounds && signature && seenRoundPayloads.has(signature);
+    const isCloudFallback = signature && seenRoundPayloads.has(signature);
     if (!isCloudFallback) {
       allRows.push(...normalizeLiveRoundRows(groupId, bout, rawRows));
       if (signature) seenRoundPayloads.add(signature);
     }
     await delay(25);
   }
+
+  const cloudRounds = new Set(allRows.map(row => row.bout));
+  const manualPairingRounds = new Set();
+  const manualRows = normalizeLivePairingOverrideRows(await manualRowsPromise);
+  for (const row of manualRows) {
+    if (row.bout > fetchThroughRound || cloudRounds.has(row.bout)) continue;
+    allRows.push(row);
+    manualPairingRounds.add(row.bout);
+  }
+  allRows.sort((a, b) => a.bout - b.bout || a.seat - b.seat);
 
   const knownPairingRounds = Math.max(0, ...allRows.map(r => r.bout));
   const rounds = new Map();
@@ -825,7 +842,28 @@ async function fetchGroupMatchesLive(groupId, requestedTotalRounds = 0) {
     totalRoundsSource: cloudTotalRounds ? 'cloud' : 'inferred',
     completedRounds,
     knownPairingRounds,
+    manualPairingRounds: [...manualPairingRounds].sort((a, b) => a - b),
   };
+}
+
+function normalizeLivePairingOverrideRows(rows) {
+  return rows
+    .filter(row => row.p1_id && row.p2_id)
+    .map(row => ({
+      group_id: String(row.group_id),
+      bout: parseInt(row.bout) || 0,
+      seat: parseInt(row.seat) || 0,
+      p1_id: String(row.p1_id),
+      p2_id: String(row.p2_id),
+      p1_name: row.p1_name || '',
+      p2_name: row.p2_name || '',
+      p1_org: row.p1_org || '',
+      p2_org: row.p2_org || '',
+      p1_result: '',
+      p2_result: '',
+      p1_score: 0,
+      p2_score: 0,
+    }));
 }
 
 function liveRoundPayloadSignature(rows) {
@@ -856,22 +894,33 @@ function inferTotalRoundsFromRows(rows) {
 
 function normalizeLiveRoundRows(groupId, bout, rows) {
   return rows
-    .filter(row => row.p1id && row.p2id)
-    .map(row => ({
-      group_id: String(groupId),
-      bout,
-      seat: parseInt(row.seatnum) || 0,
-      p1_id: String(row.p1id),
-      p2_id: String(row.p2id),
-      p1_name: row.p1 || '',
-      p2_name: row.p2 || '',
-      p1_org: row.p1_teamname || '',
-      p2_org: row.p2_teamname || '',
-      p1_result: String(row.p1_result ?? ''),
-      p2_result: String(row.p2_result ?? ''),
-      p1_score: parseFloat(row.p1_score) || 0,
-      p2_score: parseFloat(row.p2_score) || 0,
-    }));
+    .filter(row => (
+      (row.p1id && String(row.p1id) !== '0')
+      || (row.p2id && String(row.p2id) !== '0')
+    ))
+    .map(row => {
+      const p1Id = row.p1id && String(row.p1id) !== '0'
+        ? String(row.p1id)
+        : LIVE_BYE_OPPONENT_ID;
+      const p2Id = row.p2id && String(row.p2id) !== '0'
+        ? String(row.p2id)
+        : LIVE_BYE_OPPONENT_ID;
+      return {
+        group_id: String(groupId),
+        bout,
+        seat: parseInt(row.seatnum) || 0,
+        p1_id: p1Id,
+        p2_id: p2Id,
+        p1_name: row.p1 || (p1Id === LIVE_BYE_OPPONENT_ID ? '轮空' : ''),
+        p2_name: row.p2 || (p2Id === LIVE_BYE_OPPONENT_ID ? '轮空' : ''),
+        p1_org: row.p1_teamname || '',
+        p2_org: row.p2_teamname || '',
+        p1_result: String(row.p1_result ?? ''),
+        p2_result: String(row.p2_result ?? ''),
+        p1_score: parseFloat(row.p1_score) || 0,
+        p2_score: parseFloat(row.p2_score) || 0,
+      };
+    });
 }
 
 function isPlayedMatch(row) {
@@ -1007,7 +1056,7 @@ async function predictPlayerRank({
     totalRounds,
   });
   const normalizedNextResult = ['win', 'loss'].includes(nextResult) ? nextResult : '';
-  const appliedNextResult = nextOpponent ? normalizedNextResult : '';
+  const appliedNextResult = nextOpponent && !nextOpponent.is_bye ? normalizedNextResult : '';
   const playerId = String(participantId);
   const counts = new Map();
 
@@ -1058,6 +1107,7 @@ async function predictPlayerRank({
     total_rounds_source: requestedTotalRounds ? 'manual' : matchData.totalRoundsSource,
     completed_rounds: matchData.completedRounds,
     known_pairing_rounds: matchData.knownPairingRounds,
+    manual_pairing_rounds: matchData.manualPairingRounds,
     score_updates_applied: liveState.updatedCount > 0,
     score_updated_players: liveState.updatedCount,
     score_updated_through_round: liveState.updatedThroughRound,
@@ -1104,6 +1154,7 @@ function findNextKnownOpponent({ participantId, matches, players, currentRows, c
   const opponentId = isPlayerOne ? nextMatch.p2_id : nextMatch.p1_id;
   const fallbackName = isPlayerOne ? nextMatch.p2_name : nextMatch.p1_name;
   const fallbackOrg = isPlayerOne ? nextMatch.p2_org : nextMatch.p1_org;
+  const isBye = String(opponentId) === LIVE_BYE_OPPONENT_ID;
   const opponent = players.find(player => String(player.id) === String(opponentId));
   const opponentCurrent = currentRows.find(player => String(player.id) === String(opponentId));
 
@@ -1111,14 +1162,15 @@ function findNextKnownOpponent({ participantId, matches, players, currentRows, c
     bout: nextMatch.bout,
     seat: nextMatch.seat,
     id: String(opponentId),
-    name: opponent?.name || fallbackName || '',
-    org: opponent?.org || fallbackOrg || '',
-    current_rank: opponentCurrent?.display_rank || opponentCurrent?.cloud_rank || opponentCurrent?.rank || null,
-    score: opponentCurrent?.score ?? opponent?.score ?? null,
-    opponent_score: opponentCurrent?.opponent_score ?? null,
-    win: opponent?.win || 0,
-    lose: opponent?.lose || 0,
-    draw: opponent?.draw || 0,
+    name: isBye ? '轮空' : (opponent?.name || fallbackName || ''),
+    org: isBye ? '' : (opponent?.org || fallbackOrg || ''),
+    is_bye: isBye,
+    current_rank: isBye ? null : (opponentCurrent?.display_rank || opponentCurrent?.cloud_rank || opponentCurrent?.rank || null),
+    score: isBye ? null : (opponentCurrent?.score ?? opponent?.score ?? null),
+    opponent_score: isBye ? null : (opponentCurrent?.opponent_score ?? null),
+    win: isBye ? 0 : (opponent?.win || 0),
+    lose: isBye ? 0 : (opponent?.lose || 0),
+    draw: isBye ? 0 : (opponent?.draw || 0),
   };
 }
 

@@ -161,6 +161,26 @@ const initPromise = new Promise((res, rej) =>
       last_error    TEXT NOT NULL DEFAULT ''
     );
 
+    CREATE TABLE IF NOT EXISTS live_pairing_overrides (
+      group_id      TEXT NOT NULL DEFAULT '',
+      bout          INTEGER NOT NULL DEFAULT 0,
+      seat          INTEGER NOT NULL DEFAULT 0,
+      p1_id         TEXT NOT NULL DEFAULT '',
+      p2_id         TEXT NOT NULL DEFAULT '',
+      p1_name       TEXT NOT NULL DEFAULT '',
+      p2_name       TEXT NOT NULL DEFAULT '',
+      p1_org        TEXT NOT NULL DEFAULT '',
+      p2_org        TEXT NOT NULL DEFAULT '',
+      p1_short_no   TEXT NOT NULL DEFAULT '',
+      p2_short_no   TEXT NOT NULL DEFAULT '',
+      source        TEXT NOT NULL DEFAULT '',
+      updated_at    INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (group_id, bout, seat)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_live_pairing_overrides_group
+      ON live_pairing_overrides (group_id, bout, seat);
+
     CREATE TABLE IF NOT EXISTS event_notice_cache (
       event_id      TEXT PRIMARY KEY,
       notice_text   TEXT NOT NULL DEFAULT '',
@@ -390,6 +410,57 @@ async function getGroupMatchCache(group_id) {
   return { status: status || null, rows };
 }
 
+async function getLivePairingOverrides(group_id) {
+  await initPromise;
+  return all(
+    `SELECT * FROM live_pairing_overrides
+     WHERE group_id = ?
+     ORDER BY bout ASC, seat ASC`,
+    [String(group_id)]
+  );
+}
+
+async function replaceLivePairingOverrides({
+  group_id,
+  bout,
+  rows,
+  source = '',
+  updated_at = Date.now(),
+}) {
+  return withWriteLock(async () => {
+    await initPromise;
+    const groupId = String(group_id);
+    const round = parseInt(bout) || 0;
+    const sql = `
+      INSERT INTO live_pairing_overrides
+        (group_id, bout, seat, p1_id, p2_id, p1_name, p2_name,
+         p1_org, p2_org, p1_short_no, p2_short_no, source, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+
+    await run('BEGIN IMMEDIATE');
+    try {
+      await run(
+        'DELETE FROM live_pairing_overrides WHERE group_id = ? AND bout = ?',
+        [groupId, round]
+      );
+      for (const row of rows) {
+        await run(sql, [
+          groupId, round, parseInt(row.seat) || 0,
+          String(row.p1_id || ''), String(row.p2_id || ''),
+          row.p1_name || '', row.p2_name || '', row.p1_org || '', row.p2_org || '',
+          String(row.p1_short_no || ''), String(row.p2_short_no || ''),
+          row.source || source || '', updated_at,
+        ]);
+      }
+      await run('COMMIT');
+    } catch (err) {
+      await run('ROLLBACK');
+      throw err;
+    }
+  });
+}
+
 async function getEventNoticeCache(event_id) {
   await initPromise;
   return get(
@@ -542,6 +613,8 @@ module.exports = {
   queryHeadToHeadCandidates,
   getGroupMatchCache,
   replaceGroupMatchCache,
+  getLivePairingOverrides,
+  replaceLivePairingOverrides,
   getEventNoticeCache,
   replaceEventNoticeCache,
   upsertIndexedEvent,
