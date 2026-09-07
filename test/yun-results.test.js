@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { DatabaseSync } = require('node:sqlite');
+const sqlite3 = require('sqlite3');
 const { isGoEvent, isGoGroup, sportSql } = require('../sport-filter');
 const { assessYunMatches } = require('../result-quality');
 
@@ -15,10 +15,13 @@ test('Yunbisai rejects other sports and ambiguous multi-sport groups', () => {
   assert.equal(isGoGroup('\u56f4\u68cb\u6bd4\u8d5b', '\u4e94\u5b50\u68cb\u7ec4'), false);
 });
 
-test('legacy SQL filtering agrees with ingestion filtering', () => {
-  const db = new DatabaseSync(':memory:');
+test('legacy SQL filtering agrees with ingestion filtering', async () => {
+  const db = new sqlite3.Database(':memory:');
+  const run = (sql, params = []) => new Promise((resolve, reject) => {
+    db.run(sql, params, error => error ? reject(error) : resolve());
+  });
   try {
-    db.exec('CREATE TABLE events(title TEXT, group_name TEXT)');
+    await run('CREATE TABLE events(title TEXT, group_name TEXT)');
     const rows = [
       ['\u56f4\u68cb\u8c61\u68cb\u6bd4\u8d5b', '\u56f4\u68cb\u7ec4'],
       ['\u56f4\u68cb\u8c61\u68cb\u6bd4\u8d5b', '\u8c61\u68cb\u7ec4'],
@@ -26,10 +29,15 @@ test('legacy SQL filtering agrees with ingestion filtering', () => {
       ['\u56f4\u68cb\u6bd4\u8d5b', '3\u6bb5\u7ec4'],
       ['\u68cb\u7c7b\u8fd0\u52a8\u4f1a', 'U10'],
     ];
-    for (const row of rows) db.prepare('INSERT INTO events VALUES(?,?)').run(...row);
-    const actual = db.prepare(`SELECT * FROM events WHERE ${sportSql('title', 'group_name')}`).all();
+    for (const row of rows) await run('INSERT INTO events VALUES(?,?)', row);
+    const actual = await new Promise((resolve, reject) => {
+      db.all(`SELECT * FROM events WHERE ${sportSql('title', 'group_name')}`,
+        (error, result) => error ? reject(error) : resolve(result));
+    });
     assert.equal(actual.length, rows.filter(([title, group]) => isGoEvent({ title }) && isGoGroup(title, group)).length);
-  } finally { db.close(); }
+  } finally {
+    await new Promise((resolve, reject) => db.close(error => error ? reject(error) : resolve()));
+  }
 });
 
 test('small result gaps remain unknown and severe gaps are excluded', () => {
