@@ -11,6 +11,7 @@ const {
 const EVENT_NOTICE_API = 'https://data-center.yunbisai.com/api/lswl-events';
 const EVENTPART_API = 'https://api.yunbisai.com/request/Group/Eventpart';
 const NOTICE_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+const NOTICE_FAILURE_CACHE_TTL_MS = parseInt(process.env.NOTICE_FAILURE_CACHE_TTL_MS || '', 10) || 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 12000;
 const delay = ms => new Promise(r => setTimeout(r, ms));
 const CONFIRMED_PUBLIC_ASSOCIATION_RULE_EVENTS = new Set([
@@ -86,7 +87,7 @@ async function estimatePromotionHistory({ name, province = '', dateFrom = '0000-
   const groupRows = new Map();
   const eventGroups = new Map();
 
-  for (const item of candidates) {
+  const analyzed = await mapLimit(candidates, 4, async item => {
     const { row, level } = item;
     const stats = await enrichRankAndGroupSize(row, groupRows);
     const notice = await getNoticeForEvent(row.event_id, notices);
@@ -102,9 +103,9 @@ async function estimatePromotionHistory({ name, province = '', dateFrom = '0000-
     if (!decision?.promoted) {
       decision = await inferPromotionFromLaterGroups({ item, stats, rule, chronological, eventGroups });
     }
-    if (!decision.promoted) continue;
+    if (!decision.promoted) return null;
 
-    results.push({
+    return {
       event_id: String(row.event_id),
       title: row.title,
       date: (row.min_time || '').substring(0, 10),
@@ -126,8 +127,9 @@ async function estimatePromotionHistory({ name, province = '', dateFrom = '0000-
       ruleText: decision.ruleText,
       source: decision.source,
       detail_url: `https://www.yunbisai.com/tpl/eventFeatures/eventDetail-${row.event_id}.html#groupID=${row.group_id}`,
-    });
-  }
+    };
+  });
+  results.push(...analyzed.filter(Boolean));
 
   results.push(...getExternalPromotionRecords({ name, province, dateFrom, dateTo }));
   const uniqueResults = normalizePromotionSequence(dedupePromotionResults(results));
@@ -192,31 +194,47 @@ function dedupePromotionResults(items) {
   return out;
 }
 
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 function normalizePromotionSequence(items) {
   const chronological = [...items].sort((a, b) => {
     return (a.date || '').localeCompare(b.date || '')
       || String(a.event_id || '').localeCompare(String(b.event_id || ''));
   });
   const out = [];
-  const seenDanTargets = new Set();
-  let highestDan = 0;
+  const seenTargets = new Set();
+  let highestTarget = -Infinity;
 
   for (const item of chronological) {
-    const targetDan = parseDanLabel(item.promotedTo);
-    if (targetDan) {
-      if (seenDanTargets.has(targetDan) || targetDan <= highestDan) continue;
-      seenDanTargets.add(targetDan);
-      highestDan = targetDan;
-    }
+    const targetLabel = String(item.promotedTo || '').replace(/\s+/g, '');
+    const targetOrder = promotionTargetOrder(targetLabel);
+    if (targetOrder === null) continue;
+    if (seenTargets.has(targetLabel) || targetOrder <= highestTarget) continue;
+    seenTargets.add(targetLabel);
+    highestTarget = targetOrder;
     out.push(item);
   }
 
   return out;
 }
 
-function parseDanLabel(label) {
-  const m = String(label || '').match(/^(\d+)\s*段$/);
-  return m ? parseInt(m[1], 10) || 0 : 0;
+function promotionTargetOrder(label) {
+  const dan = String(label || '').match(/^(\d+)\s*段$/);
+  if (dan) return 100 + (parseInt(dan[1], 10) || 0);
+  const level = String(label || '').match(/^(\d+)\s*级$/);
+  if (level) return 100 - (parseInt(level[1], 10) || 0);
+  return null;
 }
 
 function parseCandidateLevel(groupName) {
@@ -295,16 +313,22 @@ async function enrichRankAndGroupSize(row, groupRows) {
 
 async function getNoticeForEvent(eventId, cache) {
   const key = String(eventId);
-  if (cache.has(key)) return cache.get(key);
-  const value = await getOrFetchEventNotice(key);
-  cache.set(key, value);
-  return value;
+  if (!cache.has(key)) {
+    cache.set(key, getOrFetchEventNotice(key));
+  }
+  return cache.get(key);
 }
 
 async function getOrFetchEventNotice(eventId) {
   const cached = await getEventNoticeCache(eventId);
-  const fresh = cached && cached.updated_at && Date.now() - cached.updated_at < NOTICE_CACHE_TTL_MS;
+  const cacheAge = cached?.updated_at ? Date.now() - cached.updated_at : Infinity;
+  const fresh = cacheAge < NOTICE_CACHE_TTL_MS;
+  const recentFailure = Boolean(cached?.last_error) && cacheAge < NOTICE_FAILURE_CACHE_TTL_MS;
   if (fresh && !cached.last_error) {
+    const cachedText = normalizeNoticeText(cached.notice_text || '');
+    return { text: cachedText, hasNotice: Boolean(cachedText) };
+  }
+  if (recentFailure) {
     const cachedText = normalizeNoticeText(cached.notice_text || '');
     return { text: cachedText, hasNotice: Boolean(cachedText) };
   }
@@ -835,6 +859,8 @@ function parseJsonp(text) {
 
 module.exports = {
   estimatePromotionHistory,
+  normalizePromotionSequence,
   parseCandidateLevel,
+  promotionQuota,
   extractPromotionRule,
 };

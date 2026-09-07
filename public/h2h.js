@@ -86,7 +86,7 @@ function showHeadToHeadMessage(msg) {
 function renderHeadToHeadResult(data) {
   const { summary, games, players } = data;
   const winRate = summary.games ? Math.round(summary.winRate * 1000) / 10 : 0;
-  if (!summary.games) {
+  if (!games.length) {
     showHeadToHeadMessage(`未找到「${esc(players.a)}」与「${esc(players.b)}」近两年的交手记录；已检查 ${data.checkedGroups || 0} 个同组候选。`);
     return;
   }
@@ -96,11 +96,11 @@ function renderHeadToHeadResult(data) {
       ? '<span class="m-win">胜</span>'
       : g.result === 'lose'
       ? '<span class="m-lose">负</span>'
-      : '<span class="m-draw">和</span>';
+      : g.result === 'draw' ? '<span class="m-draw">和</span>' : '<span class="m-pending">待赛</span>';
     const score = (g.score > 0 || g.opp_score > 0) ? `<span class="m-score">${g.score}:${g.opp_score}</span>` : '';
     return `<tr>
       <td>${esc(g.event.date || '')}</td>
-      <td><a class="h2h-event-link" href="${esc(g.event.detail_url)}" target="_blank">${esc(g.event.title)}</a><div class="opponent-org">${esc(g.group.name || '')}</div></td>
+      <td><a class="h2h-event-link" href="${esc(g.event.detail_url)}" target="_blank" rel="noopener">${esc(g.event.title)}</a><div class="opponent-org">${esc(g.group.name || '')}</div></td>
       <td>第${g.bout}轮</td>
       <td>${resultLabel} ${score}</td>
       <td>${esc(g.playerA.org || '')}</td>
@@ -116,6 +116,7 @@ function renderHeadToHeadResult(data) {
       <span>胜率 ${winRate}%</span>
       <span>同组候选 ${data.candidates || 0}，已检查 ${data.checkedGroups || 0}</span>
       ${data.failedGroups ? `<span>${data.failedGroups} 组加载失败</span>` : ''}
+      <span>同名棋手可能不同人</span>
     </div>
     <table class="h2h-table">
       <thead><tr><th>日期</th><th>赛事</th><th>轮次</th><th>结果</th><th>${esc(players.a)}单位</th><th>${esc(players.b)}单位</th></tr></thead>

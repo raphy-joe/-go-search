@@ -34,6 +34,13 @@ function pct(value) {
   return `${Math.round((Number(value) || 0) * 1000) / 10}%`;
 }
 
+function formatSnapshotTime(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+}
+
 function normalizeTotalRounds(value) {
   const parsed = parseInt(value, 10);
   return parsed > 0 ? Math.min(parsed, 30) : 0;
@@ -302,6 +309,7 @@ function renderGroupPlayers(data, options = {}) {
   }
 
   const minimumRounds = prepareTotalRounds(data);
+  const snapshotLabel = formatSnapshotTime(data.snapshot_at);
   if (options.predictionOnly && options.autoPredictId) {
     startPrediction(options.autoPredictId);
     return;
@@ -323,7 +331,7 @@ function renderGroupPlayers(data, options = {}) {
       <div>
         <div class="live-panel-title">当前名次</div>
         <div class="live-round-summary">
-          <div class="live-muted">已完成 ${data.completed_rounds || 0} 轮 · 已知对阵至第 ${data.known_pairing_rounds || 0} 轮${data.score_updates_applied ? ` · 积分已按第 ${data.score_updated_through_round || data.completed_rounds} 轮赛果更新` : ''}</div>
+          <div class="live-muted">已完成 ${data.completed_rounds || 0} 轮 · 已知对阵至第 ${data.known_pairing_rounds || 0} 轮${data.score_updates_applied ? ` · 积分已按第 ${data.score_updated_through_round || data.completed_rounds} 轮赛果更新` : ''}${snapshotLabel ? ` · 数据 ${snapshotLabel}` : ''}</div>
           ${renderTotalRoundsEditor('liveTotalRoundsInput', minimumRounds)}
         </div>
       </div>
@@ -429,6 +437,10 @@ function renderPrediction(data) {
   const minimumRounds = getMinimumTotalRounds(data);
   applyTotalRoundsValue(data.total_rounds, minimumRounds, false);
   selectedNextResult = normalizeNextResult(data.next_result);
+  const snapshotLabel = formatSnapshotTime(data.snapshot_at);
+  const manualPairingRounds = (data.manual_pairing_rounds || []).map(Number);
+  const nextPairingIsManual = Boolean(data.next_opponent) && manualPairingRounds.includes(Number(data.next_opponent.bout));
+  const nextPairingSource = nextPairingIsManual ? '人工录入对阵' : '云比赛公布';
   const nextOpponent = data.next_opponent;
   const isBye = Boolean(nextOpponent?.is_bye);
   const nextRoundLabel = nextOpponent?.bout || data.next_bout;
@@ -454,7 +466,7 @@ function renderPrediction(data) {
 
   const nextOpponentHtml = nextOpponent ? `
     <section class="live-next-opponent">
-      <div class="live-next-label">下一轮对手</div>
+      <div class="live-next-label">下一轮对手 · ${nextPairingSource}</div>
       <div class="live-next-main">
         <span class="live-next-round">第 ${nextOpponent.bout} 轮</span>
         <strong>${esc(nextOpponent.name || '未知棋手')}</strong>
@@ -479,12 +491,12 @@ function renderPrediction(data) {
       <div class="live-next-empty">${nextRoundLabel ? `云比赛暂未公布第 ${nextRoundLabel} 轮对阵` : '比赛已完成或暂无后续轮次'}${nextRoundLabel ? '，该轮将按瑞士制模拟配对。' : ''}</div>
     </section>`;
 
-  const probabilityTitle = selectedNextResult ? `${resultLabel}后的最终名次概率` : '最终名次概率';
+  const probabilityTitle = selectedNextResult ? `${resultLabel}后的最终名次模拟概率` : '最终名次模拟概率';
   livePredictionPanel.innerHTML = `
     <div class="live-panel-heading live-prediction-heading">
       <div>
         <div class="live-panel-title">${esc(data.player?.name || '')} 的名次预测</div>
-        <div class="live-muted">当前第 ${current.display_rank || current.cloud_rank || current.rank || '-'} 名 · 大分 ${current.score ?? '-'} · 小分 ${current.opponent_score ?? '-'} · 总得分 ${current.total_score ?? '-'}${data.score_updates_applied ? ` · 已按第 ${data.score_updated_through_round || data.completed_rounds} 轮赛果更新` : ''}</div>
+        <div class="live-muted">当前第 ${current.display_rank || current.cloud_rank || current.rank || '-'} 名 · 大分 ${current.score ?? '-'} · 小分 ${current.opponent_score ?? '-'} · 总得分 ${current.total_score ?? '-'}${data.score_updates_applied ? ` · 已按第 ${data.score_updated_through_round || data.completed_rounds} 轮赛果更新` : ''}${snapshotLabel ? ` · 数据 ${snapshotLabel}` : ''}</div>
       </div>
       <div class="live-round-actions">
         ${renderTotalRoundsEditor('livePredictionTotalRoundsInput', minimumRounds)}
@@ -497,7 +509,7 @@ function renderPrediction(data) {
       <div class="live-muted">${data.simulations} 次模拟</div>
     </div>
     <div class="live-probability-list">${rows}</div>
-    <div class="live-note">已公布对阵按真实配对模拟；未公布轮次按简化瑞士制配对。${isBye ? '轮空自动按胜局计入，' : selectedNextResult ? `下一轮已固定为${resultLabel}，` : ''}其余单盘按等强 50/50 估计。</div>`;
+    <div class="live-note">已公布对阵按真实配对模拟；未公布轮次仅在概率计算中按简化瑞士制配对，不展示为正式对阵。${isBye ? '轮空自动按胜局计入，' : selectedNextResult ? `下一轮已固定为${resultLabel}，` : ''}其余单盘按等强 50/50 估计，结果仅供趋势判断。</div>`;
 
   const roundInput = bindTotalRoundsEditor('livePredictionTotalRoundsInput', minimumRounds);
   const recalculateBtn = document.getElementById('recalculatePredictionBtn');

@@ -10,6 +10,8 @@
 const sqlite3 = require('sqlite3').verbose();
 const path    = require('path');
 const fs      = require('fs');
+const { sportSql } = require('./sport-filter');
+const { assessYunMatches } = require('./result-quality');
 
 const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
@@ -188,7 +190,32 @@ const initPromise = new Promise((res, rej) =>
       last_error    TEXT NOT NULL DEFAULT ''
     );
   `, err => err ? rej(err) : res())
-).then(ensureParticipantRankColumn);
+).then(ensureParticipantRankColumn).then(ensureGoViews);
+
+async function ensureGoViews() {
+  await run('BEGIN IMMEDIATE');
+  try {
+  await run(`CREATE TABLE IF NOT EXISTS result_quality_exclusions (
+    group_id TEXT PRIMARY KEY, reason TEXT NOT NULL, updated_at INTEGER NOT NULL)`);
+  await run('DROP VIEW IF EXISTS go_participant_index');
+  await run('DROP VIEW IF EXISTS go_event_groups');
+  await run('DROP VIEW IF EXISTS go_events');
+  await run(`CREATE VIEW IF NOT EXISTS go_events AS SELECT * FROM events WHERE ${sportSql('title')}`);
+  await run(`CREATE VIEW IF NOT EXISTS go_participant_index AS
+    SELECT p.* FROM participant_index p JOIN events e ON e.event_id=p.event_id
+    WHERE ${sportSql('e.title', 'p.group_name')}
+      AND (p.win+p.lose+p.draw)>0
+      AND NOT EXISTS (SELECT 1 FROM result_quality_exclusions q WHERE q.group_id=p.group_id)`);
+  await run(`CREATE VIEW IF NOT EXISTS go_event_groups AS
+    SELECT g.* FROM event_groups g JOIN events e ON e.event_id=g.event_id
+    WHERE ${sportSql('e.title', 'g.group_name')}
+      AND NOT EXISTS (SELECT 1 FROM result_quality_exclusions q WHERE q.group_id=g.group_id)`);
+    await run('COMMIT');
+  } catch (error) {
+    await run('ROLLBACK');
+    throw error;
+  }
+}
 
 async function ensureParticipantRankColumn() {
   const cols = await all('PRAGMA table_info(participant_index)');
@@ -239,7 +266,7 @@ async function queryEvents({ province, dateFrom, dateTo }) {
 
   return all(
     `SELECT event_id, title, min_time, provincename, city_name, cname
-     FROM events WHERE ${conds.join(' AND ')} ORDER BY min_time DESC`,
+     FROM go_events WHERE ${conds.join(' AND ')} ORDER BY min_time DESC`,
     params
   );
 }
@@ -259,7 +286,7 @@ async function queryEventsForIndex({ province = '', dateFrom, dateTo, force = fa
 
   return all(
     `SELECT e.event_id, e.title, e.min_time, e.provincename, e.city_name, e.cname
-     FROM events e
+     FROM go_events e
      LEFT JOIN indexed_events ie ON ie.event_id = e.event_id
      WHERE ${conds.join(' AND ')} ORDER BY e.min_time DESC${limitClause}`,
     params
@@ -284,7 +311,7 @@ async function getIndexCoverage({ province = '', dateFrom, dateTo }) {
        COUNT(*) AS eventCount,
        SUM(CASE WHEN ${NEEDS_INDEX_COND} THEN 0 ELSE 1 END) AS indexedEventCount,
        SUM(CASE WHEN ${NEEDS_INDEX_COND} THEN 1 ELSE 0 END) AS unindexedEventCount
-     FROM events e
+     FROM go_events e
      LEFT JOIN indexed_events ie ON ie.event_id = e.event_id
      WHERE ${conds.join(' AND ')}`,
     params
@@ -305,8 +332,8 @@ async function queryParticipants({ name, province = '', dateFrom, dateTo }) {
        e.event_id, e.title, e.min_time, e.provincename, e.city_name, e.cname,
        p.group_id, p.group_name, p.participant_id, p.participant_name,
        p.org, p.win, p.lose, p.draw, p.score, p.rank
-     FROM participant_index p
-     JOIN events e ON e.event_id = p.event_id
+     FROM go_participant_index p
+     JOIN go_events e ON e.event_id = p.event_id
      WHERE ${conds.join(' AND ')} ORDER BY e.min_time DESC`,
     params
   );
@@ -323,8 +350,8 @@ async function queryParticipantsForGroups(groupIds) {
        e.event_id, e.title, e.min_time, e.provincename, e.city_name, e.cname,
        p.group_id, p.group_name, p.participant_id, p.participant_name,
        p.org, p.win, p.lose, p.draw, p.score, p.rank
-     FROM participant_index p
-     JOIN events e ON e.event_id = p.event_id
+     FROM go_participant_index p
+     JOIN go_events e ON e.event_id = p.event_id
      WHERE p.group_id IN (${placeholders})`,
     ids
   );
@@ -353,11 +380,11 @@ async function queryHeadToHeadCandidates({ playerA, playerB, province = '', date
        p2.participant_id AS player_b_id, p2.participant_name AS player_b_name, p2.org AS player_b_org,
        (p1.win + p1.lose + p1.draw) AS player_a_rounds,
        (p2.win + p2.lose + p2.draw) AS player_b_rounds
-     FROM participant_index p1
-     JOIN participant_index p2
+     FROM go_participant_index p1
+     JOIN go_participant_index p2
        ON p2.event_id = p1.event_id
       AND p2.group_id = p1.group_id
-     JOIN events e ON e.event_id = p1.event_id
+     JOIN go_events e ON e.event_id = p1.event_id
      WHERE ${conds.join(' AND ')}
      ORDER BY e.min_time DESC
      LIMIT ?`,
@@ -369,7 +396,7 @@ async function queryEventGroups(eventId) {
   await initPromise;
   return all(
     `SELECT group_id, event_id, group_name, team_type, pnumber
-     FROM event_groups
+     FROM go_event_groups
      WHERE event_id = ?
      ORDER BY CAST(group_id AS INTEGER) ASC`,
     [String(eventId)]
@@ -391,10 +418,10 @@ async function queryPromotionCandidates({ name, province = '', dateFrom, dateTo 
        p.group_id, p.group_name, p.participant_id, p.participant_name,
        p.org, p.win, p.lose, p.draw, p.score, p.rank,
        eg.pnumber AS group_size,
-       (SELECT COUNT(*) FROM participant_index px WHERE px.group_id = p.group_id) AS indexed_group_size
-     FROM participant_index p
-     JOIN events e ON e.event_id = p.event_id
-     LEFT JOIN event_groups eg ON eg.group_id = p.group_id
+       (SELECT COUNT(*) FROM go_participant_index px WHERE px.group_id = p.group_id) AS indexed_group_size
+     FROM go_participant_index p
+     JOIN go_events e ON e.event_id = p.event_id
+     LEFT JOIN go_event_groups eg ON eg.group_id = p.group_id
      WHERE ${conds.join(' AND ')}
      ORDER BY e.min_time DESC`,
     params
@@ -580,15 +607,37 @@ async function replaceParticipantsForEvent(event_id, participants) {
   });
 }
 
+async function updateGroupResultQuality(groupId, rows) {
+  await initPromise;
+  const event = await get(`SELECT e.min_time FROM events e JOIN event_groups g ON g.event_id=e.event_id WHERE g.group_id=?`, [String(groupId)]);
+  // Historical result quality must not hide ongoing or recently finishing events.
+  const date = event?.min_time?.slice(0, 10);
+  if (!date || date >= new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10)) return { eligible: true };
+  const quality = assessYunMatches(rows);
+  await withWriteLock(async () => {
+    if (quality.eligible) await run('DELETE FROM result_quality_exclusions WHERE group_id=?', [String(groupId)]);
+    else await run('INSERT OR REPLACE INTO result_quality_exclusions(group_id,reason,updated_at) VALUES(?,?,?)',
+      [String(groupId), JSON.stringify(quality), Date.now()]);
+  });
+  return quality;
+}
+
+async function queryExcludedResultGroups(limit = 10) {
+  await initPromise;
+  return all(`SELECT q.group_id,c.rounds FROM result_quality_exclusions q
+    JOIN group_match_cache_status c ON c.group_id=q.group_id
+    ORDER BY q.updated_at LIMIT ?`, [limit]);
+}
+
 /** 获取 DB 中赛事总数和更新时间 */
 async function getStats() {
   await initPromise;
   const [cnt, ts, pcnt, icnt, pts] = await Promise.all([
-    get(`SELECT COUNT(*) AS c FROM events`),
-    get(`SELECT MAX(updated_at) AS t FROM events`),
-    get(`SELECT COUNT(*) AS c FROM participant_index`),
+    get(`SELECT COUNT(*) AS c FROM go_events`),
+    get(`SELECT MAX(updated_at) AS t FROM go_events`),
+    get(`SELECT COUNT(*) AS c FROM go_participant_index`),
     get(`SELECT COUNT(*) AS c FROM indexed_events WHERE last_error = ''`),
-    get(`SELECT MAX(updated_at) AS t FROM participant_index`),
+    get(`SELECT MAX(updated_at) AS t FROM go_participant_index`),
   ]);
   return {
     eventCount: cnt.c,
@@ -601,6 +650,8 @@ async function getStats() {
 
 module.exports = {
   initPromise,
+  updateGroupResultQuality,
+  queryExcludedResultGroups,
   upsertEvents,
   queryEvents,
   queryEventsForIndex,

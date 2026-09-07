@@ -1,6 +1,7 @@
 'use strict';
 
 const fetch = require('node-fetch');
+const { isGoGroup } = require('./sport-filter');
 const {
   queryEventsForIndex,
   upsertEventGroups,
@@ -119,7 +120,7 @@ async function indexEvent(event) {
   throwIfStopped();
   const groups = await fetchEventGroups(event.event_id);
   const now = Date.now();
-  const normalizedGroups = groups.map(g => ({
+  const normalizedGroups = groups.filter(g => isGoGroup(event.title, g.groupname)).map(g => ({
     group_id: g.groupid,
     event_id: String(event.event_id),
     group_name: g.groupname || '',

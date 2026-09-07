@@ -10,6 +10,7 @@
 
 const fetch  = require('node-fetch');
 const { upsertEvents, getStats } = require('./db');
+const { isGoEvent } = require('./sport-filter');
 
 const EVENTS_API       = 'https://data-center.yunbisai.com/api/lswl-events';
 const PAGE_CONCURRENCY = parseInt(process.env.CRAWL_PAGE_CONCURRENCY || '2', 10);
@@ -86,6 +87,7 @@ async function fetchPageWithRetry(eventType, province, page) {
 
 // ── 主入口 ────────────────────────────────────────────────────────────────────
 async function runCrawl({ eventType = '2', province = '' } = {}) {
+  if (String(eventType) !== '2') throw new Error('ONLY_GO_EVENTS_SUPPORTED');
   if (state.running) { console.log('[Crawler] Already running.'); return; }
 
   state = {
@@ -137,7 +139,8 @@ async function runCrawl({ eventType = '2', province = '' } = {}) {
     // 持久化
     throwIfStopped();
     const now = Date.now();
-    await upsertEvents(allRows.map(e => ({
+    const goRows = allRows.filter(e => String(e.event_value) === '2' && isGoEvent(e));
+    await upsertEvents(goRows.map(e => ({
       event_id:     String(e.event_id),
       title:        e.title        || '',
       min_time:     e.min_time     || '',
@@ -148,7 +151,7 @@ async function runCrawl({ eventType = '2', province = '' } = {}) {
       updated_at:   now,
     })));
 
-    state.eventsStored = allRows.length;
+    state.eventsStored = goRows.length;
     const stats = await getStats();
     if (failedCount) {
       const sample = state.failedPages.slice(0, 12).map(p => `${p.page}:${p.error}`).join(', ');

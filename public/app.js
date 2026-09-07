@@ -174,7 +174,9 @@ function renderHeadToHeadResult(data) {
       ? '<span class="m-win">胜</span>'
       : g.result === 'lose'
       ? '<span class="m-lose">负</span>'
-      : '<span class="m-draw">和</span>';
+      : g.result === 'draw'
+      ? '<span class="m-draw">和</span>'
+      : '<span class="m-pending">待赛</span>';
     const score = (g.score > 0 || g.opp_score > 0) ? `<span class="m-score">${g.score}:${g.opp_score}</span>` : '';
     return `<tr>
       <td>${esc(g.event.date || '')}</td>
@@ -224,6 +226,7 @@ function startSearch() {
   strengthEvalVersion++;
   currentProvince = province;
   clearHeadToHeadResult();
+  clearIdentityNotice();
 
   if (evtSource) { evtSource.close(); evtSource = null; }
   if (strengthRefreshTimer) {
@@ -316,7 +319,9 @@ function startSearch() {
         progressBar.style.width = '100%';
         if (msg.partial) {
           progressText.textContent = '已返回已索引结果';
-          progressCount.textContent = `已检索本地索引 ${msg.searched} / ${msg.queued} 场，找到 ${hits} 条记录，${msg.fallbackQueued || 0} 场正在后台补索引`;
+          const missing = msg.fallbackQueued || 0;
+          const missingStatus = msg.backfillStarted ? `${missing} 场已启动后台补索引` : `${missing} 场尚未建立索引`;
+          progressCount.textContent = `已检索本地索引 ${msg.searched} / ${msg.queued} 场，找到 ${hits} 条记录，${missingStatus}`;
         } else {
           progressText.textContent = '搜索完成';
           progressCount.textContent = `共搜索 ${msg.searched} 场赛事，找到 ${hits} 条记录${msg.failed ? `，${msg.failed} 场请求失败` : ''}`;
@@ -330,6 +335,7 @@ function startSearch() {
           clearPromotionCard();
           showEmpty(name, province, msg.partial);
         } else {
+          renderIdentityNotice(allHits, province);
           showStrengthEstimate([...allHits], seq, name);
           showPromotionHistory(seq, name, province, dateFrom, dateTo);
         }
@@ -372,7 +378,7 @@ function buildCard(msg) {
       <div class="card-meta">
         <span>📅 ${esc(event.date || '—')}</span>
         <span>📍 ${esc(event.province || '')} ${esc(event.city || '')}</span>
-        <span>🏢 ${esc(event.organizer || '')}</span>
+        ${event.organizer ? `<span>🏢 ${esc(event.organizer)}</span>` : ''}
       </div>
       <div class="card-scores">
         ${player.group ? `<span class="score-tag group">${esc(player.group)}</span>` : ''}
@@ -380,13 +386,13 @@ function buildCard(msg) {
         <span class="score-tag win">胜 ${winNum}</span>
         <span class="score-tag lose">负 ${loseNum}</span>
         ${drawNum > 0 ? `<span class="score-tag draw">和 ${drawNum}</span>` : ''}
-        <span class="score-tag score">积分 ${esc(player.score)}</span>
+        <span class="score-tag score">积分 ${esc(player.score === '' ? '未公布' : player.score)}</span>
         ${player.rank ? `<span class="score-tag rank">名次 ${esc(player.rank)}</span>` : ''}
       </div>
     </div>
     <div class="card-links">
-      <a href="${esc(event.detail_url)}" target="_blank">赛事详情 →</a>
-      <a href="${esc(player.detail_url)}" target="_blank">个人对局 →</a>
+      <a href="${esc(event.detail_url)}" target="_blank" rel="noopener">赛事详情 →</a>
+      ${player.detail_url ? `<a href="${esc(player.detail_url)}" target="_blank" rel="noopener">个人对局 →</a>` : ''}
       ${totalRounds > 0 ? `<button class="btn-expand" type="button">展开对局 ▾</button>` : ''}
     </div>
     ${totalRounds > 0 ? `<div class="matches-panel" style="display:none"></div>` : ''}`;
@@ -416,6 +422,7 @@ function buildCard(msg) {
         });
         const resp = await fetch(`/api/matches?${params}`);
         const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || '对局读取失败');
         if (!data.matches || data.matches.length === 0) {
           panel.innerHTML = `<div class="matches-empty">暂无对局数据，<a href="${esc(event.detail_url)}" target="_blank">查看对阵表 →</a></div>`;
           return;
@@ -427,12 +434,16 @@ function buildCard(msg) {
         }
         const rows = data.matches.map(m => {
           if (m.opponent === null) return `<tr><td class="bout-num">第${m.bout}轮</td><td colspan="3" class="no-data">—</td></tr>`;
-          const resultLabel = m.result === 'win' ? '<span class="m-win">胜</span>' : m.result === 'lose' ? '<span class="m-lose">负</span>' : '<span class="m-draw">和</span>';
-          const scoreStr = (m.score > 0 || m.opp_score > 0) ? `<span class="m-score">${m.score}:${m.opp_score}</span>` : '';
-          const oppLink = m.opponent
+          const resultLabel = m.result === 'win'
+            ? '<span class="m-win">胜</span>'
+            : m.result === 'lose'
+            ? '<span class="m-lose">负</span>'
+            : m.result === 'draw' ? '<span class="m-draw">和</span>' : '<span class="m-pending">待赛</span>';
+          const scoreStr = m.result && (m.score > 0 || m.opp_score > 0) ? `<span class="m-score">${m.score}:${m.opp_score}</span>` : '';
+          const oppLink = m.opponent && !m.bye
             ? `<a href="/?name=${encodeURIComponent(m.opponent)}&province=${encodeURIComponent(currentProvince)}" target="_blank" class="opp-link">${esc(m.opponent)}</a>`
             : '';
-          const h2hLink = m.opponent
+          const h2hLink = m.opponent && !m.bye
             ? `<button type="button" class="h2h-link" data-opponent="${esc(m.opponent)}">交手</button>`
             : '';
           return `<tr>
@@ -451,6 +462,7 @@ function buildCard(msg) {
           });
         });
       } catch (e) {
+        loaded = false;
         panel.innerHTML = `<div class="matches-empty">加载失败，<a href="${esc(event.detail_url)}" target="_blank">查看对阵表 →</a></div>`;
       }
     });
@@ -460,15 +472,50 @@ function buildCard(msg) {
 }
 
 function showEmpty(name, province, partial = false) {
+  const provinceLabel = province === '__ALL__' ? '全国' : province;
   const hint = partial
     ? '部分赛事正在后台补索引，稍后再查会更完整'
     : '请确认姓名是否精确，或尝试换一个省份';
   resultsList.innerHTML = `
     <div class="state-msg">
       <div class="icon">🔍</div>
-      <div>${partial ? '已索引赛事中暂未找到' : '未找到'}「${esc(name)}」在${esc(province)}近两年的参赛记录</div>
+      <div>${partial ? '已索引赛事中暂未找到' : '未找到'}「${esc(name)}」在${esc(provinceLabel)}近两年的参赛记录</div>
       <div style="margin-top:6px;font-size:.82rem">${hint}</div>
     </div>`;
+}
+
+function clearIdentityNotice() {
+  document.getElementById('identityNotice')?.remove();
+}
+
+function renderIdentityNotice(items, province) {
+  clearIdentityNotice();
+  if (province !== '__ALL__') return;
+  const provinces = [...new Set(items.map(item => item.event?.province).filter(Boolean))];
+  const organizers = new Set(items.map(item => item.event?.organizer).filter(Boolean));
+  if (provinces.length < 2 && organizers.size < 4) return;
+
+  const notice = document.createElement('aside');
+  notice.id = 'identityNotice';
+  notice.className = 'identity-notice';
+  notice.setAttribute('role', 'status');
+  const provinceButtons = provinces.slice(0, 6).map(item => (
+    `<button type="button" data-province="${esc(item)}">仅查 ${esc(item)}</button>`
+  )).join('');
+  notice.innerHTML = `
+    <div class="identity-notice-copy">
+      <strong>请核对是否为同一位棋手</strong>
+      <span>全国结果来自 ${provinces.length || 1} 个省份、${organizers.size || 1} 个组织，可能包含同名选手。</span>
+    </div>
+    ${provinceButtons ? `<div class="identity-notice-actions">${provinceButtons}</div>` : ''}`;
+  const anchor = document.getElementById('strengthCard') || resultsList;
+  anchor.before(notice);
+  notice.querySelectorAll('[data-province]').forEach(button => {
+    button.addEventListener('click', () => {
+      provinceSelect.value = button.dataset.province;
+      startSearch();
+    });
+  });
 }
 
 // ── Strength estimation ────────────────────────────────────────────────────────
@@ -709,6 +756,7 @@ function buildHeadToHeadStats(hits, matchMap) {
     if (timeWeight(h.event.date) === 0) continue;
     const matches = matchMap.get(i) || [];
     for (const m of matches) {
+      if (!['win', 'lose', 'draw'].includes(m.result)) continue;
       if (!m.opponent) continue;
       const key = m.opponent.trim();
       if (!key) continue;
@@ -735,6 +783,7 @@ function calcHeadToHeadAdj(matches, h2hStats) {
   const repeatedOpponents = new Set();
 
   for (const m of matches) {
+    if (!['win', 'lose', 'draw'].includes(m.result)) continue;
     if (!m.opponent) continue;
     const rec = h2hStats.get(m.opponent.trim());
     if (!rec || rec.games < 2) continue;
@@ -978,8 +1027,13 @@ function renderBackendStrengthCard(result) {
         &nbsp;·&nbsp; 依据 ${stats.events || 0} 场赛事 / ${stats.rounds || 0} 轮
       </div>
     </div>
-    <ul class="strength-basis">${basisItems}</ul>
-    ${graphNote}${warnings}`;
+    <details class="strength-details">
+      <summary>查看计算依据</summary>
+      <div class="strength-details-body">
+        <ul class="strength-basis">${basisItems}</ul>
+        ${graphNote}${warnings}
+      </div>
+    </details>`;
 
   resultsList.before(card);
 }
@@ -1002,6 +1056,7 @@ async function showStrengthEstimate(hits, seq, playerName) {
     const backendResult = await fetchBackendStrength(playerName);
     if (seq !== searchSeq || evalVersion !== strengthEvalVersion) return;
     renderBackendStrengthCard(backendResult);
+    if (!backendResult?.available || !hits.length) return;
     if (backendResult?.available) {
       playerStrengthCache.set(
         playerName,
@@ -1018,7 +1073,7 @@ async function showStrengthEstimate(hits, seq, playerName) {
   if (seq !== searchSeq || evalVersion !== strengthEvalVersion) return;
   if (matchMap.size === 0) {
     // No match data could be fetched — re-render without loading note
-    renderStrengthCard(basicResult, hits, allGroups, hasRecent, null);
+    renderStrengthCard(basicResult, hits, allGroups, hasRecent, '后端评估暂不可用，当前显示浏览器备用估算。');
     if (basicResult) {
       playerStrengthCache.set(
         playerName,
@@ -1030,7 +1085,7 @@ async function showStrengthEstimate(hits, seq, playerName) {
 
   const enhancedResult = estimateStrength(hits, matchMap);
   if (seq !== searchSeq || evalVersion !== strengthEvalVersion) return;
-  renderStrengthCard(enhancedResult, hits, allGroups, hasRecent, null);
+  renderStrengthCard(enhancedResult, hits, allGroups, hasRecent, '后端评估暂不可用，当前显示浏览器备用估算。');
   if (enhancedResult) {
     playerStrengthCache.set(
       playerName,
@@ -1146,8 +1201,13 @@ function renderStrengthCard(result, hits, allGroups, hasRecent, loadingMsg) {
         &nbsp;·&nbsp; 依据 ${events.length} 场赛事 / ${events.reduce((s,e)=>s+e.rounds,0)} 轮
       </div>
     </div>
-    <ul class="strength-basis">${basisItems}</ul>
-    ${ageNote}${h2hNote}${oppNote}${skipNote}${loadingNote}`;
+    <details class="strength-details">
+      <summary>查看计算依据</summary>
+      <div class="strength-details-body">
+        <ul class="strength-basis">${basisItems}</ul>
+        ${ageNote}${h2hNote}${oppNote}${skipNote}${loadingNote}
+      </div>
+    </details>`;
 
   resultsList.before(card);
 }

@@ -4,9 +4,12 @@ const express = require('express');
 const fetch   = require('node-fetch');
 const path    = require('path');
 const cron    = require('node-cron');
+const crypto  = require('crypto');
 
 const {
   initPromise,
+  updateGroupResultQuality,
+  queryExcludedResultGroups,
   queryUnindexedEvents,
   getIndexCoverage,
   queryParticipants,
@@ -20,7 +23,14 @@ const { runCrawl, stopCrawl, getState: getCrawlerState } = require('./crawler');
 const { runIndex, stopIndex, getState: getIndexerState } = require('./indexer');
 const { estimatePlayerStrength } = require('./strength');
 const { estimatePromotionHistory } = require('./promotions');
+const {
+  isCompleteMatchCache,
+  isPlayedMatch,
+  matchResultForSide,
+  resolveMatchResult,
+} = require('./match-results');
 const liveEventSettings = require('./live-event-settings.json');
+const { isGoEvent, isGoGroup } = require('./sport-filter');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -33,6 +43,18 @@ const EVENTPART_API   = 'https://api.yunbisai.com/request/Group/Eventpart';
 const SEARCH_TIMEOUT_MS = 15000;
 const SEARCH_RETRIES    = 1;
 const LIVE_FALLBACK_LIMIT = parseInt(process.env.SEARCH_LIVE_FALLBACK_LIMIT || '250', 10);
+const SEARCH_AUTO_BACKFILL = process.env.SEARCH_AUTO_BACKFILL === '1';
+const MATCH_CACHE_INCOMPLETE_TTL_MS = parseInt(process.env.MATCH_CACHE_INCOMPLETE_TTL_MS || '60000', 10);
+const MATCH_CACHE_COMPLETE_TTL_MS = parseInt(process.env.MATCH_CACHE_COMPLETE_TTL_MS || String(7 * 24 * 60 * 60 * 1000), 10);
+const LIVE_SNAPSHOT_TTL_MS = parseInt(process.env.LIVE_SNAPSHOT_TTL_MS || '10000', 10);
+const ROUND_FETCH_CONCURRENCY = Math.min(Math.max(parseInt(process.env.ROUND_FETCH_CONCURRENCY || '4', 10), 1), 8);
+const API_RATE_LIMIT_WINDOW_MS = parseInt(process.env.API_RATE_LIMIT_WINDOW_MS || '60000', 10);
+const API_RATE_LIMIT_MAX = parseInt(process.env.API_RATE_LIMIT_MAX || '60', 10);
+
+const groupMatchFetches = new Map();
+const liveGroupSnapshots = new Map();
+const livePredictionResults = new Map();
+const apiRateBuckets = new Map();
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
@@ -41,16 +63,93 @@ function configuredLiveEventTotalRounds(eventId) {
   return Math.min(Math.max(rounds, 0), 30);
 }
 
+app.set('trust proxy', 'loopback');
 app.use(express.static(path.join(__dirname, 'public')));
 app.use((req, res, next) => {
   if (req.path.startsWith('/api/live-')) res.setHeader('Cache-Control', 'no-store');
   next();
+});
+app.use([
+  '/api/search',
+  '/api/matches',
+  '/api/head-to-head',
+  '/api/strength',
+  '/api/promotions',
+  '/api/live-events',
+  '/api/live-event',
+  '/api/live-group',
+  '/api/live-prediction',
+], rateLimitExpensiveApis);
+
+function rateLimitExpensiveApis(req, res, next) {
+  const now = Date.now();
+  const key = String(req.ip || req.socket.remoteAddress || 'unknown');
+  let bucket = apiRateBuckets.get(key);
+  if (!bucket || now - bucket.startedAt >= API_RATE_LIMIT_WINDOW_MS) {
+    bucket = { startedAt: now, count: 0 };
+    apiRateBuckets.set(key, bucket);
+  }
+  bucket.count++;
+  if (bucket.count > API_RATE_LIMIT_MAX) {
+    const retryAfter = Math.max(1, Math.ceil((bucket.startedAt + API_RATE_LIMIT_WINDOW_MS - now) / 1000));
+    res.setHeader('Retry-After', String(retryAfter));
+    return res.status(429).json({ error: `请求过于频繁，请在 ${retryAfter} 秒后重试` });
+  }
+
+  if (apiRateBuckets.size > 5000) {
+    for (const [ip, value] of apiRateBuckets) {
+      if (now - value.startedAt >= API_RATE_LIMIT_WINDOW_MS) apiRateBuckets.delete(ip);
+    }
+  }
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  const expected = String(process.env.ADMIN_TOKEN || '');
+  if (!expected) {
+    return res.status(503).json({ error: '管理接口未启用，请在服务器设置 ADMIN_TOKEN' });
+  }
+  const bearer = String(req.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  const provided = String(req.get('x-admin-token') || bearer || '');
+  if (!safeTokenEqual(provided, expected)) {
+    return res.status(401).json({ error: '管理接口认证失败' });
+  }
+  next();
+}
+
+function safeTokenEqual(a, b) {
+  const left = Buffer.from(String(a || ''));
+  const right = Buffer.from(String(b || ''));
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+app.get('/api/system-status', async (_req, res) => {
+  try {
+    const [stats, coverage] = await Promise.all([
+      getStats(),
+      getIndexCoverage({}),
+    ]);
+    const total = coverage.eventCount || 0;
+    const indexed = coverage.indexedEventCount || 0;
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      last_updated: stats.participantLastUpdated || stats.lastUpdated || null,
+      events: total,
+      indexed_events: indexed,
+      coverage: total ? indexed / total : 0,
+      crawler_running: getCrawlerState().running,
+      indexer_running: getIndexerState().running,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── /api/search ───────────────────────────────────────────────────────────────
 // DB 提供已过滤赛事列表 → 按姓名并发搜索
 app.get('/api/search', async (req, res) => {
   const { name, eventType = '2', province = '', yearFrom, yearTo } = req.query;
+  if (String(eventType) !== '2') return res.status(400).json({ error: '仅支持围棋比赛成绩' });
   if (!name || !name.trim()) return res.status(400).json({ error: '请输入选手姓名' });
 
   const cleanName = name.trim();
@@ -77,7 +176,9 @@ app.get('/api/search', async (req, res) => {
     for (const row of indexedHits) send(indexedRowToHit(row));
 
     if (shouldReturnIndexOnly({ province: cleanProvince, unindexedEventCount, query: req.query })) {
-      const backfillStarted = startIndexBackfill({ province: cleanProvince, dateFrom, dateTo });
+      const backfillStarted = SEARCH_AUTO_BACKFILL
+        ? startIndexBackfill({ province: cleanProvince, dateFrom, dateTo })
+        : false;
       send({
         type: 'done',
         searched: indexedEventCount,
@@ -228,7 +329,7 @@ async function doSearch(event, name, send) {
     const data = JSON.parse(s);
     if (data.error === 0 && Array.isArray(data.datArr)) {
       for (const p of data.datArr) {
-        if (p.participantname === name) {
+        if (p.participantname === name && isGoGroup(event.title, p.groupname)) {
           send({
             type: 'hit',
             event: {
@@ -289,6 +390,8 @@ app.get('/api/matches', async (req, res) => {
   const { group_id, rounds, player_id } = req.query;
   if (!group_id || !rounds || !player_id)
     return res.status(400).json({ error: 'missing params' });
+  if (!/^\d+$/.test(String(group_id)) || !/^\d+$/.test(String(player_id)))
+    return res.status(400).json({ error: 'invalid group or player id' });
 
   const totalRounds = parseInt(rounds) || 0;
   if (totalRounds < 1) return res.json({ matches: [] });
@@ -315,7 +418,7 @@ app.get('/api/live-events', async (req, res) => {
     const events = [];
     await mapLimit(candidates, 4, async event => {
       try {
-        const groups = await fetchLiveEventGroups(event.event_id);
+        const groups = await fetchLiveEventGroups(event.event_id, event.title);
         const liveGroups = groups.filter(g => isLiveGroup(g, now));
         const status = liveGroups.length
           ? 'live'
@@ -384,10 +487,8 @@ app.get('/api/live-group', async (req, res) => {
   if (!groupId) return res.status(400).json({ error: 'missing group_id' });
 
   try {
-    const [players, matchData] = await Promise.all([
-      fetchGroupParticipantsLive(groupId),
-      fetchGroupMatchesLive(groupId, requestedTotalRounds),
-    ]);
+    const snapshot = await getLiveGroupSnapshot(groupId, requestedTotalRounds);
+    const { players, matchData } = snapshot;
     const liveState = reconcileLivePlayers(players, matchData.rows);
     const current = computeCurrentRanking(liveState.players, matchData.rows, Math.max(matchData.completedRounds || 0, 1));
     res.json({
@@ -403,6 +504,7 @@ app.get('/api/live-group', async (req, res) => {
       score_updated_players: liveState.updatedCount,
       score_updated_through_round: liveState.updatedThroughRound,
       players: current,
+      snapshot_at: snapshot.snapshotAt,
     });
   } catch (err) {
     console.warn(`[LiveGroup] ${groupId} failed: ${err.message}`);
@@ -419,7 +521,7 @@ app.get('/api/live-prediction', async (req, res) => {
   if (!groupId || !participantId) return res.status(400).json({ error: 'missing params' });
 
   try {
-    const result = await predictPlayerRank({ groupId, participantId, simulations, requestedTotalRounds, nextResult });
+    const result = await getCachedLivePrediction({ groupId, participantId, simulations, requestedTotalRounds, nextResult });
     res.json(result);
   } catch (err) {
     console.warn(`[LivePrediction] group ${groupId} player ${participantId} failed: ${err.message}`);
@@ -461,6 +563,7 @@ app.get('/api/head-to-head', async (req, res) => {
 
     games.sort((a, b) => (b.event.date || '').localeCompare(a.event.date || '') || b.bout - a.bout);
     const summary = games.reduce((s, g) => {
+      if (!g.result) return s;
       s.games++;
       if (g.result === 'win') s.win++;
       else if (g.result === 'lose') s.lose++;
@@ -533,12 +636,13 @@ function buildPlayerMatches(groupRows, totalRounds, playerId) {
       continue;
     }
     const isP1 = String(row.p1_id) === String(playerId);
-    const raw = isP1 ? row.p1_result : row.p2_result;
+    const result = matchResultForSide(row, isP1 ? 'p1' : 'p2');
     results.push({
       bout,
       opponent: isP1 ? row.p2_name : row.p1_name,
       opponent_org: isP1 ? row.p2_org : row.p1_org,
-      result: raw == '1' ? 'win' : raw == '2' ? 'lose' : 'draw',
+      result,
+      played: result !== null,
       score: parseFloat(isP1 ? row.p1_score : row.p2_score) || 0,
       opp_score: parseFloat(isP1 ? row.p2_score : row.p1_score) || 0,
     });
@@ -548,13 +652,67 @@ function buildPlayerMatches(groupRows, totalRounds, playerId) {
 
 async function getOrFetchGroupMatches(groupId, rounds) {
   const cached = await getGroupMatchCache(groupId);
+  const cachedRows = normalizeCachedRows(cached.rows);
   if (cached.status && !cached.status.last_error && cached.status.rounds >= rounds) {
-    return normalizeCachedRows(cached.rows);
+    const complete = isCompleteMatchCache(cachedRows, rounds);
+    const ttl = complete ? MATCH_CACHE_COMPLETE_TTL_MS : MATCH_CACHE_INCOMPLETE_TTL_MS;
+    if (Date.now() - Number(cached.status.updated_at || 0) <= ttl) {
+      const quality = await updateGroupResultQuality(groupId, cachedRows);
+      if (!quality.eligible) throw new Error('INSUFFICIENT_RESULTS');
+      return cachedRows;
+    }
   }
 
-  const rows = await fetchGroupMatches(groupId, rounds);
-  await replaceGroupMatchCache({ group_id: groupId, rounds, rows });
-  return rows;
+  const key = `${String(groupId)}:${Math.max(parseInt(rounds) || 0, 1)}`;
+  if (!groupMatchFetches.has(key)) {
+    const request = (async () => {
+      const rows = await fetchGroupMatches(groupId, rounds);
+      await replaceGroupMatchCache({ group_id: groupId, rounds, rows });
+      const quality = await updateGroupResultQuality(groupId, rows);
+      if (!quality.eligible) throw new Error('INSUFFICIENT_RESULTS');
+      return rows;
+    })();
+    groupMatchFetches.set(key, request);
+  }
+
+  const request = groupMatchFetches.get(key);
+  try {
+    return await request;
+  } catch (err) {
+    if (err.message === 'INSUFFICIENT_RESULTS') throw err;
+    if (cachedRows.length) {
+      console.warn(`[Matches] using stale cache for group ${groupId}: ${err.message}`);
+      return cachedRows;
+    }
+    throw err;
+  } finally {
+    if (groupMatchFetches.get(key) === request) groupMatchFetches.delete(key);
+  }
+}
+
+async function getLiveGroupSnapshot(groupId, requestedTotalRounds = 0) {
+  const key = `${String(groupId)}:${parseInt(requestedTotalRounds) || 0}`;
+  const cached = liveGroupSnapshots.get(key);
+  if (cached && cached.value && cached.expiresAt > Date.now()) return cached.value;
+  if (cached?.promise) return cached.promise;
+
+  const promise = Promise.all([
+    fetchGroupParticipantsLive(groupId),
+    fetchGroupMatchesLive(groupId, requestedTotalRounds),
+  ]).then(([players, matchData]) => ({ players, matchData, snapshotAt: Date.now() }));
+  liveGroupSnapshots.set(key, { promise, expiresAt: 0, value: null });
+  try {
+    const value = await promise;
+    liveGroupSnapshots.set(key, {
+      value,
+      promise: null,
+      expiresAt: Date.now() + LIVE_SNAPSHOT_TTL_MS,
+    });
+    return value;
+  } catch (err) {
+    if (liveGroupSnapshots.get(key)?.promise === promise) liveGroupSnapshots.delete(key);
+    throw err;
+  }
 }
 
 function normalizeCachedRows(rows) {
@@ -576,7 +734,8 @@ function normalizeCachedRows(rows) {
 
 async function fetchGroupMatches(groupId, rounds) {
   const allRows = [];
-  for (let bout = 1; bout <= rounds; bout++) {
+  const bouts = Array.from({ length: rounds }, (_, index) => index + 1);
+  await mapLimit(bouts, ROUND_FETCH_CONCURRENCY, async bout => {
     const params = new URLSearchParams({ groupid: groupId, team: 0, bout, callback: 'cb' });
     const text = await fetchTextWithRetry(`${AGAINSTPLAN_API}?${params}`, {
       headers: AGAINSTPLAN_HEADERS,
@@ -601,8 +760,8 @@ async function fetchGroupMatches(groupId, rounds) {
         p2_score: parseFloat(row.p2_score) || 0,
       });
     }
-    await delay(40);
-  }
+  });
+  allRows.sort((a, b) => a.bout - b.bout);
   return allRows;
 }
 
@@ -639,6 +798,7 @@ async function fetchLiveEventCandidates({ province = '', dateFrom, dateTo, limit
     const json = JSON.parse(text);
     const pageRows = json.datArr?.rows || [];
     for (const row of pageRows) {
+      if (String(row.event_value) !== '2' || !isGoEvent(row)) continue;
       const start = (row.min_time || '').substring(0, 10);
       const end = (row.max_time || row.min_time || '').substring(0, 10);
       if (dateFrom && end < dateFrom) continue;
@@ -700,12 +860,13 @@ async function mapLimit(items, limit, fn) {
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
 }
 
-async function fetchLiveEventGroups(eventId) {
+async function fetchLiveEventGroups(eventId, eventTitle = '') {
   const html = await fetchTextWithRetry(`${DETAIL_BASE}${eventId}.html`, {
     headers: { 'User-Agent': 'Mozilla/5.0' },
     timeout: SEARCH_TIMEOUT_MS,
   }, 1);
   const groups = [];
+  const title = eventTitle || htmlDecode(html.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1] || '');
   const seen = new Set();
   const anchorRe = /<a\b[^>]*data-groupid=["']?\d+["']?[^>]*>/gi;
   let m;
@@ -713,7 +874,7 @@ async function fetchLiveEventGroups(eventId) {
     const attrs = parseDataAttrs(m[0]);
     if (!attrs.groupid || seen.has(attrs.groupid)) continue;
     seen.add(attrs.groupid);
-    groups.push(attrs);
+    if (isGoEvent({ title }) && isGoGroup(title, attrs.groupname)) groups.push(attrs);
   }
   if (groups.length === 0) throw new Error('no groups found');
   return groups;
@@ -801,7 +962,8 @@ async function fetchGroupMatchesLive(groupId, requestedTotalRounds = 0) {
   const firstSignature = liveRoundPayloadSignature(firstRows);
   if (firstSignature) seenRoundPayloads.add(firstSignature);
 
-  for (let bout = 2; bout <= fetchThroughRound; bout++) {
+  const remainingBouts = Array.from({ length: Math.max(fetchThroughRound - 1, 0) }, (_, index) => index + 2);
+  await mapLimit(remainingBouts, ROUND_FETCH_CONCURRENCY, async bout => {
     const data = await fetchGroupRoundLive(groupId, bout);
     const rawRows = data.rows || [];
     const signature = liveRoundPayloadSignature(rawRows);
@@ -810,8 +972,7 @@ async function fetchGroupMatchesLive(groupId, requestedTotalRounds = 0) {
       allRows.push(...normalizeLiveRoundRows(groupId, bout, rawRows));
       if (signature) seenRoundPayloads.add(signature);
     }
-    await delay(25);
-  }
+  });
 
   const cloudRounds = new Set(allRows.map(row => row.bout));
   const manualPairingRounds = new Set();
@@ -923,14 +1084,6 @@ function normalizeLiveRoundRows(groupId, bout, rows) {
     });
 }
 
-function isPlayedMatch(row) {
-  return isResultCode(row.p1_result) || isResultCode(row.p2_result) || row.p1_score > 0 || row.p2_score > 0;
-}
-
-function isResultCode(value) {
-  return ['1', '2', '3'].includes(String(value));
-}
-
 function reconcileLivePlayers(players, matches) {
   const matchStats = new Map(players.map(player => [String(player.id), {
     score: 0,
@@ -988,22 +1141,7 @@ function applyLiveMatchResult(stats, ownResult, opponentResult, ownScore, oppone
 }
 
 function resolveLiveMatchResult(ownResult, opponentResult, ownScore, opponentScore) {
-  const ownCode = String(ownResult ?? '');
-  if (ownCode === '1') return 'win';
-  if (ownCode === '2') return 'lose';
-  if (ownCode === '3') return 'draw';
-
-  const opponentCode = String(opponentResult ?? '');
-  if (opponentCode === '1') return 'lose';
-  if (opponentCode === '2') return 'win';
-  if (opponentCode === '3') return 'draw';
-
-  const own = parseFloat(ownScore);
-  const opponent = parseFloat(opponentScore);
-  if (!Number.isFinite(own) || !Number.isFinite(opponent) || (own === 0 && opponent === 0)) return '';
-  if (own > opponent) return 'win';
-  if (own < opponent) return 'lose';
-  return 'draw';
+  return resolveMatchResult(ownResult, opponentResult, ownScore, opponentScore) || '';
 }
 
 function computeCurrentRanking(players, matches, totalRounds) {
@@ -1023,6 +1161,47 @@ function computeCurrentRanking(players, matches, totalRounds) {
   }));
 }
 
+async function getCachedLivePrediction(options) {
+  const key = [
+    options.groupId,
+    options.participantId,
+    options.simulations,
+    options.requestedTotalRounds,
+    options.nextResult,
+  ].join(':');
+  const cached = livePredictionResults.get(key);
+  if (cached?.promise) return cached.promise;
+  if (cached?.value && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+
+  if (livePredictionResults.size > 500) {
+    const now = Date.now();
+    for (const [cacheKey, entry] of livePredictionResults) {
+      if (entry.expiresAt <= now) livePredictionResults.delete(cacheKey);
+    }
+  }
+
+  const promise = predictPlayerRank(options);
+  livePredictionResults.set(key, {
+    promise,
+    value: null,
+    expiresAt: Date.now() + LIVE_SNAPSHOT_TTL_MS,
+  });
+  try {
+    const value = await promise;
+    livePredictionResults.set(key, {
+      promise: null,
+      value,
+      expiresAt: Date.now() + LIVE_SNAPSHOT_TTL_MS,
+    });
+    return value;
+  } catch (err) {
+    if (livePredictionResults.get(key)?.promise === promise) livePredictionResults.delete(key);
+    throw err;
+  }
+}
+
 async function predictPlayerRank({
   groupId,
   participantId,
@@ -1030,10 +1209,8 @@ async function predictPlayerRank({
   requestedTotalRounds = 0,
   nextResult = '',
 }) {
-  const [rawPlayers, matchData] = await Promise.all([
-    fetchGroupParticipantsLive(groupId),
-    fetchGroupMatchesLive(groupId, requestedTotalRounds),
-  ]);
+  const snapshot = await getLiveGroupSnapshot(groupId, requestedTotalRounds);
+  const { players: rawPlayers, matchData } = snapshot;
   const liveState = reconcileLivePlayers(rawPlayers, matchData.rows);
   const players = liveState.players;
   const selected = players.find(p => String(p.id) === String(participantId));
@@ -1112,6 +1289,7 @@ async function predictPlayerRank({
     score_updated_players: liveState.updatedCount,
     score_updated_through_round: liveState.updatedThroughRound,
     next_bout: matchData.completedRounds < totalRounds ? matchData.completedRounds + 1 : null,
+    snapshot_at: snapshot.snapshotAt,
     next_opponent: nextOpponent,
     next_result: appliedNextResult,
     simulations,
@@ -1376,10 +1554,11 @@ function findHeadToHeadGames(rows, playerAId, playerBId, candidate) {
     const bIsP1 = String(row.p1_id) === String(playerBId);
     const bIsP2 = String(row.p2_id) === String(playerBId);
     if (!((aIsP1 && bIsP2) || (aIsP2 && bIsP1))) continue;
-    const raw = aIsP1 ? row.p1_result : row.p2_result;
+    const result = matchResultForSide(row, aIsP1 ? 'p1' : 'p2');
+    if (!result) continue;
     games.push({
       bout: row.bout,
-      result: raw == '1' ? 'win' : raw == '2' ? 'lose' : 'draw',
+      result,
       score: parseFloat(aIsP1 ? row.p1_score : row.p2_score) || 0,
       opp_score: parseFloat(aIsP1 ? row.p2_score : row.p1_score) || 0,
       playerA: {
@@ -1417,10 +1596,11 @@ app.get('/api/crawl/status', async (_req, res) => {
   res.json({ ...getCrawlerState(), stats });
 });
 
-app.post('/api/crawl/start', express.json(), (req, res) => {
+app.post('/api/crawl/start', requireAdmin, express.json(), (req, res) => {
   if (getCrawlerState().running)
     return res.status(409).json({ error: '爬虫正在运行' });
   const { eventType = '2', province = '', indexAfter = true } = req.body || {};
+  if (String(eventType) !== '2') return res.status(400).json({ error: '仅支持围棋比赛成绩' });
   runCrawl({ eventType, province })
     .then(() => {
       const crawlState = getCrawlerState();
@@ -1435,7 +1615,7 @@ app.post('/api/crawl/start', express.json(), (req, res) => {
   res.json({ started: true, indexAfter: indexAfter !== false });
 });
 
-app.post('/api/crawl/stop', (_req, res) => {
+app.post('/api/crawl/stop', requireAdmin, (_req, res) => {
   stopCrawl();
   res.json({ stopped: true });
 });
@@ -1445,7 +1625,7 @@ app.get('/api/index/status', async (_req, res) => {
   res.json({ ...getIndexerState(), stats });
 });
 
-app.post('/api/index/start', express.json(), (req, res) => {
+app.post('/api/index/start', requireAdmin, express.json(), (req, res) => {
   if (getIndexerState().running)
     return res.status(409).json({ error: '索引正在运行' });
   const { province = '', dateFrom, dateTo, force = false, limit = 0 } = req.body || {};
@@ -1453,7 +1633,7 @@ app.post('/api/index/start', express.json(), (req, res) => {
   res.json({ started: true });
 });
 
-app.post('/api/index/stop', (_req, res) => {
+app.post('/api/index/stop', requireAdmin, (_req, res) => {
   stopIndex();
   res.json({ stopped: true });
 });
@@ -1463,6 +1643,11 @@ cron.schedule('30 2 * * *', () => {
   console.log('[Scheduler] Nightly crawl triggered.');
   runCrawl()
     .then(() => runIndex())
+    .then(async () => {
+      for (const group of await queryExcludedResultGroups()) {
+        try { await getOrFetchGroupMatches(group.group_id, group.rounds); } catch (_) { /* Still quarantined. */ }
+      }
+    })
     .catch(console.error);
 }, { timezone: 'Asia/Shanghai' });
 

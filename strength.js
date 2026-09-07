@@ -4,6 +4,7 @@ const {
   queryParticipants,
   queryParticipantsForGroups,
 } = require('./db');
+const { matchScoreForSide } = require('./match-results');
 
 const STRENGTH_WINDOW_DAYS = envPositiveInt('STRENGTH_WINDOW_DAYS', 180);
 const MATCH_FETCH_CONCURRENCY = envPositiveInt('STRENGTH_MATCH_FETCH_CONCURRENCY', 4);
@@ -258,13 +259,9 @@ function normalizeMatchRows(rows) {
     p2_id: String(r.p2_id || ''),
     p1_result: String(r.p1_result ?? ''),
     p2_result: String(r.p2_result ?? ''),
+    p1_score: Number.parseFloat(r.p1_score) || 0,
+    p2_score: Number.parseFloat(r.p2_score) || 0,
   })).filter(r => r.group_id && r.p1_id && r.p2_id);
-}
-
-function resultFor(raw) {
-  if (raw === '1') return 1;
-  if (raw === '2') return 0;
-  return 0.5;
 }
 
 async function fetchGroupMatchesForStrength(groupInfos, getOrFetchGroupMatches) {
@@ -313,6 +310,9 @@ function buildRatingGraph({ groupRows, matchMap, dateTo }) {
   const games = [];
   for (const [groupId, rows] of matchMap.entries()) {
     for (const m of rows) {
+      const p1Score = matchScoreForSide(m, 'p1');
+      const p2Score = matchScoreForSide(m, 'p2');
+      if (p1Score === null || p2Score === null) continue;
       const k1 = `${groupId}:${m.p1_id}`;
       const k2 = `${groupId}:${m.p2_id}`;
       if (!players.has(k1) || !players.has(k2)) continue;
@@ -324,8 +324,8 @@ function buildRatingGraph({ groupRows, matchMap, dateTo }) {
         groupId,
         p1: k1,
         p2: k2,
-        p1Score: resultFor(m.p1_result),
-        p2Score: resultFor(m.p2_result),
+        p1Score,
+        p2Score,
         weight,
       });
     }
@@ -459,7 +459,7 @@ function aggregateTarget({ name, targetRows, graph, matchMap, dateFrom, dateTo, 
 
   let L = weightedSum / totalWeight;
   L = eliteYouthPromotion(used, totalRounds, L);
-  const hasFiveDanEvidence = used.some(e => e.isOpen || e.rating >= 30.1 || /5\s*段/.test(e.org || ''));
+  const hasFiveDanEvidence = used.some(e => e.isOpen || e.rating >= 30.1 || /5\s*段/.test(e.group || ''));
   if (L >= 29.85 && L < 30 && hasFiveDanEvidence && totalRounds >= 12) {
     L = 30.02;
   }
@@ -525,7 +525,7 @@ async function estimatePlayerStrength({ name, province = '', dateTo, getOrFetchG
   if (!targetRows.length) {
     return {
       available: false,
-      reason: '近180天内没有找到该棋手的索引记录',
+      reason: '近180天内没有可用于评估的云比赛索引记录',
       name: cleanName,
       scope: { province: cleanProvince || '__ALL__', dateFrom, dateTo: safeDateTo, windowDays: STRENGTH_WINDOW_DAYS },
       groups: [],
@@ -546,10 +546,14 @@ async function estimatePlayerStrength({ name, province = '', dateTo, getOrFetchG
     ? await fetchGroupMatchesForStrength(groupInfos, getOrFetchGroupMatches)
     : new Map();
 
-  const graph = buildRatingGraph({ groupRows, matchMap, dateTo: safeDateTo });
+  // Fetching matches can newly quarantine a group; recheck before any scoring.
+  const verifiedRows = await queryParticipantsForGroups(groupIds);
+  const verifiedKeys = new Set(verifiedRows.map(r => `${r.group_id}:${r.participant_id}`));
+  const verifiedTargets = targetRows.filter(r => verifiedKeys.has(`${r.group_id}:${r.participant_id}`));
+  const graph = buildRatingGraph({ groupRows: verifiedRows, matchMap, dateTo: safeDateTo });
   const result = aggregateTarget({
     name: cleanName,
-    targetRows,
+    targetRows: verifiedTargets,
     graph,
     matchMap,
     dateFrom,
