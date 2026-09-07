@@ -630,22 +630,35 @@ async function queryExcludedResultGroups(limit = 10) {
 }
 
 /** 获取 DB 中赛事总数和更新时间 */
+let statsSnapshot = null;
+let statsInFlight = null;
+
 async function getStats() {
   await initPromise;
-  const [cnt, ts, pcnt, icnt, pts] = await Promise.all([
-    get(`SELECT COUNT(*) AS c FROM go_events`),
-    get(`SELECT MAX(updated_at) AS t FROM go_events`),
-    get(`SELECT COUNT(*) AS c FROM go_participant_index`),
-    get(`SELECT COUNT(*) AS c FROM indexed_events WHERE last_error = ''`),
-    get(`SELECT MAX(updated_at) AS t FROM go_participant_index`),
-  ]);
-  return {
-    eventCount: cnt.c,
-    lastUpdated: ts.t,
-    participantCount: pcnt.c,
-    indexedEventCount: icnt.c,
-    participantLastUpdated: pts.t,
-  };
+  if (statsSnapshot && statsSnapshot.expiresAt > Date.now()) return { ...statsSnapshot.value };
+  if (!statsInFlight) {
+    statsInFlight = (async () => {
+      // Storage counters use raw tables; search and coverage enforce Go-only filtering.
+      // Scanning filtered participant views here starves I/O on multi-million-row databases.
+      const [cnt, ts, pcnt, icnt, pts] = await Promise.all([
+        get(`SELECT COUNT(*) AS c FROM events`),
+        get(`SELECT MAX(updated_at) AS t FROM events`),
+        get(`SELECT COUNT(*) AS c FROM participant_index`),
+        get(`SELECT COUNT(*) AS c FROM indexed_events WHERE last_error = ''`),
+        get(`SELECT MAX(updated_at) AS t FROM participant_index`),
+      ]);
+      const value = {
+        eventCount: cnt.c,
+        lastUpdated: ts.t,
+        participantCount: pcnt.c,
+        indexedEventCount: icnt.c,
+        participantLastUpdated: pts.t,
+      };
+      statsSnapshot = { value, expiresAt: Date.now() + 30000 };
+      return value;
+    })().finally(() => { statsInFlight = null; });
+  }
+  return { ...await statsInFlight };
 }
 
 module.exports = {
