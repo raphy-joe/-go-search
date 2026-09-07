@@ -653,7 +653,9 @@ function buildPlayerMatches(groupRows, totalRounds, playerId) {
 async function getOrFetchGroupMatches(groupId, rounds) {
   const cached = await getGroupMatchCache(groupId);
   const cachedRows = normalizeCachedRows(cached.rows);
-  if (cached.status && !cached.status.last_error && cached.status.rounds >= rounds) {
+  rounds = Math.max(parseInt(rounds) || 1, parseInt(cached.status?.rounds) || 0,
+    ...cachedRows.map(row => row.bout));
+  if (cached.status && !cached.status.last_error && hasAllMatchRounds(cachedRows, rounds)) {
     const complete = isCompleteMatchCache(cachedRows, rounds);
     const ttl = complete ? MATCH_CACHE_COMPLETE_TTL_MS : MATCH_CACHE_INCOMPLETE_TTL_MS;
     if (Date.now() - Number(cached.status.updated_at || 0) <= ttl) {
@@ -667,10 +669,19 @@ async function getOrFetchGroupMatches(groupId, rounds) {
   if (!groupMatchFetches.has(key)) {
     const request = (async () => {
       const rows = await fetchGroupMatches(groupId, rounds);
-      await replaceGroupMatchCache({ group_id: groupId, rounds, rows });
-      const quality = await updateGroupResultQuality(groupId, rows);
+      if (!hasAllMatchRounds(rows, rounds)) throw new Error('INCOMPLETE_MATCH_RESPONSE');
+      const stored = await replaceGroupMatchCache({ group_id: groupId, rounds, rows, preserveCoverage: true });
+      let effectiveRows = rows;
+      if (stored === false) {
+        const latest = await getGroupMatchCache(groupId);
+        effectiveRows = normalizeCachedRows(latest.rows);
+        const required = Math.max(rounds, parseInt(latest.status?.rounds) || 0);
+        if (!hasAllMatchRounds(effectiveRows, required)) throw new Error('INCOMPLETE_MATCH_CACHE');
+        console.warn(`[Matches] retained fuller cache for group ${groupId}`);
+      }
+      const quality = await updateGroupResultQuality(groupId, effectiveRows);
       if (!quality.eligible) throw new Error('INSUFFICIENT_RESULTS');
-      return rows;
+      return effectiveRows;
     })();
     groupMatchFetches.set(key, request);
   }
@@ -680,7 +691,9 @@ async function getOrFetchGroupMatches(groupId, rounds) {
     return await request;
   } catch (err) {
     if (err.message === 'INSUFFICIENT_RESULTS') throw err;
-    if (cachedRows.length) {
+    if (hasAllMatchRounds(cachedRows, rounds)) {
+      const quality = await updateGroupResultQuality(groupId, cachedRows);
+      if (!quality.eligible) throw new Error('INSUFFICIENT_RESULTS');
       console.warn(`[Matches] using stale cache for group ${groupId}: ${err.message}`);
       return cachedRows;
     }
@@ -688,6 +701,13 @@ async function getOrFetchGroupMatches(groupId, rounds) {
   } finally {
     if (groupMatchFetches.get(key) === request) groupMatchFetches.delete(key);
   }
+}
+
+function hasAllMatchRounds(rows, rounds) {
+  if (!rows.length) return false;
+  const bouts = new Set(rows.map(row => Number(row.bout)));
+  for (let bout = 1; bout <= rounds; bout++) if (!bouts.has(bout)) return false;
+  return true;
 }
 
 async function getLiveGroupSnapshot(groupId, requestedTotalRounds = 0) {
@@ -735,14 +755,28 @@ function normalizeCachedRows(rows) {
 async function fetchGroupMatches(groupId, rounds) {
   const allRows = [];
   const bouts = Array.from({ length: rounds }, (_, index) => index + 1);
-  await mapLimit(bouts, ROUND_FETCH_CONCURRENCY, async bout => {
+  // Avoid upstream cache-generation races within the same historical group.
+  await mapLimit(bouts, 1, async bout => {
     const params = new URLSearchParams({ groupid: groupId, team: 0, bout, callback: 'cb' });
-    const text = await fetchTextWithRetry(`${AGAINSTPLAN_API}?${params}`, {
-      headers: AGAINSTPLAN_HEADERS,
-      timeout: 8000,
-    }, 1);
-    const data = parseJsonp(text);
-    const rows = data.datArr?.rows ?? [];
+    let rows;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const text = await fetchTextWithRetry(`${AGAINSTPLAN_API}?${params}`, {
+          headers: AGAINSTPLAN_HEADERS,
+          timeout: 8000,
+        }, 1);
+        const data = parseJsonp(text);
+        if (data.error !== 0 || !Array.isArray(data.datArr?.rows) || !data.datArr.rows.length) {
+          throw new Error(`INCOMPLETE_MATCH_ROUND group=${groupId} bout=${bout}`);
+        }
+        rows = data.datArr.rows;
+        if (!rows.some(row => row.p1id && row.p2id)) throw new Error(`EMPTY_MATCH_ROUND bout=${bout}`);
+        break;
+      } catch (err) {
+        if (attempt === 2) throw err;
+        await delay(500 * (attempt + 1));
+      }
+    }
     for (const row of rows) {
       if (!row.p1id || !row.p2id) continue;
       allRows.push({

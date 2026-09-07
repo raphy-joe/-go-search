@@ -12,6 +12,7 @@ const path    = require('path');
 const fs      = require('fs');
 const { sportSql } = require('./sport-filter');
 const { assessYunMatches } = require('./result-quality');
+const { isPlayedMatch } = require('./match-results');
 
 const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
@@ -509,7 +510,7 @@ async function replaceEventNoticeCache({ event_id, notice_text = '', last_error 
   });
 }
 
-async function replaceGroupMatchCache({ group_id, rounds, rows, last_error = '', updated_at = Date.now() }) {
+async function replaceGroupMatchCache({ group_id, rounds, rows, last_error = '', updated_at = Date.now(), preserveCoverage = false }) {
   return withWriteLock(async () => {
     await initPromise;
     const sql = `
@@ -519,6 +520,30 @@ async function replaceGroupMatchCache({ group_id, rounds, rows, last_error = '',
     `;
     await run('BEGIN IMMEDIATE');
     try {
+      if (preserveCoverage) {
+        // Check inside the transaction so a shorter concurrent refresh cannot win last.
+        const previous = await all('SELECT * FROM group_match_cache WHERE group_id = ?', [String(group_id)]);
+        const status = await get('SELECT rounds FROM group_match_cache_status WHERE group_id = ?', [String(group_id)]);
+        const previousCounts = new Map();
+        const incomingCounts = new Map();
+        const incomingByGame = new Map();
+        const key = row => `${row.bout}:${row.p1_id}:${row.p2_id}`;
+        for (const row of previous) previousCounts.set(row.bout, (previousCounts.get(row.bout) || 0) + 1);
+        for (const row of rows) {
+          incomingCounts.set(row.bout, (incomingCounts.get(row.bout) || 0) + 1);
+          incomingByGame.set(key(row), row);
+        }
+        const fewerRounds = Number(status?.rounds || 0) > Number(rounds);
+        const fewerGames = [...previousCounts].some(([bout, count]) => (incomingCounts.get(bout) || 0) < count);
+        const lostResults = previous.some(row => {
+          const incoming = incomingByGame.get(key(row));
+          return incoming && isPlayedMatch(row) && !isPlayedMatch(incoming);
+        });
+        if (fewerRounds || fewerGames || lostResults) {
+          await run('COMMIT');
+          return false;
+        }
+      }
       await run('DELETE FROM group_match_cache WHERE group_id = ?', [String(group_id)]);
       for (const r of rows) {
         await run(sql, [
@@ -537,6 +562,7 @@ async function replaceGroupMatchCache({ group_id, rounds, rows, last_error = '',
         [String(group_id), parseInt(rounds) || 0, updated_at, last_error || '']
       );
       await run('COMMIT');
+      return true;
     } catch (err) {
       await run('ROLLBACK');
       throw err;
