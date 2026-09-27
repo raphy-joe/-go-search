@@ -37,6 +37,7 @@ const PORT = process.env.PORT || 3000;
 
 const SEARCH_API      = 'https://api.yunbisai.com/request/event/SearchInfo';
 const EVENTS_API      = 'https://data-center.yunbisai.com/api/lswl-events';
+const EVENT_GROUPS_API = 'https://data-center.yunbisai.com/api/lswl-groups/event/';
 const DETAIL_BASE     = 'https://www.yunbisai.com/tpl/eventFeatures/eventDetail-';
 const AGAINSTPLAN_API = 'https://api.yunbisai.com/request/Group/Againstplan';
 const EVENTPART_API   = 'https://api.yunbisai.com/request/Group/Eventpart';
@@ -416,9 +417,11 @@ app.get('/api/live-events', async (req, res) => {
   try {
     const candidates = await fetchLiveEventCandidates({ province, dateFrom, dateTo, limit });
     const events = [];
+    let failedEvents = 0;
     await mapLimit(candidates, 4, async event => {
       try {
         const groups = await fetchLiveEventGroups(event.event_id, event.title);
+        if (!groups.length) return;
         const liveGroups = groups.filter(g => isLiveGroup(g, now));
         const status = liveGroups.length
           ? 'live'
@@ -432,7 +435,7 @@ app.get('/api/live-events', async (req, res) => {
           province: event.provincename,
           city: event.city_name,
           organizer: event.cname,
-          detail_url: `${DETAIL_BASE}${event.event_id}.html`,
+          detail_url: `https://m.yunbisai.com/event/${event.event_id}`,
           group_count: groups.length,
           live_group_count: liveGroups.length,
           status,
@@ -441,6 +444,7 @@ app.get('/api/live-events', async (req, res) => {
           ends_at: maxDateValue(groups.map(g => g.et)) || event.max_time || '',
         });
       } catch (err) {
+        failedEvents++;
         console.warn(`[LiveEvents] event ${event.event_id} failed: ${err.message}`);
       }
     });
@@ -449,7 +453,13 @@ app.get('/api/live-events', async (req, res) => {
       (b.date || '').localeCompare(a.date || '') ||
       String(b.event_id).localeCompare(String(a.event_id))
     );
-    res.json({ events, scope: { province: province || '__ALL__', dateFrom, dateTo } });
+    if (!events.length && failedEvents) {
+      return res.status(502).json({ error: '云比赛赛事组别暂时读取失败，请稍后重试', failed_events: failedEvents });
+    }
+    res.json({ events, scope: { province: province || '__ALL__', dateFrom, dateTo },
+      failed_events: failedEvents,
+      warning: failedEvents ? `有 ${failedEvents} 场赛事组别暂时读取失败，当前结果可能不完整` : '',
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -457,7 +467,7 @@ app.get('/api/live-events', async (req, res) => {
 
 app.get('/api/live-event', async (req, res) => {
   const eventId = String(req.query.event_id || '').trim();
-  if (!eventId) return res.status(400).json({ error: 'missing event_id' });
+  if (!/^\d+$/.test(eventId)) return res.status(400).json({ error: 'invalid event_id' });
 
   try {
     const groups = await fetchLiveEventGroups(eventId);
@@ -830,7 +840,10 @@ async function fetchLiveEventCandidates({ province = '', dateFrom, dateTo, limit
       headers: { 'User-Agent': 'Mozilla/5.0' },
     }, 1);
     const json = JSON.parse(text);
-    const pageRows = json.datArr?.rows || [];
+    if (Number(json.error) !== 0 || !Array.isArray(json.datArr?.rows)) {
+      throw new Error('云比赛赛事列表暂时读取失败，请稍后重试');
+    }
+    const pageRows = json.datArr.rows;
     for (const row of pageRows) {
       if (String(row.event_value) !== '2' || !isGoEvent(row)) continue;
       const start = (row.min_time || '').substring(0, 10);
@@ -895,6 +908,40 @@ async function mapLimit(items, limit, fn) {
 }
 
 async function fetchLiveEventGroups(eventId, eventTitle = '') {
+  try {
+    const text = await fetchTextWithRetry(`${EVENT_GROUPS_API}${encodeURIComponent(eventId)}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      timeout: SEARCH_TIMEOUT_MS,
+    }, 1);
+    const json = JSON.parse(text);
+    if (Number(json.error) !== 0 || !Array.isArray(json.data)) throw new Error('invalid group response');
+    const seen = new Set();
+    // The public API supplies each group's sport, including mixed-sport events.
+    return json.data.filter(g => String(g.eventtype) === '2' && isGoGroup('', g.groupname))
+      .map(g => {
+        const groupId = String(g.groupid || '');
+        if (!/^\d+$/.test(groupId) || (g.eventid != null && String(g.eventid) !== String(eventId))) {
+          throw new Error('invalid group identity');
+        }
+        return { groupid: groupId, groupname: g.groupname || '', pnumber: parseInt(g.pnumber) || 0,
+          groupstate: String(g.groupstate ?? ''), bt: g.begintime || '', et: g.endtime || '' };
+      }).filter(g => {
+        if (seen.has(g.groupid)) return false;
+        seen.add(g.groupid);
+        return true;
+      });
+  } catch (err) {
+    console.warn(`[LiveGroups] event ${eventId} API failed: ${err.message}`);
+    try {
+      return await fetchLiveEventGroupsHtml(eventId, eventTitle);
+    } catch (htmlError) {
+      console.warn(`[LiveGroups] event ${eventId} HTML failed: ${htmlError.message}`);
+      throw new Error('云比赛赛事组别暂时读取失败，请稍后重试');
+    }
+  }
+}
+
+async function fetchLiveEventGroupsHtml(eventId, eventTitle = '') {
   const html = await fetchTextWithRetry(`${DETAIL_BASE}${eventId}.html`, {
     headers: { 'User-Agent': 'Mozilla/5.0' },
     timeout: SEARCH_TIMEOUT_MS,

@@ -122,23 +122,23 @@ async function loadLiveEvents() {
     const resp = await fetch(`/api/live-events?${params}`, { cache: 'no-store' });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || '查询失败');
-    renderLiveEvents(data.events || []);
+    renderLiveEvents(data.events || [], data.warning || '');
   } catch (err) {
-    liveEventCount.textContent = '0';
+    liveEventCount.textContent = '--';
     showMessage(liveEventsList, `查询失败：${err.message}`);
   } finally {
     loadLiveEventsBtn.disabled = false;
   }
 }
 
-function renderLiveEvents(events) {
+function renderLiveEvents(events, warning = '') {
   liveEventCount.textContent = String(events.length);
   if (!events.length) {
     showMessage(liveEventsList, '当前省份暂未发现可预测比赛');
     return;
   }
 
-  liveEventsList.innerHTML = events.map(event => `
+  liveEventsList.innerHTML = (warning ? `<div class="state-msg" role="status">${esc(warning)}</div>` : '') + events.map(event => `
     <button type="button" class="live-event-item" data-event-id="${esc(event.event_id)}">
       <span class="live-event-main">
         <b><span class="live-status live-status-${esc(event.status || 'unknown')}">${esc(event.status_label || '可查询')}</span>${esc(event.title)}</b>
