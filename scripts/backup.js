@@ -4,7 +4,11 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const {open,all,run,close} = require('./sqlite-tools');
 const versions = require('../model-versions');
-const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+async function hash(file) {
+  const digest=crypto.createHash('sha256');
+  for await (const chunk of fs.createReadStream(file)) digest.update(chunk);
+  return digest.digest('hex');
+}
 async function inspect(file) {
   const db = await open(file);
   try {
@@ -32,14 +36,14 @@ async function backup(source,directory) {
     await run(db,'VACUUM INTO ?',[path.join(dest,'yunbisai.db')]);
   } finally {await close(db);}
   const file=path.join(dest,'yunbisai.db');
-  const manifest={format:1,created_at:new Date().toISOString(),models:versions,sha256:hash(file),...await inspect(file)};
+  const manifest={format:1,created_at:new Date().toISOString(),models:versions,sha256:await hash(file),...await inspect(file)};
   fs.writeFileSync(path.join(dest,'manifest.json'),JSON.stringify(manifest,null,2),{flag:'wx'});
   return manifest;
 }
 async function verify(directory) {
   const file=path.join(path.resolve(directory),'yunbisai.db');
   const manifest=JSON.parse(fs.readFileSync(path.join(directory,'manifest.json'),'utf8'));
-  if(manifest.format!==1 || hash(file)!==manifest.sha256) throw new Error('Backup checksum mismatch');
+  if(manifest.format!==1 || await hash(file)!==manifest.sha256) throw new Error('Backup checksum mismatch');
   const actual=await inspect(file);
   if(actual.schema_sha256!==manifest.schema_sha256 || JSON.stringify(actual.counts)!==JSON.stringify(manifest.counts)) {
     throw new Error('Backup schema or record counts mismatch');
@@ -51,7 +55,7 @@ async function restore(directory,destination) {
   const dest=newDestination(destination);
   const file=path.join(dest,'yunbisai.db');
   fs.copyFileSync(path.join(directory,'yunbisai.db'),file,fs.constants.COPYFILE_EXCL);
-  if(hash(file)!==manifest.sha256) throw new Error('Restored database checksum mismatch');
+  if(await hash(file)!==manifest.sha256) throw new Error('Restored database checksum mismatch');
   const actual=await inspect(file);
   if(actual.schema_sha256!==manifest.schema_sha256 || JSON.stringify(actual.counts)!==JSON.stringify(manifest.counts)) throw new Error('Restore verification failed');
   return {restored_to:dest,...actual};

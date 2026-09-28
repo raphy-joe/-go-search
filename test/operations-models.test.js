@@ -112,6 +112,11 @@ test('online backup is consistent, restore verifies records, existing destinatio
     fs.rmSync(dir,{recursive:true,force:true});
   });
   const source=path.join(dir,'source.db');const db=new sqlite.Database(source);
+  const readFileSync=fs.readFileSync;
+  fs.readFileSync=function(file,...args) {
+    if(String(file).endsWith('.db')) throw new Error('Database hashing must stream, not buffer the entire database');
+    return readFileSync.call(this,file,...args);
+  };
   try {
     await run(db,'PRAGMA journal_mode=WAL');
     for(const table of ['events','event_groups','participant_index','group_match_cache','event_notice_cache','live_pairing_overrides']) {
@@ -126,5 +131,5 @@ test('online backup is consistent, restore verifies records, existing destinatio
     await assert.rejects(restore(dest,path.join(dir,'restored')),/EEXIST/);
     fs.appendFileSync(path.join(dest,'yunbisai.db'),'tampering');
     await assert.rejects(verify(dest),/checksum/);
-  } finally {await close(db);}
+  } finally {fs.readFileSync=readFileSync;await close(db);}
 });
