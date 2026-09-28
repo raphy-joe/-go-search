@@ -76,7 +76,7 @@ let systemStatusInFlight = null;
 async function readSystemStatus() {
   if (systemStatusSnapshot?.expiresAt > Date.now()) return systemStatusSnapshot.value;
   if (!systemStatusInFlight) {
-    systemStatusInFlight = Promise.all([getStats(), getIndexCoverage({})]).then(value => {
+    systemStatusInFlight = getIndexCoverage({}).then(value => {
       systemStatusSnapshot = { value, expiresAt: Date.now() + 30000 };
       return value;
     }).finally(() => { systemStatusInFlight = null; });
@@ -164,7 +164,7 @@ function safeTokenEqual(a, b) {
 
 app.get('/api/system-status', async (_req, res) => {
   try {
-    const [, coverage] = await readSystemStatus();
+    const coverage = await readSystemStatus();
     const total = coverage.eventCount || 0;
     const indexed = coverage.indexedEventCount || 0;
     res.setHeader('Cache-Control', 'no-store');
@@ -347,7 +347,7 @@ app.get('/healthz', async (_req,res)=>{
 
 app.get('/api/ops/status', requireAdmin, async (_req,res)=>{
   try {
-    const [,coverage]=await readSystemStatus();
+    const coverage=await readSystemStatus();
     const cache=await getOperationalCacheHealth();
     const requests=telemetry.snapshot();
     const alerts=healthAlerts({coverage,cache,requests});

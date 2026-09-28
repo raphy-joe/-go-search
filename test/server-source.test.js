@@ -94,6 +94,21 @@ test('status and head-to-head responses contain no merged-source metadata', asyn
   assert.equal(Object.hasOwn(h2h.body, 'source_coverage'), false);
 });
 
+test('status coalesces coverage reads without scanning the participant storage table',async()=>{
+  let calls=0;
+  const {routes}=loadServer({'./db':{
+    initPromise:new Promise(()=>{}),
+    getStats:async()=>{throw new Error('Full storage statistics must not run on the status path');},
+    getIndexCoverage:async()=>{calls++;await new Promise(resolve=>setTimeout(resolve,10));return {eventCount:10,indexedEventCount:9};},
+  }});
+  const results=[response(),response(),response()];
+  await Promise.all(results.map(res=>routes.get('/api/system-status')({},res)));
+  assert.equal(calls,1);
+  for(const res of results) {assert.equal(res.statusCode,200);assert.equal(res.body.coverage,0.9);}
+  const again=response();await routes.get('/api/system-status')({},again);
+  assert.equal(calls,1);
+});
+
 test('ambiguous identity cannot reach strength or promotion aggregation; explicit choices are filtered', async () => {
   const row = (id,province) => ({event_id:id,group_id:id,participant_id:'1',participant_name:'Alpha',
     title:'围棋段位赛',group_name:'5段组',min_time:'2026-08-01',provincename:province,win:4,lose:3});
