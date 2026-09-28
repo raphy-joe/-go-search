@@ -24,7 +24,35 @@ let predictionRequestSeq = 0;
 let predictionOnlyPage = false;
 let selectedTotalRounds = 0;
 let hasManualTotalRounds = false;
-let selectedNextResult = '';
+let selectedNextResult = normalizeNextResult(new URLSearchParams(window.location.search).get('next_result'));
+let eventsRequestSeq = 0;
+let eventsController = null;
+let groupController = null;
+let predictionController = null;
+let eventController = null;
+let selectedRankingRule = new URLSearchParams(window.location.search).get('ranking_rule') || '';
+if (!['','cloud-total-score','score-opponent-score'].includes(selectedRankingRule)) selectedRankingRule='';
+let predictionSeed = new URLSearchParams(window.location.search).get('seed') || '';
+let currentPredictionId = '';
+let playerQuery = new URLSearchParams(window.location.search).get('player_q') || '';
+
+function scoreText(value) { return window.PageView?.score(value) ?? (value ?? '--'); }
+
+function renderRuleEditor() {
+  return `<label class="rule-editor">排名口径<select id="liveRankingRule">
+    <option value="">未核实：暂按总得分</option><option value="cloud-total-score">假设：总得分、大分</option>
+    <option value="score-opponent-score">假设：大分、对手分</option></select></label>`;
+}
+function bindRuleEditor() {
+  const select=document.getElementById('liveRankingRule');
+  if(!select) return;
+  select.value=selectedRankingRule;
+  select.addEventListener('change',()=>{
+    selectedRankingRule=select.value;
+    window.PageView?.update({ranking_rule:selectedRankingRule});
+    loadGroup(liveGroupSelect.value,{predictionOnly:predictionOnlyPage,autoPredictId:predictionOnlyPage?currentPredictionId:''});
+  });
+}
 
 function esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -108,6 +136,16 @@ async function loadLiveEvents() {
     return;
   }
   liveProvinceSelect.setCustomValidity('');
+  window.PageView?.update({province});
+  window.history.replaceState({...window.history.state,liveSearched:true},'',window.location.href);
+  const seq = ++eventsRequestSeq;
+  eventsController?.abort();
+  const controller = new AbortController();
+  eventsController = controller;
+  groupController?.abort();
+  predictionController?.abort();
+  groupRequestSeq++;
+  predictionRequestSeq++;
   selectedEvent = null;
   selectedGroup = null;
   liveGroupSection.style.display = 'none';
@@ -119,15 +157,15 @@ async function loadLiveEvents() {
 
   try {
     const params = new URLSearchParams({ province });
-    const resp = await fetch(`/api/live-events?${params}`, { cache: 'no-store' });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || '查询失败');
+    const data = await requestJson(`/api/live-events?${params}`, { cache:'no-store', signal:controller.signal });
+    if (seq !== eventsRequestSeq || controller.signal.aborted) return;
     renderLiveEvents(data.events || [], data.warning || '');
   } catch (err) {
+    if (seq !== eventsRequestSeq || err.name === 'AbortError') return;
     liveEventCount.textContent = '--';
     showMessage(liveEventsList, `查询失败：${err.message}`);
   } finally {
-    loadLiveEventsBtn.disabled = false;
+    if (seq === eventsRequestSeq) loadLiveEventsBtn.disabled = false;
   }
 }
 
@@ -172,6 +210,9 @@ function buildEventDetailUrl(event) {
 }
 
 async function selectEvent(event, options = {}) {
+  eventController?.abort();
+  const controller = new AbortController();
+  eventController = controller;
   selectedEvent = event;
   initializeEventTotalRounds(event);
   selectedGroup = null;
@@ -179,18 +220,18 @@ async function selectEvent(event, options = {}) {
   liveGroupSection.style.display = 'block';
   selectedEventTitle.textContent = event.title || '';
   selectedEventMeta.textContent = `${event.date || ''} · ${event.province || ''} ${event.city || ''}`;
-  selectedEventLink.href = event.detail_url || '#';
+  selectedEventLink.href = `https://m.yunbisai.com/event/${encodeURIComponent(event.event_id)}`;
   liveGroupSelect.innerHTML = '<option>正在同步组别...</option>';
   showMessage(livePlayersPanel, '请选择组别后查看选手');
 
   try {
     const params = new URLSearchParams({ event_id: event.event_id });
-    const resp = await fetch(`/api/live-event?${params}`, { cache: 'no-store' });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || '组别加载失败');
+    const data = await requestJson(`/api/live-event?${params}`, { cache:'no-store', signal:controller.signal });
+    if (controller.signal.aborted) return;
     applyConfiguredEventTotalRounds(data.total_rounds);
     renderGroups(data.groups || [], options);
   } catch (err) {
+    if (err.name === 'AbortError') return;
     liveGroupSelect.innerHTML = '<option>组别加载失败</option>';
     showMessage(livePlayersPanel, `组别加载失败：${err.message}`);
   }
@@ -218,6 +259,11 @@ function renderGroups(groups, options = {}) {
 async function loadGroup(groupId = liveGroupSelect.value, options = {}) {
   if (!groupId) return;
   const seq = ++groupRequestSeq;
+  groupController?.abort();
+  predictionController?.abort();
+  predictionRequestSeq++;
+  const controller = new AbortController();
+  groupController = controller;
   livePredictionSection.style.display = 'none';
   selectedGroup = { group_id: groupId, group_name: liveGroupSelect.options[liveGroupSelect.selectedIndex]?.textContent || '' };
   livePlayersPanel.style.display = options.predictionOnly ? 'none' : 'block';
@@ -226,14 +272,13 @@ async function loadGroup(groupId = liveGroupSelect.value, options = {}) {
 
   try {
     const params = new URLSearchParams({ group_id: groupId });
+    if(selectedRankingRule) params.set('ranking_rule',selectedRankingRule);
     if (selectedTotalRounds) params.set('total_rounds', String(selectedTotalRounds));
-    const resp = await fetch(`/api/live-group?${params}`, { cache: 'no-store' });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || '本组加载失败');
+    const data = await requestJson(`/api/live-group?${params}`, { cache:'no-store', signal:controller.signal });
     if (seq !== groupRequestSeq) return;
     renderGroupPlayers(data, options);
   } catch (err) {
-    if (seq === groupRequestSeq) {
+    if (seq === groupRequestSeq && err.name !== 'AbortError') {
       livePlayersPanel.style.display = 'block';
       showMessage(livePlayersPanel, `本组加载失败：${err.message}`);
     }
@@ -319,11 +364,12 @@ function renderGroupPlayers(data, options = {}) {
     <tr>
       <td>${p.display_rank || p.cloud_rank || p.rank || ''}</td>
       <td><button type="button" class="live-player-link" data-player-id="${esc(p.id)}" data-player-name="${esc(p.name)}">${esc(p.name)}</button><div class="opponent-org">${esc(p.org || '')}</div></td>
-      <td>${p.score}</td>
-      <td>${p.opponent_score}</td>
-      <td>${p.total_score}</td>
-      <td>${p.win || 0}-${p.lose || 0}${p.draw ? `-${p.draw}` : ''}</td>
-    </tr>
+      <td>${scoreText(p.score)}</td>
+      <td class="secondary-column">${scoreText(p.opponent_score)}</td>
+      <td class="secondary-column">${scoreText(p.total_score)}</td>
+      <td class="secondary-column">${p.win || 0}-${p.lose || 0}${p.draw ? `-${p.draw}` : ''}</td>
+      <td class="mobile-only"><button type="button" class="icon-button" data-player-detail="${esc(p.id)}" aria-label="展开${esc(p.name)}的积分详情" title="积分详情" aria-expanded="false" aria-controls="player-detail-${esc(p.id)}"><img src="icons/chevron-down.svg" alt=""></button></td>
+    </tr><tr id="player-detail-${esc(p.id)}" class="ranking-detail mobile-only" hidden><td colspan="4">小分 ${scoreText(p.opponent_score)} · 总得分 ${scoreText(p.total_score)} · ${p.win||0}胜${p.lose||0}负${p.draw||0}和<br>${esc(p.org||'')}</td></tr>
   `).join('');
 
   livePlayersPanel.innerHTML = `
@@ -336,10 +382,42 @@ function renderGroupPlayers(data, options = {}) {
         </div>
       </div>
     </div>
-    <table class="live-table">
-      <thead><tr><th>名次</th><th>选手</th><th>大分</th><th>小分</th><th>总得分</th><th>胜负</th></tr></thead>
+    ${data.data_warning ? `<div class="live-note" role="status">${esc(data.data_warning)}</div>` : ''}
+    <div class="table-toolbar"><label>定位棋手<input id="livePlayerQuery" type="search" placeholder="姓名或单位" maxlength="64" value="${esc(playerQuery)}"></label>${renderRuleEditor()}<span id="livePlayerCount" role="status"></span></div>
+    <div class="live-note">排名规则未核实；当前计算采用${selectedRankingRule==='score-opponent-score'?'大分、对手分':'总得分、大分'}。总轮次来源：${data.total_rounds_source==='cloud'?'云比赛接口':data.total_rounds_source==='inferred'?'推测，需确认':'手动设置'}。</div>
+    <div class="ranking-scroll" tabindex="0" aria-label="选手排名表"><table class="live-table">
+      <thead><tr><th scope="col">名次</th><th scope="col">选手</th><th scope="col">大分</th><th scope="col" class="secondary-column">小分</th><th scope="col" class="secondary-column">总得分</th><th scope="col" class="secondary-column">胜负</th><th class="mobile-only" scope="col">详情</th></tr></thead>
       <tbody>${rows}</tbody>
-    </table>`;
+    </table></div>`;
+
+  bindRuleEditor();
+  const applyPlayerQuery=()=>{
+    playerQuery=document.getElementById('livePlayerQuery').value;
+    let count=0;
+    for(const button of livePlayersPanel.querySelectorAll('.live-player-link')) {
+      const row=button.closest('tr');
+      row.hidden=!row.textContent.toLocaleLowerCase().includes(playerQuery.trim().toLocaleLowerCase());
+      if(!row.hidden) count++;
+      const detail=document.getElementById(`player-detail-${button.dataset.playerId}`);
+      detail.hidden=row.hidden || row.querySelector('[data-player-detail]').getAttribute('aria-expanded')!=='true';
+    }
+    document.getElementById('livePlayerCount').textContent=`${count} / ${players.length} 人`;
+    window.PageView?.update({player_q:playerQuery});
+  };
+  document.getElementById('livePlayerQuery').addEventListener('input',applyPlayerQuery);
+  document.getElementById('livePlayerQuery').addEventListener('keydown',event=>{
+    if(event.key==='Enter') {
+      event.preventDefault();
+      livePlayersPanel.querySelector('tr:not([hidden]) .live-player-link')?.focus();
+    }
+  });
+  livePlayersPanel.querySelectorAll('[data-player-detail]').forEach(button=>button.addEventListener('click',()=>{
+    const open=button.getAttribute('aria-expanded')!=='true';
+    button.setAttribute('aria-expanded',String(open));
+    document.getElementById(button.getAttribute('aria-controls')).hidden=!open;
+  }));
+  applyPlayerQuery();
+  window.PageView?.restoreScroll();
 
   bindTotalRoundsEditor('liveTotalRoundsInput', minimumRounds);
   livePlayersPanel.querySelectorAll('.live-player-link').forEach(btn => {
@@ -364,6 +442,7 @@ function buildPredictionUrl(participantId, playerName = '') {
     player_name: playerName,
     total_rounds: readSelectedTotalRounds(),
   });
+  if(selectedRankingRule) params.set('ranking_rule',selectedRankingRule);
   return `live-prediction.html?${params}`;
 }
 
@@ -381,7 +460,11 @@ function setPredictionBusy(isBusy, message = '') {
 }
 
 async function startPrediction(participantId, nextResult = selectedNextResult, options = {}) {
+  currentPredictionId=participantId;
   const seq = ++predictionRequestSeq;
+  predictionController?.abort();
+  const controller = new AbortController();
+  predictionController = controller;
   const previousNextResult = selectedNextResult;
   const normalizedResult = normalizeNextResult(nextResult);
   selectedNextResult = normalizedResult;
@@ -403,18 +486,22 @@ async function startPrediction(participantId, nextResult = selectedNextResult, o
     const totalRounds = readSelectedTotalRounds();
     if (totalRounds) params.set('total_rounds', String(totalRounds));
     if (normalizedResult) params.set('next_result', normalizedResult);
-    const resp = await fetch(`/api/live-prediction?${params}`, { cache: 'no-store' });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || '预测失败');
-    if (seq !== predictionRequestSeq) return;
+    if(selectedRankingRule) params.set('ranking_rule',selectedRankingRule);
+    if(predictionSeed) params.set('seed',predictionSeed);
+    const data = await requestJson(`/api/live-prediction?${params}`, { cache:'no-store', signal:controller.signal });
+    if (seq !== predictionRequestSeq || controller.signal.aborted) return;
     renderPrediction(data);
   } catch (err) {
-    if (seq !== predictionRequestSeq) return;
-    if (preservePanel) {
+    if (seq !== predictionRequestSeq || err.name === 'AbortError') return;
+    if (preservePanel && err.code !== 'INCOMPLETE_PREDICTION_DATA') {
       selectedNextResult = previousNextResult;
       setPredictionBusy(false, `更新失败：${err.message}`);
     } else {
       showMessage(livePredictionPanel, `预测失败：${err.message}`);
+      const retry = document.createElement('button');
+      retry.type = 'button'; retry.className = 'btn-secondary'; retry.textContent = '重试';
+      retry.addEventListener('click', () => startPrediction(participantId, normalizedResult));
+      livePredictionPanel.appendChild(retry);
     }
   } finally {
     if (seq === predictionRequestSeq) setPredictionBusy(false);
@@ -422,6 +509,8 @@ async function startPrediction(participantId, nextResult = selectedNextResult, o
 }
 
 function renderPrediction(data) {
+  if(data.model?.seed) predictionSeed=data.model.seed;
+  window.PageView?.update({ranking_rule:selectedRankingRule,seed:predictionSeed,next_result:data.next_result||''});
   const items = data.probabilities || [];
   const rows = items.map(item => {
     const probability = Math.max(0, Math.min(1, Number(item.probability) || 0));
@@ -503,13 +592,16 @@ function renderPrediction(data) {
         <button id="recalculatePredictionBtn" type="button" class="btn-secondary">重新计算</button>
       </div>
     </div>
+    <div class="prediction-rule-bar">${renderRuleEditor()}<span class="live-muted">规则未核实 · ${data.total_rounds_source==='cloud'?'轮次来自云比赛':data.total_rounds_source==='inferred'?'总轮次为推测值，需确认':'轮次为手动设置'}</span></div>
     ${nextOpponentHtml}
     <div class="live-probability-heading">
       <div class="live-panel-title">${probabilityTitle}</div>
       <div class="live-muted">${data.simulations} 次模拟</div>
     </div>
     <div class="live-probability-list">${rows}</div>
-    <div class="live-note">已公布对阵按真实配对模拟；未公布轮次仅在概率计算中按简化瑞士制配对，不展示为正式对阵。${isBye ? '轮空自动按胜局计入，' : selectedNextResult ? `下一轮已固定为${resultLabel}，` : ''}其余单盘按等强 50/50 估计，结果仅供趋势判断。</div>`;
+    <div class="live-note">${esc(data.assumptions?.note||'排名细则未核实，结果为假设情景。')}已公布对阵按真实配对模拟；未公布轮次仅在概率计算中按简化瑞士制配对。${isBye ? '轮空自动按胜局计入，' : selectedNextResult ? `下一轮已固定为${resultLabel}，` : ''}其余单盘按等强 50/50 估计。</div>
+    ${data.model?.version?`<details class="model-details"><summary>计算版本</summary><div>${esc(data.model.version)}</div><div>数据标识 ${esc(data.model.snapshot_fingerprint)}</div><div>随机种子 ${esc(data.model.seed)}</div></details>`:''}`;
+  bindRuleEditor();
 
   const roundInput = bindTotalRoundsEditor('livePredictionTotalRoundsInput', minimumRounds);
   const recalculateBtn = document.getElementById('recalculatePredictionBtn');
@@ -542,7 +634,10 @@ function initFromUrl() {
   const params = new URLSearchParams(window.location.search);
   const eventId = params.get('event_id');
   if (!eventId) {
+    const province=params.get('province');
+    if(province) liveProvinceSelect.value=province;
     liveEventsSection.style.display = 'none';
+    if(province && window.history.state?.liveSearched) loadLiveEvents();
     return;
   }
 

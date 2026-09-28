@@ -6,6 +6,7 @@
   <meta name="color-scheme" content="light">
   <title>Go-Search · 赛中名次预测</title>
   <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="usability.css">
 </head>
 <body>
   <div class="app-shell">
@@ -36,6 +37,7 @@
         </div>
         <div class="page-chip page-chip-live"><span aria-hidden="true"></span>实时</div>
       </header>
+      <div class="query-link-row"><button type="button" class="icon-button" data-copy-query aria-label="复制查询链接" title="复制查询链接"><img src="icons/copy.svg" alt=""></button><span data-link-status class="action-status" role="status"></span></div>
 
       <section class="search-card live-toolbar">
         <div class="section-heading">
@@ -124,6 +126,7 @@
     </main>
   </div>
 
+  <script src="request.js"></script>
   <script src="common.js"></script>
   <script src="live-prediction.js"></script>
 </body>

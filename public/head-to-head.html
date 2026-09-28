@@ -6,6 +6,7 @@
   <meta name="color-scheme" content="light">
   <title>Go-Search · 棋手交手记录</title>
   <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="usability.css">
 </head>
 <body>
   <div class="app-shell">
@@ -34,8 +35,9 @@
           <h1>棋手交手记录</h1>
           <p class="subtitle">近两年同组直接对局</p>
         </div>
-        <div class="page-chip">近两年</div>
+        <button type="button" class="icon-button" data-copy-query aria-label="复制查询链接" title="复制查询链接"><img src="icons/copy.svg" alt=""></button>
       </header>
+      <div data-link-status class="action-status" role="status"></div>
 
       <form id="h2hForm" class="search-card h2h-card" autocomplete="on">
         <div class="section-heading">
@@ -98,6 +100,7 @@
     </main>
   </div>
 
+  <script src="request.js"></script>
   <script src="common.js"></script>
   <script src="h2h.js"></script>
 </body>

@@ -104,7 +104,8 @@ test('partial group fetch failures retain successful events with a warning', asy
 
 test('event-list business errors cannot masquerade as no competitions', async () => {
   const res = await load({ listError: true }).request('/api/live-events');
-  assert.equal(res.statusCode, 500);
+  assert.equal(res.statusCode, 502);
+  assert.equal(res.body.code, 'UPSTREAM_UNAVAILABLE');
   assert.match(res.body.error, /\u8bfb\u53d6\u5931\u8d25/);
 });
 
@@ -120,7 +121,7 @@ test('genuinely empty events and empty published groups stay successful', async 
 
 test('mismatched group ownership is rejected instead of showing another event', async () => {
   const res = await load({ groups: () => [group(1, 123)] }).request('/api/live-event', { event_id: '70596' });
-  assert.equal(res.statusCode, 500);
+  assert.equal(res.statusCode, 502);
 });
 
 test('invalid event identifiers do not trigger upstream requests', async () => {
@@ -138,10 +139,13 @@ function loadPage(response = { ok: true, data: { events: [] } }) {
     return elements.get(id);
   };
   let calls = 0;
-  const sandbox = { document: { getElementById: element, querySelector: element }, URLSearchParams,
-    window: { location: { search: '' } }, console,
+  const sandbox = { document: { getElementById: element, querySelector: element }, URLSearchParams, AbortController, setTimeout, clearTimeout,
+    window: { location: { search: '', href:'http://localhost/live-prediction.html' },
+      history: {state:null, replaceState(state) { this.state=state; }} }, console,
     fetch: async () => { calls++; return { ok: response.ok, json: async () => response.data }; } };
-  vm.runInNewContext(fs.readFileSync(path.join(root, 'public/live-prediction.js'), 'utf8'), sandbox);
+  vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(path.join(root, 'public/request.js'), 'utf8'), sandbox);
+  vm.runInContext(fs.readFileSync(path.join(root, 'public/live-prediction.js'), 'utf8'), sandbox);
   return { sandbox, element, calls: () => calls };
 }
 

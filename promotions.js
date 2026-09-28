@@ -1,6 +1,8 @@
 'use strict';
 
-const fetch = require('node-fetch');
+const rawFetch = require('node-fetch');
+const { limitedFetch } = require('./resource-limits');
+const fetch = (url, options) => limitedFetch(rawFetch, url, options);
 const {
   queryPromotionCandidates,
   queryEventGroups,
@@ -14,6 +16,8 @@ const NOTICE_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const NOTICE_FAILURE_CACHE_TTL_MS = parseInt(process.env.NOTICE_FAILURE_CACHE_TTL_MS || '', 10) || 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 12000;
 const delay = ms => new Promise(r => setTimeout(r, ms));
+const catalog = require('./rules/promotion-catalog.json');
+const { createHash } = require('node:crypto');
 const CONFIRMED_PUBLIC_ASSOCIATION_RULE_EVENTS = new Set([
   '54734',
 ]);
@@ -68,13 +72,15 @@ const EXTERNAL_PROMOTION_EVIDENCE = [
     organizer: '\u5185\u6c5f\u5e02\u9686\u660c\u5e02\u56f4\u68cb\u534f\u4f1a',
     group: '3\u6bb5-4\u6bb5\u7ec4',
     promotedTo: '5\u6bb5',
-    source: 'association-promotion-list',
+    source: 'user-confirmed-promotion',
     detail_url: 'http://www.scwqxh.com/',
   },
 ];
 
-async function estimatePromotionHistory({ name, province = '', dateFrom = '0000-01-01', dateTo = '9999-12-31' }) {
-  const rows = await queryPromotionCandidates({ name, province, dateFrom, dateTo });
+async function estimatePromotionHistory({ name, province = '', dateFrom = '0000-01-01', dateTo = '9999-12-31', identityRows, allowExternalEvidence = true }) {
+  const candidatesRows = await queryPromotionCandidates({ name, province, dateFrom, dateTo });
+  const identityKeys = identityRows ? new Set(identityRows.map(r => `${r.event_id}:${r.group_id}:${r.participant_id}`)) : null;
+  const rows = identityKeys ? candidatesRows.filter(r => identityKeys.has(`${r.event_id}:${r.group_id}:${r.participant_id}`)) : candidatesRows;
   const candidates = rows
     .map(row => ({ row, level: parseCandidateLevel(row.group_name) }))
     .filter(item => item.level);
@@ -126,12 +132,18 @@ async function estimatePromotionHistory({ name, province = '', dateFrom = '0000-
       basis: decision.basis,
       ruleText: decision.ruleText,
       source: decision.source,
+      provenance: { catalog_version:catalog.version, rule:rule?.provenance || null,
+        notice_url:notice.text ? `${EVENT_NOTICE_API}/${encodeURIComponent(row.event_id)}/event-notice` : null,
+        notice_sha256:notice.text ? createHash('sha256').update(notice.text).digest('hex') : null,
+        decision_method:decision.source, model_version:require('./model-versions').promotion },
       detail_url: `https://www.yunbisai.com/tpl/eventFeatures/eventDetail-${row.event_id}.html#groupID=${row.group_id}`,
     };
   });
   results.push(...analyzed.filter(Boolean));
 
-  results.push(...getExternalPromotionRecords({ name, province, dateFrom, dateTo }));
+  const external = getExternalPromotionRecords({ name, province, dateFrom, dateTo });
+  results.push(...external.filter(item => allowExternalEvidence || !identityRows || identityRows.some(r =>
+    r.provincename === item.province && String(r.min_time).slice(0,10) === item.date)));
   const uniqueResults = normalizePromotionSequence(dedupePromotionResults(results));
   uniqueResults.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
 
@@ -168,6 +180,7 @@ function getExternalPromotionRecords({ name, province, dateFrom, dateTo }) {
       basis: '',
       ruleText: '',
       source: item.source,
+      provenance: { ...catalog.manual[item.event_id], catalog_version:catalog.version },
       detail_url: item.detail_url,
     }));
 }
@@ -435,6 +448,7 @@ function confirmedEventRule(row) {
       targetLabel: null,
       fullWinTargetLabel: '1级',
       source: 'user-confirmed-rule',
+      provenance: catalog.manual[`${eventId}:${groupName}`],
     };
   }
   return null;
@@ -445,6 +459,10 @@ function genericAssociationRule(row, level) {
   if (!isRankEvent && !canUseAssociationRuleForBackedPublicEvent(row, level)) return null;
   const config = PROVINCIAL_ASSOCIATION_RULES[String(row.provincename || '')];
   if (!config) return null;
+  const provenance = catalog.provinces[row.provincename];
+  const date = String(row.min_time || '').slice(0,10);
+  if (provenance?.effective_from && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date < provenance.effective_from)) return null;
+  if (provenance?.effective_to && date > provenance.effective_to) return null;
   const rule = level.kind === 'dan'
     ? config.danRules?.[level.current]
     : config.levelRules?.[level.current];
@@ -459,6 +477,9 @@ function genericAssociationRule(row, level) {
     rounding: rule.rounding || config.rounding || 'ceil',
     minRounds: rule.minRounds || config.minRounds || 0,
     source: 'association-general-rule',
+    provenance,
+    minParticipants: provenance?.min_participants || 0,
+    nineRoundsAbove: provenance?.nine_rounds_above || 0,
   };
 }
 
@@ -775,6 +796,8 @@ function decidePromotion({ row, stats, rule, level }) {
   let basis = '';
   let target = targetFromFullWin || rule.targetLabel;
   if (rule.minRounds && rounds < rule.minRounds) return { promoted: false };
+  if (rule.minParticipants && groupSize < rule.minParticipants) return { promoted:false };
+  if (rule.nineRoundsAbove && groupSize > rule.nineRoundsAbove && rounds < 9) return { promoted:false };
   if (targetFromFullWin) {
     promoted = true;
     basis = `规程写明全胜特殊晋升；选手${win}胜全胜`;
@@ -863,4 +886,6 @@ module.exports = {
   parseCandidateLevel,
   promotionQuota,
   extractPromotionRule,
+  genericAssociationRule,
+  decidePromotion,
 };

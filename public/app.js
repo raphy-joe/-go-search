@@ -6,12 +6,6 @@ const nameInput       = document.getElementById('name');
 const provinceSelect  = document.getElementById('province');
 const searchBtn       = document.getElementById('searchBtn');
 const stopBtn         = document.getElementById('stopBtn');
-const h2hForm         = document.getElementById('h2hForm');
-const h2hPlayerAInput = document.getElementById('h2hPlayerA');
-const h2hPlayerBInput = document.getElementById('h2hPlayerB');
-const h2hBtn          = document.getElementById('h2hBtn');
-const h2hClearBtn     = document.getElementById('h2hClearBtn');
-const h2hResult       = document.getElementById('h2hResult');
 const progressSection = document.getElementById('progressSection');
 const progressText    = document.getElementById('progressText');
 const progressCount   = document.getElementById('progressCount');
@@ -28,35 +22,13 @@ let allHits   = [];   // all hit messages, used for strength estimation
 let searchSeq = 0;
 let strengthRefreshTimer = null;
 let strengthEvalVersion = 0;
-const STRENGTH_REFRESH_DELAY_MS = 900;
-
-// Cross-search cache: player name → { L, confidence }
-// Populated after each search; used as opponent strength reference in future searches.
-const playerStrengthCache = new Map();
-
-// ── Fetch all match data in parallel ─────────────────────────────────────────
-// Returns Map<hitIndex, matches[]>
-async function fetchAllMatchData(hits) {
-  const matchMap = new Map();
-  await Promise.all(hits.map(async (h, i) => {
-    const win   = parseInt(h.player.win)  || 0;
-    const lose  = parseInt(h.player.lose) || 0;
-    const draw  = parseInt(h.player.draw) || 0;
-    const rounds = win + lose + draw;
-    if (!rounds || !h.player.groupid || !h.player.participantid) return;
-    try {
-      const params = new URLSearchParams({
-        group_id:  h.player.groupid,
-        rounds,
-        player_id: h.player.participantid,
-      });
-      const resp = await fetch(`/api/matches?${params}`);
-      const data = await resp.json();
-      if (data.matches?.length) matchMap.set(i, data.matches);
-    } catch (_) {}
-  }));
-  return matchMap;
-}
+let queryController = null;
+let queryContext = null;
+let identityProfiles = [];
+let identityMemberships = new Map();
+let identityRequestVersion = 0;
+let resultFilters = {year:'',keyword:'',group:''};
+let linkedIdentity = '';
 
 // ── Compute rolling recent two years range ───────────────────────────────────
 function formatDate(d) {
@@ -77,155 +49,61 @@ function getRecentTwoYearRange() {
   };
 }
 
-function openHeadToHeadPage(playerA = '', playerB = '') {
-  const province = currentProvince || provinceSelect?.value || '__ALL__';
+function openHeadToHeadPage(playerA = '', playerB = '', context = {}) {
+  const province = context.province || queryContext?.province || '__ALL__';
   const params = new URLSearchParams({ playerA, playerB, province });
-  window.open(`/head-to-head.html?${params}`, '_blank');
+  if (context.identityA) params.set('identity_a', context.identityA);
+  if (context.identityB) params.set('identity_b', context.identityB);
+  window.open(`/head-to-head.html?${params}`, '_blank', 'noopener');
 }
 
-async function startHeadToHeadSearch(playerA = '', playerB = '', options = {}) {
-  if (!h2hForm) {
-    openHeadToHeadPage(playerA, playerB);
-    return;
-  }
-  if (!playerA) playerA = h2hPlayerAInput.value.trim();
-  if (!playerB) playerB = h2hPlayerBInput.value.trim();
-  playerA = playerA.trim();
-  playerB = playerB.trim();
-  const shouldFocusPanel = Boolean(options.focusPanel);
-  if (shouldFocusPanel) focusHeadToHeadPanel();
-  if (!playerA) { h2hPlayerAInput.focus(); return; }
-  if (!playerB) { h2hPlayerBInput.focus(); return; }
-  if (playerA === playerB) {
-    showHeadToHeadMessage('请输入两位不同棋手');
-    return;
-  }
-
-  h2hPlayerAInput.value = playerA;
-  h2hPlayerBInput.value = playerB;
-  const province = provinceSelect.value || '__ALL__';
-  const { dateFrom, dateTo } = getRecentTwoYearRange();
-
-  h2hBtn.disabled = true;
-  showHeadToHeadLoading(playerA, playerB);
-
-  try {
-    const params = new URLSearchParams({
-      playerA,
-      playerB,
-      province,
-      dateFrom,
-      dateTo,
-    });
-    const resp = await fetch(`/api/head-to-head?${params}`);
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || '查询失败');
-    renderHeadToHeadResult(data);
-  } catch (err) {
-    showHeadToHeadMessage(`查询失败：${esc(err.message)}`);
-  } finally {
-    h2hBtn.disabled = false;
-  }
-}
-
-function clearHeadToHeadResult({ clearPlayers = false } = {}) {
-  if (!h2hForm || !h2hResult) return;
-  if (clearPlayers) {
-    h2hPlayerAInput.value = '';
-    h2hPlayerBInput.value = '';
-  }
-  h2hResult.style.display = 'none';
-  h2hResult.innerHTML = '';
-  h2hForm.classList.remove('h2h-card--flash');
-}
-
-function focusHeadToHeadPanel() {
-  if (!h2hForm) return;
-  h2hForm.classList.remove('h2h-card--flash');
-  void h2hForm.offsetWidth;
-  h2hForm.classList.add('h2h-card--flash');
-  h2hForm.scrollIntoView({ behavior: 'smooth', block: 'start' });
-}
-
-function showHeadToHeadLoading(playerA, playerB) {
-  if (!h2hResult) return;
-  h2hResult.style.display = 'block';
-  h2hResult.innerHTML = `
-    <div class="h2h-context">正在查询「${esc(playerA)}」与「${esc(playerB)}」的交手记录</div>
-    <div class="matches-loading">查询中…</div>`;
-}
-
-function showHeadToHeadMessage(msg) {
-  if (!h2hResult) return;
-  h2hResult.style.display = 'block';
-  h2hResult.innerHTML = `<div class="matches-empty">${msg}</div>`;
-}
-
-function renderHeadToHeadResult(data) {
-  const { summary, games, players } = data;
-  const winRate = summary.games ? Math.round(summary.winRate * 1000) / 10 : 0;
-  if (!summary.games) {
-    showHeadToHeadMessage(`未找到「${esc(players.a)}」与「${esc(players.b)}」近两年的交手记录；已检查 ${data.checkedGroups || 0} 个同组候选。`);
-    return;
-  }
-
-  const rows = games.map(g => {
-    const resultLabel = g.result === 'win'
-      ? '<span class="m-win">胜</span>'
-      : g.result === 'lose'
-      ? '<span class="m-lose">负</span>'
-      : g.result === 'draw'
-      ? '<span class="m-draw">和</span>'
-      : '<span class="m-pending">待赛</span>';
-    const score = (g.score > 0 || g.opp_score > 0) ? `<span class="m-score">${g.score}:${g.opp_score}</span>` : '';
-    return `<tr>
-      <td>${esc(g.event.date || '')}</td>
-      <td><a class="h2h-event-link" href="${esc(g.event.detail_url)}" target="_blank">${esc(g.event.title)}</a><div class="opponent-org">${esc(g.group.name || '')}</div></td>
-      <td>第${g.bout}轮</td>
-      <td>${resultLabel} ${score}</td>
-      <td>${esc(g.playerA.org || '')}</td>
-      <td>${esc(g.playerB.org || '')}</td>
-    </tr>`;
-  }).join('');
-
-  h2hResult.style.display = 'block';
-  h2hResult.innerHTML = `
-    <div class="h2h-summary">
-      <span><b>${esc(players.a)}</b> 对 <b>${esc(players.b)}</b></span>
-      <span class="h2h-score">${summary.win}胜 ${summary.lose}负 ${summary.draw}和</span>
-      <span>胜率 ${winRate}%</span>
-      <span>同组候选 ${data.candidates || 0}，已检查 ${data.checkedGroups || 0}</span>
-      ${data.failedGroups ? `<span>${data.failedGroups} 组加载失败</span>` : ''}
-    </div>
-    <table class="h2h-table">
-      <thead><tr><th>日期</th><th>赛事</th><th>轮次</th><th>结果</th><th>${esc(players.a)}单位</th><th>${esc(players.b)}单位</th></tr></thead>
-      <tbody>${rows}</tbody>
-    </table>`;
-}
 
 // ── Form submit ───────────────────────────────────────────────────────────────
 form.addEventListener('submit', e => { e.preventDefault(); startSearch(); });
-if (h2hForm) h2hForm.addEventListener('submit', e => { e.preventDefault(); startHeadToHeadSearch(); });
-if (h2hClearBtn) h2hClearBtn.addEventListener('click', () => clearHeadToHeadResult({ clearPlayers: true }));
 stopBtn.addEventListener('click', () => {
+  if (strengthRefreshTimer) { clearTimeout(strengthRefreshTimer); strengthRefreshTimer = null; }
   if (evtSource) { evtSource.close(); evtSource = null; }
-  progressText.textContent = '已停止';
+  preservePartialResults();
+  progressText.textContent = '已停止，当前为部分结果';
   stopBtn.style.display = 'none';
   searchBtn.disabled = false;
 });
 
+function preservePartialResults() {
+  searchSeq++;
+  identityRequestVersion++;
+  strengthEvalVersion++;
+  queryController?.abort();
+  queryController = new AbortController();
+  queryContext = Object.freeze({ ...queryContext, identity:'', seq:searchSeq });
+  identityProfiles = [];
+  identityMemberships = new Map();
+  clearIdentityNotice();
+  clearStrengthCard();
+  clearPromotionCard();
+  resultsList.replaceChildren(...[...allHits].sort((a,b) => (b.event.date || '').localeCompare(a.event.date || '')).map(buildCard));
+  populateResultFilters();
+}
+
 // ── Main search ───────────────────────────────────────────────────────────────
-function startSearch() {
+function startSearch({ restore = false } = {}) {
   const name     = nameInput.value.trim();
   const province = provinceSelect.value;
 
   if (!name)     { nameInput.focus();     return; }
   if (!province) { provinceSelect.focus(); return; }
+  if (!restore) { resultFilters={year:'',keyword:'',group:''}; linkedIdentity=''; window.PageView?.resetScroll(); }
+  window.PageView?.update({name,province,year:resultFilters.year,keyword:resultFilters.keyword,group:resultFilters.group,identity:linkedIdentity});
+  document.getElementById('resultFilters').hidden=true;
 
   const seq = ++searchSeq;
+  queryController?.abort();
+  queryController = new AbortController();
+  identityRequestVersion++;
+  identityProfiles = [];
+  identityMemberships = new Map();
   strengthEvalVersion++;
   currentProvince = province;
-  clearHeadToHeadResult();
   clearIdentityNotice();
 
   if (evtSource) { evtSource.close(); evtSource = null; }
@@ -235,6 +113,7 @@ function startSearch() {
   }
 
   const { dateFrom, dateTo, label: dateLabel } = getRecentTwoYearRange();
+  queryContext = Object.freeze({ name, province, dateFrom, dateTo, identity: '', seq });
 
   // Reset UI
   hits = 0;
@@ -251,7 +130,7 @@ function startSearch() {
   progressSection.style.display = 'block';
   resultsSection.style.display  = 'block';
   const provinceLabel = province === '__ALL__' ? '全国' : province;
-  resultsTitle.textContent = `${esc(name)} · ${esc(provinceLabel)} · ${dateLabel}`;
+  resultsTitle.textContent = `${name} · ${provinceLabel} · ${dateLabel}`;
   renderStrengthPending(name);
   searchBtn.disabled = true;
   stopBtn.style.display = 'inline-block';
@@ -268,6 +147,10 @@ function startSearch() {
     const msg = JSON.parse(e.data);
 
     switch (msg.type) {
+      case 'identities':
+        identityProfiles = msg.profiles || [];
+        identityMemberships = new Map((msg.memberships || []).map(item => [item.key, item.identity_id]));
+        break;
       case 'status':
         progressText.textContent = msg.msg;
         break;
@@ -308,10 +191,6 @@ function startSearch() {
           hitDates.splice(idx, 0, date);
           resultsList.insertBefore(card, resultsList.children[idx]);
         }
-        if (hits === 1) {
-          renderCurrentBasicStrength(seq, name);
-        }
-        scheduleStrengthRefresh(seq, name);
         break;
       }
 
@@ -333,12 +212,11 @@ function startSearch() {
         if (hits === 0) {
           clearStrengthCard();
           clearPromotionCard();
-          showEmpty(name, province, msg.partial);
+          showEmpty(name, province, msg.partial || msg.failed > 0);
         } else {
-          renderIdentityNotice(allHits, province);
-          showStrengthEstimate([...allHits], seq, name);
-          showPromotionHistory(seq, name, province, dateFrom, dateTo);
+          applyIdentitySelection(identityProfiles.some(p=>p.id===linkedIdentity) ? linkedIdentity : identityProfiles.length === 1 ? identityProfiles[0].id : '');
         }
+        window.PageView?.restoreScroll();
         evtSource.close(); evtSource = null;
         searchBtn.disabled = false;
         stopBtn.style.display = 'none';
@@ -347,6 +225,7 @@ function startSearch() {
       case 'error':
         progressText.textContent = '出错：' + msg.msg;
         evtSource.close(); evtSource = null;
+        preservePartialResults();
         searchBtn.disabled = false;
         stopBtn.style.display = 'none';
         break;
@@ -355,8 +234,9 @@ function startSearch() {
 
   evtSource.onerror = () => {
     if (seq !== searchSeq) return;
-    progressText.textContent = '连接中断';
+    progressText.textContent = '连接中断，当前结果可能不完整';
     evtSource.close(); evtSource = null;
+    preservePartialResults();
     searchBtn.disabled = false;
     stopBtn.style.display = 'none';
   };
@@ -365,8 +245,13 @@ function startSearch() {
 // ── Build result card ─────────────────────────────────────────────────────────
 function buildCard(msg) {
   const { event, player } = msg;
+  const cardContext = { name: player.name, province: queryContext?.province || currentProvince || '__ALL__',
+    identityA: identityMemberships.get(hitIdentityKey(msg)) || `${event.event_id}:${player.groupid}:${player.participantid}` };
   const card = document.createElement('div');
   card.className = 'result-card';
+  card.dataset.year = String(event.date || '').slice(0,4);
+  card.dataset.title = event.title || '';
+  card.dataset.group = player.group || '';
   const winNum  = parseInt(player.win)  || 0;
   const loseNum = parseInt(player.lose) || 0;
   const drawNum = parseInt(player.draw) || 0;
@@ -402,68 +287,57 @@ function buildCard(msg) {
     const panel = card.querySelector('.matches-panel');
     let loaded  = false;
 
-    btn.addEventListener('click', async () => {
-      const open = panel.style.display !== 'none';
-      if (open) {
-        panel.style.display = 'none';
-        btn.textContent = '展开对局 ▾';
-        return;
-      }
+    async function loadMatches() {
+      const signal = queryController?.signal;
+      const seq = searchSeq;
       panel.style.display = 'block';
       btn.textContent = '收起对局 ▴';
+      btn.setAttribute('aria-expanded', 'true');
       if (loaded) return;
       loaded = true;
       panel.innerHTML = '<div class="matches-loading">加载中…</div>';
       try {
-        const params = new URLSearchParams({
-          group_id:  player.groupid,
-          rounds:    totalRounds,
-          player_id: player.participantid,
-        });
-        const resp = await fetch(`/api/matches?${params}`);
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.error || '对局读取失败');
-        if (!data.matches || data.matches.length === 0) {
-          panel.innerHTML = `<div class="matches-empty">暂无对局数据，<a href="${esc(event.detail_url)}" target="_blank">查看对阵表 →</a></div>`;
-          return;
-        }
-        const anyData = data.matches.some(m => m.opponent !== null);
-        if (!anyData) {
-          panel.innerHTML = `<div class="matches-empty">暂无对局数据，<a href="${esc(event.detail_url)}" target="_blank">查看对阵表 →</a></div>`;
+        const params = new URLSearchParams({ group_id:player.groupid, rounds:totalRounds, player_id:player.participantid });
+        const data = await requestJson(`/api/matches?${params}`, { signal });
+        if (seq !== searchSeq || signal?.aborted || !card.isConnected) return;
+        if (!data.matches?.some(m => m.opponent !== null)) {
+          loaded = false;
+          panel.innerHTML = '<div class="matches-empty">暂无已公布的对局数据 <button type="button" class="btn-expand" data-retry>重新查询</button></div>';
+          panel.querySelector('[data-retry]').addEventListener('click', loadMatches);
           return;
         }
         const rows = data.matches.map(m => {
           if (m.opponent === null) return `<tr><td class="bout-num">第${m.bout}轮</td><td colspan="3" class="no-data">—</td></tr>`;
-          const resultLabel = m.result === 'win'
-            ? '<span class="m-win">胜</span>'
-            : m.result === 'lose'
-            ? '<span class="m-lose">负</span>'
-            : m.result === 'draw' ? '<span class="m-draw">和</span>' : '<span class="m-pending">待赛</span>';
-          const scoreStr = m.result && (m.score > 0 || m.opp_score > 0) ? `<span class="m-score">${m.score}:${m.opp_score}</span>` : '';
-          const oppLink = m.opponent && !m.bye
-            ? `<a href="/?name=${encodeURIComponent(m.opponent)}&province=${encodeURIComponent(currentProvince)}" target="_blank" class="opp-link">${esc(m.opponent)}</a>`
-            : '';
-          const h2hLink = m.opponent && !m.bye
-            ? `<button type="button" class="h2h-link" data-opponent="${esc(m.opponent)}">交手</button>`
-            : '';
-          return `<tr>
-            <td class="bout-num">第${m.bout}轮</td>
-            <td>${resultLabel} ${scoreStr}</td>
-            <td class="opponent-name">${oppLink}${h2hLink}</td>
-            <td class="opponent-org">${esc(m.opponent_org || '')}</td>
-          </tr>`;
+          const resultLabel = { win:'胜', lose:'负', draw:'和' }[m.result] || '待赛';
+          const resultClass = { win:'m-win', lose:'m-lose', draw:'m-draw' }[m.result] || 'm-pending';
+          const opponentUrl = `/?name=${encodeURIComponent(m.opponent)}&province=${encodeURIComponent(cardContext.province)}`;
+          const score = (m.score > 0 || m.opp_score > 0) ? `<span class="m-score">${Number(m.score) || 0}:${Number(m.opp_score) || 0}</span>` : '';
+          return `<tr><td class="bout-num">第${m.bout}轮</td><td><span class="${resultClass}">${resultLabel}</span> ${score}</td>
+            <td>${m.bye ? esc(m.opponent) : `<a href="${opponentUrl}" target="_blank" rel="noopener" class="opp-link">${esc(m.opponent)}</a>
+            <button type="button" class="h2h-link" data-opponent="${esc(m.opponent)}" data-opponent-id="${esc(m.opponent_id || '')}">交手</button>`}</td><td class="opponent-org">${esc(m.opponent_org || '')}</td></tr>`;
         }).join('');
-        panel.innerHTML = `<table class="matches-table"><tbody>${rows}</tbody></table>`;
-        panel.querySelectorAll('.h2h-link').forEach(link => {
-          link.addEventListener('click', () => {
-            const playerA = nameInput.value.trim() || player.name;
-            const playerB = link.dataset.opponent || '';
-            openHeadToHeadPage(playerA, playerB);
-          });
-        });
-      } catch (e) {
+        const freshness = data.stale ? `<div class="matches-empty">实时读取失败，显示上次成功记录${data.updated_at ? `（${esc(new Date(data.updated_at).toLocaleString())}）` : ''} <button type="button" class="btn-expand" data-retry>重试更新</button></div>` : '';
+        panel.innerHTML = `${freshness}<table class="matches-table"><tbody>${rows}</tbody></table>`;
+        panel.querySelector('[data-retry]')?.addEventListener('click', () => { loaded = false; loadMatches(); });
+        panel.querySelectorAll('.h2h-link').forEach(link => link.addEventListener('click', () => {
+          openHeadToHeadPage(cardContext.name, link.dataset.opponent, { ...cardContext,
+            identityB: link.dataset.opponentId ? `${event.event_id}:${player.groupid}:${link.dataset.opponentId}` : '' });
+        }));
+      } catch (error) {
         loaded = false;
-        panel.innerHTML = `<div class="matches-empty">加载失败，<a href="${esc(event.detail_url)}" target="_blank">查看对阵表 →</a></div>`;
+        if (seq !== searchSeq || error.name === 'AbortError') return;
+        panel.innerHTML = `<div class="matches-empty">${esc(error.message)} <button type="button" class="btn-expand" data-retry>重试</button></div>`;
+        panel.querySelector('[data-retry]').addEventListener('click', loadMatches);
+      }
+    }
+    btn.setAttribute('aria-expanded', 'false');
+    btn.addEventListener('click', () => {
+      if (panel.style.display !== 'none') {
+        panel.style.display = 'none';
+        btn.textContent = '展开对局 ▾';
+        btn.setAttribute('aria-expanded', 'false');
+      } else {
+        loadMatches();
       }
     });
   }
@@ -474,7 +348,7 @@ function buildCard(msg) {
 function showEmpty(name, province, partial = false) {
   const provinceLabel = province === '__ALL__' ? '全国' : province;
   const hint = partial
-    ? '部分赛事正在后台补索引，稍后再查会更完整'
+    ? '本次未覆盖所有赛事，当前不能确认没有参赛记录，请稍后重试'
     : '请确认姓名是否精确，或尝试换一个省份';
   resultsList.innerHTML = `
     <div class="state-msg">
@@ -488,33 +362,101 @@ function clearIdentityNotice() {
   document.getElementById('identityNotice')?.remove();
 }
 
-function renderIdentityNotice(items, province) {
-  clearIdentityNotice();
-  if (province !== '__ALL__') return;
-  const provinces = [...new Set(items.map(item => item.event?.province).filter(Boolean))];
-  const organizers = new Set(items.map(item => item.event?.organizer).filter(Boolean));
-  if (provinces.length < 2 && organizers.size < 4) return;
+function hitIdentityKey(hit) {
+  return `${hit.event.event_id}:${hit.player.groupid}:${hit.player.participantid}`;
+}
 
+function applyIdentitySelection(identity) {
+  queryController?.abort();
+  queryController = new AbortController();
+  identityRequestVersion++;
+  strengthEvalVersion++;
+  queryContext = Object.freeze({ ...queryContext, identity });
+  window.PageView?.update({identity});
+  clearStrengthCard();
+  clearPromotionCard();
+  resultsList.innerHTML = '';
+  const selected = identityProfiles.find(p => p.id === identity);
+  const visible = selected ? allHits.filter(h => identityMemberships.get(hitIdentityKey(h)) === identity) : allHits;
+  const profiles = selected ? [selected] : identityProfiles;
+  for (const profile of profiles) {
+    if (identityProfiles.length > 1) {
+      const heading = document.createElement('h3');
+      heading.className = 'identity-group-heading';
+      heading.textContent = `${profile.label} · ${profile.orgs.join('、') || '单位未注明'} · ${profile.event_count} 场`;
+      resultsList.appendChild(heading);
+    }
+    const records = visible.filter(h => identityMemberships.get(hitIdentityKey(h)) === profile.id)
+      .sort((a,b) => (b.event.date || '').localeCompare(a.event.date || ''));
+    for (const hit of records) resultsList.appendChild(buildCard(hit));
+  }
+  resultCount.textContent = String(visible.length);
+  renderIdentityNotice();
+  populateResultFilters();
+  if (!selected) return;
+  const { seq, name, province, dateFrom, dateTo } = queryContext;
+  showStrengthEstimate(visible, seq, name);
+  showPromotionHistory(seq, name, province, dateFrom, dateTo);
+}
+
+function populateResultFilters() {
+  const section=document.getElementById('resultFilters');
+  section.hidden=!allHits.length;
+  for(const [key,id,values,label] of [
+    ['year','resultYear',allHits.map(h=>String(h.event.date||'').slice(0,4)),'全部年份'],
+    ['group','resultGroup',allHits.map(h=>h.player.group),'全部组别'],
+  ]) {
+    const select=document.getElementById(id);
+    select.innerHTML=`<option value="">${label}</option>`+[...new Set(values.filter(Boolean))].sort().reverse()
+      .map(value=>`<option value="${esc(value)}">${esc(value)}</option>`).join('');
+    select.value=resultFilters[key];
+    if(!select.value) resultFilters[key]='';
+  }
+  document.getElementById('resultKeyword').value=resultFilters.keyword;
+  applyResultFilters();
+}
+
+function applyResultFilters() {
+  const cards=[...resultsList.querySelectorAll('.result-card')];let shown=0;
+  for(const card of cards) {
+    card.hidden=Boolean((resultFilters.year && card.dataset.year!==resultFilters.year)
+      || (resultFilters.group && card.dataset.group!==resultFilters.group)
+      || !card.dataset.title.toLocaleLowerCase().includes(resultFilters.keyword.trim().toLocaleLowerCase()));
+    if(!card.hidden) shown++;
+  }
+  for(const heading of resultsList.querySelectorAll('.identity-group-heading')) {
+    let next=heading.nextElementSibling,visible=false;
+    while(next && !next.classList.contains('identity-group-heading')) { if(!next.hidden) visible=true;next=next.nextElementSibling; }
+    heading.hidden=!visible;
+  }
+  document.getElementById('resultDisplayed').textContent=`显示 ${shown} / ${cards.length} 场`;
+  window.PageView?.update({...resultFilters});
+}
+for(const [id,key,event] of [['resultYear','year','change'],['resultGroup','group','change'],['resultKeyword','keyword','input']]) {
+  document.getElementById(id).addEventListener(event,e=>{resultFilters[key]=e.target.value;applyResultFilters();});
+}
+document.getElementById('resetResultFilters').addEventListener('click',()=>{resultFilters={year:'',keyword:'',group:''};populateResultFilters();});
+
+function renderIdentityNotice() {
+  clearIdentityNotice();
+  if (identityProfiles.length < 2) return;
   const notice = document.createElement('aside');
   notice.id = 'identityNotice';
   notice.className = 'identity-notice';
   notice.setAttribute('role', 'status');
-  const provinceButtons = provinces.slice(0, 6).map(item => (
-    `<button type="button" data-province="${esc(item)}">仅查 ${esc(item)}</button>`
-  )).join('');
+  const choices = identityProfiles.map(profile => `<button type="button" data-identity="${esc(profile.id)}"
+    aria-pressed="${queryContext.identity === profile.id}">${esc(profile.label)} · ${esc(profile.orgs[0] || '单位未注明')}
+    · ${esc(profile.date_from)} 至 ${esc(profile.date_to)}</button>`).join('');
   notice.innerHTML = `
     <div class="identity-notice-copy">
-      <strong>请核对是否为同一位棋手</strong>
-      <span>全国结果来自 ${provinces.length || 1} 个省份、${organizers.size || 1} 个组织，可能包含同名选手。</span>
+      <strong>${identityProfiles.length} 条待区分的同名参赛轨迹</strong>
+      <span>${queryContext.identity ? '当前统计仅包含选中轨迹' : '记录已分开，棋力和升段历史暂未合并计算'}</span>
     </div>
-    ${provinceButtons ? `<div class="identity-notice-actions">${provinceButtons}</div>` : ''}`;
+    <div class="identity-notice-actions">${choices}<button type="button" data-identity="">全部轨迹</button></div>`;
   const anchor = document.getElementById('strengthCard') || resultsList;
   anchor.before(notice);
-  notice.querySelectorAll('[data-province]').forEach(button => {
-    button.addEventListener('click', () => {
-      provinceSelect.value = button.dataset.province;
-      startSearch();
-    });
+  notice.querySelectorAll('[data-identity]').forEach(button => {
+    button.addEventListener('click', () => applyIdentitySelection(button.dataset.identity));
   });
 }
 
@@ -524,16 +466,17 @@ function renderIdentityNotice(items, province) {
 // ── Path A: skill-level groups (1级组, 3段组, 定段组, 公开组…) ────────────────
 async function showPromotionHistory(seq, playerName, province, dateFrom, dateTo) {
   if (seq !== searchSeq) return;
+  const version = identityRequestVersion;
+  const signal = queryController?.signal;
   renderPromotionPending(playerName);
   try {
     const params = new URLSearchParams({ name: playerName, province, dateFrom, dateTo });
-    const resp = await fetch(`/api/promotions?${params}`);
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || '升段历史查询失败');
-    if (seq !== searchSeq) return;
+    if (queryContext?.identity) params.set('identity', queryContext.identity);
+    const data = await requestJson(`/api/promotions?${params}`, { signal });
+    if (seq !== searchSeq || version !== identityRequestVersion || signal?.aborted) return;
     renderPromotionCard(data);
   } catch (err) {
-    if (seq !== searchSeq) return;
+    if (seq !== searchSeq || version !== identityRequestVersion || err.name === 'AbortError') return;
     renderPromotionError(err);
   }
 }
@@ -624,355 +567,17 @@ function placePromotionCard(card) {
   resultsList.after(card);
 }
 
-function parseGroupL(groupName) {
-  if (!groupName) return null;
-  const g = groupName.trim();
-  if (/启蒙|吃子|入门|幼儿|棋趣/.test(g)) return null;
-  if (/定段/.test(g)) return 25.3;
-
-  // Range group: "1-2级" "3~5级" "1至3级"
-  const rangeM = g.match(/(\d+)\s*[~\-－—至到]\s*(\d+)\s*级/);
-  if (rangeM) {
-    const a = 26 - parseInt(rangeM[1]);
-    const b = 26 - parseInt(rangeM[2]);
-    return (a + b) / 2;
-  }
-
-  // Single level: "X级"
-  const lvM = g.match(/(\d+)\s*级/);
-  if (lvM) {
-    const lv = parseInt(lvM[1]);
-    if (lv >= 1 && lv <= 25) return 26 - lv;
-  }
-
-  // Dan group: "X段"
-  const danM = g.match(/(\d+)\s*段/);
-  if (danM) {
-    const d = parseInt(danM[1]);
-    if (d >= 1 && d <= 8) return 25 + d;
-  }
-
-  if (/低段/.test(g)) return 27.5;
-  if (/高段/.test(g)) return 30;
-  if (isOpenGroup(g)) return 30.2;   // 公开组略强于普通5段组
-  return null;
-}
-
-function isOpenGroup(groupName) {
-  return /公开/.test(groupName || '');
-}
-
-// ── Path B: age/grade groups (年级组, U10组, 8岁组…) ─────────────────────────
-// Returns L base value derived from event tier × grade/age, or null if not recognized.
-function parseAgeGradeL(groupName, eventTitle, organizer) {
-  if (!groupName) return null;
-  const g = groupName.trim();
-
-  // Must look like an age/grade group
-  const isAge = /[一二三四五六]年级|低年级|高年级|小学生?组|初中|中学生?组|U\d+|\d+\s*岁|[甲乙丙丁]组/.test(g);
-  if (!isAge) return null;
-  if (/启蒙|吃子|入门/.test(g)) return null;
-
-  // Event tier → base level
-  const text = (eventTitle || '') + ' ' + (organizer || '');
-  let tierBase;
-  if (/全国|国际/.test(text))           tierBase = 31.0;  // 5段以上
-  else if (/省/.test(text))             tierBase = 30.0;  // 5段
-  else if (/市/.test(text))             tierBase = 30.0;  // 5段
-  else if (/区|县/.test(text))          tierBase = 28.0;  // 3段
-  else if (/学校|班级|校内/.test(text)) tierBase = 24.5;  // 1-2级
-  else                                  tierBase = 28.0;  // default: 区县
-
-  // Grade/age adjustment (higher grade/age → stronger baseline)
-  let adj = 0;
-  const gradeMap = { '一': 0, '二': 0.3, '三': 0.6, '四': 0.9, '五': 1.2, '六': 1.5 };
-  for (const [ch, a] of Object.entries(gradeMap)) {
-    if (g.includes(ch + '年级')) { adj = a; break; }
-  }
-  if (/低年级/.test(g)) adj = 0.2;
-  if (/高年级/.test(g)) adj = 1.0;
-  if (/初中|中学生/.test(g)) adj = 1.5;  // 初中 ≈ 六年级以上
-
-  // 甲乙丙丁组（按年级划分，甲=高年级/初中，丁=低年级）
-  // 只在没有更精确的年级信息时使用（如"男甲组"、"女子乙组"等均匹配）
-  if (/甲组/.test(g) && adj === 0) adj = 1.0;   // 高年级/初中
-  if (/乙组/.test(g) && adj === 0) adj = 0.6;   // 中年级
-  if (/丙组/.test(g) && adj === 0) adj = 0.2;   // 低年级
-  if (/丁组/.test(g) && adj === 0) adj = 0;     // 最低年级
-
-  // U-age or 岁
-  const uM = g.match(/U(\d+)/i);
-  const aM = g.match(/(\d+)\s*岁/);
-  const age = uM ? parseInt(uM[1]) : aM ? parseInt(aM[1]) : null;
-  if (age !== null) {
-    adj = age <= 7 ? 0 : age <= 9 ? 0.3 : age <= 11 ? 0.7 : age <= 13 ? 1.1 : 1.5;
-  }
-
-  return tierBase + adj;
-}
-
-function winRateAdj(win, lose, draw) {
-  const total = win + lose + draw;
-  if (total === 0) return 0;
-  return 2 * ((win + 0.5 * draw) / total - 0.5);  // [-1, +1]
-}
-
-function timeWeight(dateStr) {
-  if (!dateStr) return 0;
-  const days = (Date.now() - new Date(dateStr).getTime()) / 86400000;
-  if (days <= 90)  return 1.00;
-  if (days <= 180) return 0.40;
-  return 0;
-}
-
-function eventLevelWeight(title, organizer) {
-  const text = title + ' ' + (organizer || '');
-  if (/全国|国际|中国围棋协会/.test(text))             return 1.60;
-  if (/省级|省赛|省锦标|全省|省围棋/.test(text))       return 1.40;
-  if (/市级|市锦标|全市|市围棋/.test(text))             return 1.20;
-  return 1.00;
-}
-
-function lToLabel(L) {
-  L = Math.max(0.5, Math.min(33.99, L));
-  const base = Math.floor(L);
-  const frac = L - base;
-  const tier = frac < 0.34 ? '弱' : frac < 0.67 ? '普通' : '强';
-  if (base >= 1 && base <= 25) return `${tier}${26 - base}级`;
-  if (base >= 26 && base <= 33) return `${tier}${base - 25}段`;
-  return null;
-}
-
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
-function buildHeadToHeadStats(hits, matchMap) {
-  const stats = new Map();
-  if (!matchMap) return stats;
-
-  for (let i = 0; i < hits.length; i++) {
-    const h = hits[i];
-    if (timeWeight(h.event.date) === 0) continue;
-    const matches = matchMap.get(i) || [];
-    for (const m of matches) {
-      if (!['win', 'lose', 'draw'].includes(m.result)) continue;
-      if (!m.opponent) continue;
-      const key = m.opponent.trim();
-      if (!key) continue;
-      const rec = stats.get(key) || { games: 0, win: 0, lose: 0, draw: 0 };
-      rec.games++;
-      if (m.result === 'win') rec.win++;
-      else if (m.result === 'lose') rec.lose++;
-      else rec.draw++;
-      stats.set(key, rec);
-    }
-  }
-
-  return stats;
-}
-
-function calcHeadToHeadAdj(matches, h2hStats) {
-  if (!matches?.length || !h2hStats?.size) {
-    return { h2hAdj: 0, h2hGameCount: 0, h2hOpponentCount: 0 };
-  }
-
-  let weightedScore = 0;
-  let totalWeight = 0;
-  let h2hGameCount = 0;
-  const repeatedOpponents = new Set();
-
-  for (const m of matches) {
-    if (!['win', 'lose', 'draw'].includes(m.result)) continue;
-    if (!m.opponent) continue;
-    const rec = h2hStats.get(m.opponent.trim());
-    if (!rec || rec.games < 2) continue;
-    const score = (rec.win + 0.5 * rec.draw) / rec.games - 0.5;
-    const reliability = Math.min(1, rec.games / 4);
-    weightedScore += score * reliability * rec.games;
-    totalWeight += reliability * rec.games;
-    h2hGameCount += rec.games;
-    repeatedOpponents.add(m.opponent.trim());
-  }
-
-  if (totalWeight === 0) {
-    return { h2hAdj: 0, h2hGameCount: 0, h2hOpponentCount: 0 };
-  }
-
-  return {
-    h2hAdj: clamp(1.6 * (weightedScore / totalWeight), -0.8, 0.8),
-    h2hGameCount,
-    h2hOpponentCount: repeatedOpponents.size,
-  };
-}
-
-function estimateStrength(hits, matchMap = null) {
-  // ── Pass 1: collect all event data ───────────────────────────────────────
-  const collected = [];
-  const h2hStats = buildHeadToHeadStats(hits, matchMap);
-
-  for (let i = 0; i < hits.length; i++) {
-    const h = hits[i];
-    const L_skill = parseGroupL(h.player.group);
-    const L_age   = L_skill === null
-      ? parseAgeGradeL(h.player.group, h.event.title, h.event.organizer)
-      : null;
-    const isAgeGroup = L_skill === null && L_age !== null;
-    const L_group = L_skill ?? L_age;
-    if (L_group === null) continue;
-    const isOpen = !isAgeGroup && isOpenGroup(h.player.group);
-
-    const win   = parseInt(h.player.win)  || 0;
-    const lose  = parseInt(h.player.lose) || 0;
-    const draw  = parseInt(h.player.draw) || 0;
-    const totalRounds = win + lose + draw;
-    if (totalRounds === 0) continue;
-
-    const tw = timeWeight(h.event.date);
-    if (tw === 0) continue;
-
-    // ── Match data analysis ────────────────────────────────────────────────
-    const matches = matchMap?.get(i) ?? null;
-    let effectiveRounds = totalRounds;
-    let oppAdj = 0;
-    let h2hAdj = 0;
-    let h2hGameCount = 0;
-    let h2hOpponentCount = 0;
-    let hasMatchData = false;
-    let knownOppCount = 0;
-
-    if (matches?.length) {
-      const realMatches = matches.filter(m => m.opponent !== null);
-      effectiveRounds = realMatches.length || totalRounds;
-      hasMatchData = true;
-
-      const oppLs = [];
-      for (const m of realMatches) {
-        if (!m.opponent) continue;
-        const cached = playerStrengthCache.get(m.opponent);
-        if (cached && (cached.confidence === '高' || cached.confidence === '中')) {
-          oppLs.push(cached.L);
-          knownOppCount++;
-        }
-      }
-      if (oppLs.length > 0) {
-        const oppLAvg = oppLs.reduce((s, v) => s + v, 0) / oppLs.length;
-        oppAdj = 0.4 * (oppLAvg - L_group);
-        oppAdj = Math.max(-1.5, Math.min(1.5, oppAdj));
-      }
-
-      const h2h = calcHeadToHeadAdj(realMatches, h2hStats);
-      h2hAdj = h2h.h2hAdj;
-      h2hGameCount = h2h.h2hGameCount;
-      h2hOpponentCount = h2h.h2hOpponentCount;
-    }
-
-    let wrAdj = winRateAdj(win, lose, draw);
-    if (isOpen && wrAdj < 0) wrAdj *= 0.75;
-    const T_raw = L_group + (isAgeGroup ? 0 : 0.5) + wrAdj + oppAdj + h2hAdj;
-    const ew = eventLevelWeight(h.event.title, h.event.organizer || '');
-
-    let dq;
-    if (isAgeGroup)              dq = h2hGameCount >= 4 ? 0.72 : 0.60;
-    else if (h2hGameCount >= 4)  dq = 1.08;
-    else if (knownOppCount >= 2) dq = 1.00;
-    else if (hasMatchData)       dq = 0.85;
-    else                         dq = 0.75;
-
-    const w = effectiveRounds * tw * ew * dq;
-    collected.push({ h, L_group, wrAdj, oppAdj, h2hAdj, h2hGameCount, h2hOpponentCount, T_raw, w, rounds: effectiveRounds, tw, ew, isAgeGroup, isOpen, hasMatchData, knownOppCount });
-  }
-
-  if (collected.length === 0) return null;
-
-  // ── Pass 2: compute skill-group baseline L ───────────────────────────────
-  // Age-group events can never be stronger evidence than skill-group events.
-  // A player who dominates a low-tier age group is AT LEAST as strong as
-  // the skill-group estimate — so floor age-group T at the skill-group L.
-  const skillOnly = collected.filter(e => !e.isAgeGroup);
-  let L_base = null;
-  if (skillOnly.length > 0) {
-    const sw  = skillOnly.reduce((s, e) => s + e.w, 0);
-    const sws = skillOnly.reduce((s, e) => s + e.T_raw * e.w, 0);
-    if (sw > 0) L_base = sws / sw;
-  }
-
-  // ── Pass 3: apply floor and compute final weighted average ───────────────
-  const usedEvents = [];
-  let weightedSum = 0;
-  let totalWeight = 0;
-
-  for (const e of collected) {
-    // For age groups with ≥50% win rate, T must be at least max(L_group, L_base).
-    // This ensures a player who dominates a lower-tier age group is never
-    // dragged below their skill-group estimate.
-    let T = e.T_raw;
-    if (e.isAgeGroup && e.wrAdj >= 0) {
-      const floor = L_base !== null ? Math.max(e.L_group, L_base) : e.L_group;
-      T = Math.max(T, floor);
-    }
-    if (e.isOpen) T = Math.max(T, 30.0);
-
-    weightedSum += T * e.w;
-    totalWeight += e.w;
-    usedEvents.push({ ...e, T });
-  }
-
-  if (totalWeight === 0) return null;
-
-  const L = weightedSum / totalWeight;
-
-  const recent3 = usedEvents.filter(e => e.tw === 1.00);
-  const recentRounds = recent3.reduce((s, e) => s + e.rounds, 0);
-  const allAge = usedEvents.every(e => e.isAgeGroup);
-  const conf = (!allAge && recentRounds >= 15 && recent3.length >= 2) ? '高'
-             : (recentRounds >= 8  || usedEvents.length >= 1)         ? '中'
-             : '低';
-
-  return { L, label: lToLabel(L), confidence: conf, events: usedEvents };
-}
-
-function scheduleStrengthRefresh(seq, playerName) {
-  if (seq !== searchSeq || allHits.length === 0) return;
-  if (strengthRefreshTimer) clearTimeout(strengthRefreshTimer);
-  strengthRefreshTimer = setTimeout(() => {
-    strengthRefreshTimer = null;
-    showStrengthEstimate([...allHits], seq, playerName);
-  }, STRENGTH_REFRESH_DELAY_MS);
-}
-
-function renderCurrentBasicStrength(seq, playerName) {
-  if (seq !== searchSeq || allHits.length === 0) return;
-  const snapshot = [...allHits];
-  const allGroups = [...new Set(snapshot.map(h => h.player.group).filter(Boolean))];
-  const hasRecent = snapshot.some(h => timeWeight(h.event.date) > 0);
-  const basicResult = estimateStrength(snapshot, null);
-  renderStrengthCard(
-    basicResult,
-    snapshot,
-    allGroups,
-    hasRecent,
-    '（搜索仍在继续，棋力会随新增结果自动刷新…）'
-  );
-  if (basicResult) {
-    playerStrengthCache.set(
-      playerName,
-      { L: basicResult.L, confidence: basicResult.confidence }
-    );
-  }
-}
 
 async function fetchBackendStrength(playerName) {
   const { dateTo } = getRecentTwoYearRange();
   const params = new URLSearchParams({
     name: playerName,
-    province: currentProvince || provinceSelect.value || '__ALL__',
+    province: queryContext?.province || '__ALL__',
+    dateFrom: queryContext?.dateFrom || getRecentTwoYearRange().dateFrom,
     dateTo,
   });
-  const resp = await fetch(`/api/strength?${params}`);
-  const data = await resp.json();
-  if (!resp.ok) throw new Error(data.error || 'strength estimate failed');
-  return data;
+  if (queryContext?.identity) params.set('identity', queryContext.identity);
+  return requestJson(`/api/strength?${params}`, { signal: queryController?.signal });
 }
 
 function renderBackendStrengthCard(result) {
@@ -1032,6 +637,7 @@ function renderBackendStrengthCard(result) {
       <div class="strength-details-body">
         <ul class="strength-basis">${basisItems}</ul>
         ${graphNote}${warnings}
+        ${result.model?.version ? `<div class="strength-note">模型 ${esc(result.model.version)} · ${esc(result.model.window_days)} 天</div>` : ''}
       </div>
     </details>`;
 
@@ -1041,56 +647,23 @@ function renderBackendStrengthCard(result) {
 async function showStrengthEstimate(hits, seq, playerName) {
   if (seq !== searchSeq) return;
   const evalVersion = ++strengthEvalVersion;
-  const old = document.getElementById('strengthCard');
-  if (old) old.remove();
-
-  const allGroups = [...new Set(hits.map(h => h.player.group).filter(Boolean))];
-  const hasRecent = hits.some(h => timeWeight(h.event.date) > 0);
-
-  // Phase 1: show basic estimate immediately (synchronous, no match data)
-  const basicResult = estimateStrength(hits, null);
-  if (seq !== searchSeq || evalVersion !== strengthEvalVersion) return;
-  renderStrengthCard(basicResult, hits, allGroups, hasRecent, '（正在加载对局数据…）');
-
+  renderStrengthPending(playerName);
   try {
-    const backendResult = await fetchBackendStrength(playerName);
+    const result = await fetchBackendStrength(playerName);
     if (seq !== searchSeq || evalVersion !== strengthEvalVersion) return;
-    renderBackendStrengthCard(backendResult);
-    if (!backendResult?.available || !hits.length) return;
-    if (backendResult?.available) {
-      playerStrengthCache.set(
-        playerName,
-        { L: backendResult.L, confidence: backendResult.confidence }
-      );
-      return;
-    }
-  } catch (_) {
-    // Keep the previous browser-side estimator as a fallback.
-  }
-
-  // Phase 2: fetch all match data in parallel, re-render enhanced estimate
-  const matchMap = await fetchAllMatchData(hits);
-  if (seq !== searchSeq || evalVersion !== strengthEvalVersion) return;
-  if (matchMap.size === 0) {
-    // No match data could be fetched — re-render without loading note
-    renderStrengthCard(basicResult, hits, allGroups, hasRecent, '后端评估暂不可用，当前显示浏览器备用估算。');
-    if (basicResult) {
-      playerStrengthCache.set(
-        playerName,
-        { L: basicResult.L, confidence: basicResult.confidence }
-      );
-    }
-    return;
-  }
-
-  const enhancedResult = estimateStrength(hits, matchMap);
-  if (seq !== searchSeq || evalVersion !== strengthEvalVersion) return;
-  renderStrengthCard(enhancedResult, hits, allGroups, hasRecent, '后端评估暂不可用，当前显示浏览器备用估算。');
-  if (enhancedResult) {
-    playerStrengthCache.set(
-      playerName,
-      { L: enhancedResult.L, confidence: enhancedResult.confidence }
-    );
+    renderBackendStrengthCard(result);
+  } catch (error) {
+    if (seq !== searchSeq || evalVersion !== strengthEvalVersion || error.name === 'AbortError') return;
+    clearStrengthCard();
+    const card = document.createElement('div');
+    card.id = 'strengthCard';
+    card.className = 'strength-card strength-card--unknown';
+    card.innerHTML = `<div class="strength-label strength-label--unknown">评估暂不可用</div><div class="strength-note">${esc(error.message)}</div>`;
+    const retry = document.createElement('button');
+    retry.type = 'button'; retry.className = 'btn-secondary'; retry.textContent = '重试';
+    retry.addEventListener('click', () => showStrengthEstimate(hits, seq, playerName));
+    card.appendChild(retry);
+    resultsList.before(card);
   }
 }
 
@@ -1112,105 +685,6 @@ function clearStrengthCard() {
   if (old) old.remove();
 }
 
-function renderStrengthCard(result, hits, allGroups, hasRecent, loadingMsg) {
-  clearStrengthCard();
-
-  if (!result) {
-    if (allGroups.length === 0) return;
-    const reason = hasRecent
-      ? '组别信息无法映射到段级位，暂不估算'
-      : '近180天内缺少可用棋力样本，暂不估算';
-    const note = hasRecent
-      ? `识别到的组别：${allGroups.map(g => `<b>${esc(g)}</b>`).join('、')}。如需支持这些组别，请反馈给开发者。`
-      : `识别到的组别：${allGroups.map(g => `<b>${esc(g)}</b>`).join('、')}。当前棋力评测只采纳近180天内的比赛。`;
-    const card = document.createElement('div');
-    card.id = 'strengthCard';
-    card.className = 'strength-card strength-card--unknown';
-    card.innerHTML = `
-      <div class="strength-header">
-        <div class="strength-label strength-label--unknown">棋力待估</div>
-        <div class="strength-meta">${reason}</div>
-      </div>
-      <div class="strength-note">${note}</div>`;
-    resultsList.before(card);
-    return;
-  }
-
-  const { L, label, confidence, events } = result;
-  const confColor = confidence === '高' ? '#2e7d32' : confidence === '中' ? '#e65100' : '#c62828';
-
-  // Build basis list (up to 4 events, sorted by time weight desc)
-  const sorted = [...events].sort((a, b) => b.tw - a.tw);
-  const basisItems = sorted.slice(0, 4).map(({ h, L_group, wrAdj, oppAdj, h2hAdj, h2hGameCount, h2hOpponentCount, T, rounds, isAgeGroup, hasMatchData, knownOppCount }) => {
-    const win  = parseInt(h.player.win)  || 0;
-    const lose = parseInt(h.player.lose) || 0;
-    const draw = parseInt(h.player.draw) || 0;
-    const groupLabel = h.player.group || '?';
-    const adjStr = (wrAdj >= 0 ? '+' : '') + wrAdj.toFixed(2);
-    const title = h.event.title.length > 22 ? h.event.title.slice(0, 22) + '…' : h.event.title;
-    const baseNote = isAgeGroup
-      ? `年龄/年级组估算基准${L_group.toFixed(1)}`
-      : `基准${L_group}+0.5`;
-    const oppAdjStr = oppAdj && Math.abs(oppAdj) >= 0.01
-      ? `，对手调整${(oppAdj >= 0 ? '+' : '') + oppAdj.toFixed(2)}`
-      : '';
-    const h2hAdjStr = h2hAdj && Math.abs(h2hAdj) >= 0.01
-      ? `，交手修正${(h2hAdj >= 0 ? '+' : '') + h2hAdj.toFixed(2)}`
-      : '';
-    const matchTag = h2hGameCount >= 4
-      ? ` <span class="tag-opp">同对手${h2hOpponentCount}人/${h2hGameCount}盘</span>`
-      : knownOppCount >= 2
-      ? ` <span class="tag-opp">对手数据</span>`
-      : hasMatchData
-      ? ` <span class="tag-match">对局已获取</span>`
-      : '';
-    return `<li><b>${esc(title)}</b> · ${esc(groupLabel)} · ${win}胜${lose}负${draw > 0 ? draw + '和' : ''}（${rounds}轮）→ <b>T=${T.toFixed(2)}</b>（${baseNote}，胜率调整${adjStr}${oppAdjStr}${h2hAdjStr}）${isAgeGroup ? ' <span class="tag-age">年龄组</span>' : ''}${matchTag}</li>`;
-  }).join('');
-
-  const skipped = hits.length - events.length;
-  const ageCount = events.filter(e => e.isAgeGroup).length;
-  const oppCount = events.filter(e => e.knownOppCount >= 2).length;
-  const h2hEvents = events.filter(e => e.h2hGameCount >= 4).length;
-  const h2hGames = events.reduce((s, e) => s + (e.h2hGameCount || 0), 0);
-
-  const skipNote = skipped > 0
-    ? `<div class="strength-note">另有 ${skipped} 场赛事因组别无法识别未纳入计算。</div>`
-    : '';
-  const ageNote = ageCount > 0
-    ? `<div class="strength-note">含 ${ageCount} 场年龄/年级组比赛，以赛事级别+年级估算基准，置信度偏低。</div>`
-    : '';
-  const oppNote = oppCount > 0
-    ? `<div class="strength-note strength-note--good">已通过对手强度数据（${oppCount} 场赛事）增强估算精度。</div>`
-    : '';
-  const h2hNote = h2hEvents > 0
-    ? `<div class="strength-note strength-note--good">已纳入同对手交手记录：${h2hEvents} 场赛事中识别到 ${h2hGames} 盘重复对手交手，作为重要修正因素。</div>`
-    : '';
-  const loadingNote = loadingMsg
-    ? `<div class="strength-note strength-note--loading">${loadingMsg}</div>`
-    : '';
-
-  const card = document.createElement('div');
-  card.id = 'strengthCard';
-  card.className = 'strength-card';
-  card.innerHTML = `
-    <div class="strength-header">
-      <div class="strength-label">${esc(label)}</div>
-      <div class="strength-meta">
-        L值 <b>${L.toFixed(2)}</b>
-        &nbsp;·&nbsp; 置信度 <span style="color:${confColor};font-weight:700">${confidence}</span>
-        &nbsp;·&nbsp; 依据 ${events.length} 场赛事 / ${events.reduce((s,e)=>s+e.rounds,0)} 轮
-      </div>
-    </div>
-    <details class="strength-details">
-      <summary>查看计算依据</summary>
-      <div class="strength-details-body">
-        <ul class="strength-basis">${basisItems}</ul>
-        ${ageNote}${h2hNote}${oppNote}${skipNote}${loadingNote}
-      </div>
-    </details>`;
-
-  resultsList.before(card);
-}
 
 function esc(s) {
   return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -1222,7 +696,9 @@ function esc(s) {
   const name     = params.get('name');
   const province = params.get('province') || '__ALL__';
   if (!name) return;
+  resultFilters={year:params.get('year')||'',keyword:params.get('keyword')||'',group:params.get('group')||''};
+  linkedIdentity=params.get('identity')||'';
   nameInput.value = name;
   provinceSelect.value = province;
-  if (provinceSelect.value === province) startSearch();
+  if (provinceSelect.value === province) startSearch({restore:true});
 })();

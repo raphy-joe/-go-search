@@ -3,15 +3,28 @@
   "version": "1.0.0",
   "description": "云比赛选手历史查询",
   "main": "server.js",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node --test \"test/*.test.js\""
+    "test": "node --test \"test/*.test.js\"",
+    "test:browser": "node --test test/browser-flows.cjs",
+    "test:smoke": "node scripts/smoke.js",
+    "ops:check": "node scripts/ops-check.js",
+    "backup": "node scripts/backup.js",
+    "backtest": "node scripts/backtest.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "node-cron": "^3.0.3",
+    "express": "^4.22.3",
+    "node-cron": "^4.6.0",
     "node-fetch": "^2.7.0",
+    "seedrandom": "^3.0.5",
     "sqlite3": "^6.0.1"
+  },
+  "devDependencies": {
+    "lucide-static": "^1.48.0",
+    "playwright": "^1.63.0"
   }
 }

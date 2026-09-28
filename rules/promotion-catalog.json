@@ -1,0 +1,49 @@
+{
+  "version": "2026-09-28.1",
+  "provinces": {
+    "四川省": {
+      "rule_id": "sichuan-association-legacy-v1",
+      "source_url": "http://www.scwqxh.com/go-a327.htm",
+      "scope": "现有四川省段级位赛识别条件及已确认赛事，不适用于公益、混合组",
+      "effective_from": null,
+      "effective_to": null,
+      "reviewed_at": "2026-09-28",
+      "verification": "legacy-source-unavailable",
+      "note": "沿用既有规则；本次来源无法访问，生效日期待核实，不冒充新核实规定"
+    },
+    "河北省": {
+      "rule_id": "hebei-2017-v1",
+      "source_url": "https://sport.hebei.gov.cn/m/view.php?aid=8392",
+      "scope": "河北省业余5段及以下、符合当地赛事授权的段级位赛",
+      "effective_from": "2017-10-01",
+      "effective_to": null,
+      "reviewed_at": "2026-09-28",
+      "verification": "source-text-verified-current-applicability-not-established",
+      "min_participants": 20,
+      "nine_rounds_above": 32,
+      "note": "已核对原文件第17、37条；最新有效性及具体赛事授权仍须核实"
+    }
+  },
+  "manual": {
+    "63516:5级组": {
+      "rule_id": "owner-confirmed-63516-5kyu-v1",
+      "source_type": "user-confirmation",
+      "source_url": null,
+      "scope": "仅赛事63516的5级组全胜升1级",
+      "effective_from": null,
+      "recorded_at": "2026-09-28",
+      "actor": "project-owner-confirmation-in-conversation",
+      "reason": "保留用户明确确认的历史修订；未伪造规程链接"
+    },
+    "external-scwqxh-2025-05-neijiang-3d4d-qym": {
+      "rule_id": "owner-confirmed-qym-20250504-v1",
+      "source_type": "user-confirmation",
+      "source_url": null,
+      "scope": "钱悦勉于2025-05-04该赛事定5段的单条补录",
+      "effective_from": "2025-05-04",
+      "recorded_at": "2026-09-28",
+      "actor": "project-owner-confirmation-in-conversation",
+      "reason": "用户提供明确赛事与晋升结果，原协会首页不是名单证据"
+    }
+  }
+}

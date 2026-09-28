@@ -6,6 +6,7 @@
   <meta name="color-scheme" content="light">
   <title>Go-Search · 选手历史查询</title>
   <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="usability.css">
 </head>
 <body>
   <div class="app-shell">
@@ -104,12 +105,22 @@
         <div class="results-header">
           <h2 id="resultsTitle">查询结果</h2>
           <span id="resultCount" class="badge">0</span>
+          <button type="button" class="icon-button" data-copy-query aria-label="复制查询链接" title="复制查询链接"><img src="icons/copy.svg" alt=""></button>
         </div>
+        <div class="result-filters" id="resultFilters" hidden>
+          <label>年份<select id="resultYear"><option value="">全部年份</option></select></label>
+          <label>赛事<input id="resultKeyword" type="search" placeholder="赛事关键词" maxlength="80"></label>
+          <label>组别<select id="resultGroup"><option value="">全部组别</option></select></label>
+          <button type="button" id="resetResultFilters" class="icon-button" aria-label="重置筛选" title="重置筛选"><img src="icons/filter-x.svg" alt=""></button>
+          <span id="resultDisplayed" role="status"></span>
+        </div>
+        <div data-link-status class="action-status" role="status"></div>
         <div id="resultsList"></div>
       </section>
     </main>
   </div>
 
+  <script src="request.js"></script>
   <script src="common.js"></script>
   <script src="app.js"></script>
 </body>

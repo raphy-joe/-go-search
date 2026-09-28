@@ -849,6 +849,18 @@ button:disabled {
   cursor: pointer;
 }
 
+.identity-group-heading {
+  margin: 20px 0 10px;
+  font-size: 15px;
+  overflow-wrap: anywhere;
+}
+
+.identity-notice-actions button[aria-pressed="true"] {
+  border-color: var(--primary);
+  color: var(--primary);
+  background: var(--primary-soft);
+}
+
 .strength-card,
 .promotion-card {
   min-width: 0;

@@ -1,15 +1,16 @@
 'use strict';
 
-const fetch = require('node-fetch');
+const rawFetch = require('node-fetch');
+const { limitedFetch } = require('./resource-limits');
+const fetch = (url, options) => limitedFetch(rawFetch, url, options);
 const { isGoGroup } = require('./sport-filter');
+const { fetchEventGroups } = require('./yunbisai-groups');
 const {
   queryEventsForIndex,
-  upsertEventGroups,
-  replaceParticipantsForEvent,
+  publishEventIndex,
   upsertIndexedEvent,
 } = require('./db');
 
-const DETAIL_BASE = 'https://www.yunbisai.com/tpl/eventFeatures/eventDetail-';
 const EVENTPART_API = 'https://api.yunbisai.com/request/Group/Eventpart';
 const REQUEST_TIMEOUT_MS = 15000;
 const EVENT_CONCURRENCY = 4;
@@ -24,6 +25,7 @@ let state = {
   totalEvents: 0,
   eventsIndexed: 0,
   eventsFailed: 0,
+  eventsPartial: 0,
   groupsIndexed: 0,
   participantsIndexed: 0,
   currentEvent: null,
@@ -58,6 +60,7 @@ async function runIndex({ province = '', dateFrom, dateTo, force = false, limit 
     totalEvents: 0,
     eventsIndexed: 0,
     eventsFailed: 0,
+    eventsPartial: 0,
     groupsIndexed: 0,
     participantsIndexed: 0,
     currentEvent: null,
@@ -79,7 +82,11 @@ async function runIndex({ province = '', dateFrom, dateTo, force = false, limit 
         state.currentEvent = `${event.event_id} ${event.title || ''}`.trim();
         try {
           const result = await indexEvent(event);
-          state.eventsIndexed++;
+          if (result.status === 'success') state.eventsIndexed++;
+          else {
+            state[result.status === 'partial' ? 'eventsPartial' : 'eventsFailed']++;
+            state.lastError = result.errors.join('; ');
+          }
           state.groupsIndexed += result.groupCount;
           state.participantsIndexed += result.participantCount;
           if (state.eventsIndexed % 20 === 0 || !queue.length) {
@@ -100,7 +107,9 @@ async function runIndex({ province = '', dateFrom, dateTo, force = false, limit 
       }
     }
 
-    await Promise.all(Array.from({ length: EVENT_CONCURRENCY }, worker));
+    const workers = await Promise.allSettled(Array.from({ length: EVENT_CONCURRENCY }, worker));
+    const failure = workers.find(result => result.status === 'rejected');
+    if (failure) throw failure.reason;
     console.log(`[Indexer] Done. Indexed ${state.eventsIndexed} events, ${state.participantsIndexed} participants.`);
   } catch (err) {
     if (err.message === 'INDEX_STOPPED' || err.name === 'AbortError') {
@@ -118,7 +127,7 @@ async function runIndex({ province = '', dateFrom, dateTo, force = false, limit 
 
 async function indexEvent(event) {
   throwIfStopped();
-  const groups = await fetchEventGroups(event.event_id);
+  const groups = await fetchEventGroups(event.event_id, { fetchText, eventTitle: event.title });
   const now = Date.now();
   const normalizedGroups = groups.filter(g => isGoGroup(event.title, g.groupname)).map(g => ({
     group_id: g.groupid,
@@ -128,64 +137,41 @@ async function indexEvent(event) {
     pnumber: g.pnumber || 0,
     updated_at: now,
   }));
-  await upsertEventGroups(normalizedGroups);
-
-  const participants = [];
+  const groupResults = [];
   for (const group of normalizedGroups) {
     throwIfStopped();
-    const rows = await fetchGroupParticipants(group.group_id);
-    for (const row of rows) {
-      const participantId = row.participantid || row.id || row.pid || '';
-      const participantName = row.participantname || row.name || '';
-      if (!participantId || !participantName) continue;
-      participants.push({
-        event_id: String(event.event_id),
-        group_id: group.group_id,
-        group_name: group.group_name,
-        participant_id: String(participantId),
-        participant_name: participantName,
-        org: row.teamname || row.othername || '',
-        short_no: row.short || '',
-        win: row.vicsum,
-        lose: row.faisum,
-        draw: row.deusum,
-        score: row.integral,
-        rank: row.compositor,
-        updated_at: now,
-      });
+    const participants = [];
+    try {
+      const rows = await fetchGroupParticipants(group.group_id);
+      for (const row of rows) {
+        const participantId = row.participantid || row.id || row.pid || '';
+        const participantName = row.participantname || row.name || '';
+        if (!participantId || !participantName) throw new Error('INVALID_PARTICIPANT');
+        participants.push({
+          event_id: String(event.event_id),
+          group_id: group.group_id,
+          group_name: group.group_name,
+          participant_id: String(participantId),
+          participant_name: participantName,
+          org: row.teamname || row.othername || '',
+          short_no: row.short || '',
+          win: row.vicsum,
+          lose: row.faisum,
+          draw: row.deusum,
+          score: row.integral,
+          rank: row.compositor,
+          updated_at: now,
+        });
+      }
+      groupResults.push({ group_id: group.group_id, rows: participants });
+    } catch (error) {
+      if (error.name === 'AbortError' || state.stopRequested) throw error;
+      groupResults.push({ group_id: group.group_id, error: error.message });
     }
     await delay(GROUP_DELAY_MS);
   }
-
-  await replaceParticipantsForEvent(event.event_id, participants);
-  await upsertIndexedEvent({
-    event_id: event.event_id,
-    group_count: normalizedGroups.length,
-    participant_count: participants.length,
-    last_error: '',
-    indexed_at: now,
-  });
-
-  return { groupCount: normalizedGroups.length, participantCount: participants.length };
-}
-
-async function fetchEventGroups(eventId) {
-  const html = await fetchText(`${DETAIL_BASE}${eventId}.html`, {
-    headers: { 'User-Agent': 'Mozilla/5.0' },
-    timeout: REQUEST_TIMEOUT_MS,
-  });
-  const groups = [];
-  const seen = new Set();
-  const anchorRe = /<a\b[^>]*data-groupid=["']?\d+["']?[^>]*>/gi;
-  let m;
-  while ((m = anchorRe.exec(html))) {
-    const attrs = parseDataAttrs(m[0]);
-    if (!attrs.groupid || seen.has(attrs.groupid)) continue;
-    seen.add(attrs.groupid);
-    groups.push(attrs);
-  }
-  if (groups.length === 0) throw new Error('no groups found');
-  return groups;
+  throwIfStopped();
+  return publishEventIndex({ event_id: event.event_id, groups: normalizedGroups, groupResults, indexed_at: now });
 }
 
 async function fetchGroupParticipants(groupId) {
@@ -201,7 +187,8 @@ async function fetchGroupParticipants(groupId) {
       continue;
     }
     if (data.error !== 0) throw new Error(data.msg || 'Eventpart API error');
-    return data.datArr?.rows || [];
+    if (!Array.isArray(data.datArr?.rows)) throw new Error('INVALID_PARTICIPANT_RESPONSE');
+    return data.datArr.rows;
   }
   throw new Error(`participants wait timeout for group ${groupId}`);
 }
@@ -224,23 +211,6 @@ function parseJsonp(text) {
     .replace(/\);\s*$/, '')
     .replace(/\)\s*$/, '');
   return JSON.parse(s);
-}
-
-function parseDataAttrs(html) {
-  const attrs = {};
-  const re = /data-([a-z0-9_-]+)=["']([^"']*)["']/gi;
-  let m;
-  while ((m = re.exec(html))) attrs[m[1].replace(/-/g, '')] = htmlDecode(m[2]);
-  return attrs;
-}
-
-function htmlDecode(s) {
-  return String(s || '')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>');
 }
 
 if (require.main === module) {

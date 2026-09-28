@@ -3,8 +3,7 @@
 /**
  * db.js — SQLite 数据库层
  *
- * 只存赛事列表（events 表）。
- * 参赛者数据仍由搜索时实时从云比赛 API 获取。
+ * 赛事、选手索引和对局缓存；索引刷新按组验证后原子发布。
  */
 
 const sqlite3 = require('sqlite3').verbose();
@@ -14,8 +13,8 @@ const { sportSql } = require('./sport-filter');
 const { assessYunMatches } = require('./result-quality');
 const { isPlayedMatch } = require('./match-results');
 
-const DATA_DIR = path.join(__dirname, 'data');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const db = new sqlite3.Database(path.join(DATA_DIR, 'yunbisai.db'));
 db.configure('busyTimeout', 10000);
@@ -52,21 +51,15 @@ function envNonNegativeInt(name, fallback) {
 const INDEX_REFRESH_PAST_DAYS = envNonNegativeInt('INDEX_REFRESH_PAST_DAYS', 45);
 const INDEX_REFRESH_FUTURE_DAYS = envNonNegativeInt('INDEX_REFRESH_FUTURE_DAYS', 14);
 const RECENT_EVENT_REFRESH_COND = `(
-  e.updated_at > COALESCE(ie.indexed_at, 0)
+  e.updated_at > COALESCE(ie.last_success_at, 0)
   AND date(e.min_time) BETWEEN date('now', '-${INDEX_REFRESH_PAST_DAYS} days') AND date('now', '+${INDEX_REFRESH_FUTURE_DAYS} days')
 )`;
 
 const NEEDS_INDEX_COND = `(
   ie.event_id IS NULL
   OR ${RECENT_EVENT_REFRESH_COND}
-  OR ie.last_error LIKE 'SQLITE_%'
-  OR ie.last_error LIKE '%database is locked%'
-  OR ie.last_error LIKE '%cannot start a transaction%'
-  OR ie.last_error LIKE '%timeout%'
-  OR ie.last_error LIKE '%socket hang up%'
-  OR ie.last_error LIKE '%ECONNRESET%'
-  OR ie.last_error LIKE '%ETIMEDOUT%'
-  OR ie.last_error LIKE 'HTTP %'
+  OR COALESCE(ie.last_error, '') <> ''
+  OR COALESCE(ie.status, 'pending') <> 'success'
 )`;
 
 // ── Schema ────────────────────────────────────────────────────────────────────
@@ -191,7 +184,23 @@ const initPromise = new Promise((res, rej) =>
       last_error    TEXT NOT NULL DEFAULT ''
     );
   `, err => err ? rej(err) : res())
-).then(ensureParticipantRankColumn).then(ensureGoViews);
+).then(ensureParticipantRankColumn).then(ensureIndexStatusColumns).then(ensureGoViews);
+
+async function ensureIndexStatusColumns() {
+  const cols = new Set((await all('PRAGMA table_info(indexed_events)')).map(c => c.name));
+  for (const [name, type] of Object.entries({
+    status: "TEXT NOT NULL DEFAULT 'pending'",
+    last_attempt_at: 'INTEGER NOT NULL DEFAULT 0',
+    last_success_at: 'INTEGER NOT NULL DEFAULT 0',
+  })) {
+    if (!cols.has(name)) await run(`ALTER TABLE indexed_events ADD COLUMN ${name} ${type}`);
+  }
+  if (!cols.has('status')) {
+    await run(`UPDATE indexed_events SET last_attempt_at=indexed_at,
+      last_success_at=CASE WHEN last_error='' THEN indexed_at ELSE 0 END,
+      status=CASE WHEN last_error='' THEN 'success' ELSE 'failed' END`);
+  }
+}
 
 async function ensureGoViews() {
   await run('BEGIN IMMEDIATE');
@@ -311,7 +320,12 @@ async function getIndexCoverage({ province = '', dateFrom, dateTo }) {
     `SELECT
        COUNT(*) AS eventCount,
        SUM(CASE WHEN ${NEEDS_INDEX_COND} THEN 0 ELSE 1 END) AS indexedEventCount,
-       SUM(CASE WHEN ${NEEDS_INDEX_COND} THEN 1 ELSE 0 END) AS unindexedEventCount
+       SUM(CASE WHEN ${NEEDS_INDEX_COND} THEN 1 ELSE 0 END) AS unindexedEventCount,
+       SUM(CASE WHEN ie.status='failed' THEN 1 ELSE 0 END) AS failedEventCount,
+       SUM(CASE WHEN ie.status='partial' THEN 1 ELSE 0 END) AS partialEventCount,
+       SUM(CASE WHEN ie.status='success' AND ${RECENT_EVENT_REFRESH_COND} THEN 1 ELSE 0 END) AS staleEventCount,
+       MAX(ie.last_success_at) AS lastSuccessAt,
+       MAX(ie.last_attempt_at) AS lastAttemptAt
      FROM go_events e
      LEFT JOIN indexed_events ie ON ie.event_id = e.event_id
      WHERE ${conds.join(' AND ')}`,
@@ -574,10 +588,17 @@ async function upsertIndexedEvent({ event_id, group_count = 0, participant_count
   return withWriteLock(async () => {
     await initPromise;
     return run(
-      `INSERT OR REPLACE INTO indexed_events
-         (event_id, indexed_at, group_count, participant_count, last_error)
-       VALUES (?, ?, ?, ?, ?)`,
-      [String(event_id), indexed_at, group_count, participant_count, last_error]
+      `INSERT INTO indexed_events
+         (event_id, indexed_at, group_count, participant_count, last_error, status, last_attempt_at, last_success_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(event_id) DO UPDATE SET
+         last_error=excluded.last_error, status=excluded.status, last_attempt_at=excluded.last_attempt_at,
+         indexed_at=CASE WHEN excluded.last_error='' THEN excluded.indexed_at ELSE indexed_events.indexed_at END,
+         last_success_at=CASE WHEN excluded.last_error='' THEN excluded.last_success_at ELSE indexed_events.last_success_at END,
+         group_count=CASE WHEN excluded.last_error='' THEN excluded.group_count ELSE indexed_events.group_count END,
+         participant_count=CASE WHEN excluded.last_error='' THEN excluded.participant_count ELSE indexed_events.participant_count END`,
+      [String(event_id), last_error ? 0 : indexed_at, group_count, participant_count, last_error,
+        last_error ? 'failed' : 'success', indexed_at, last_error ? 0 : indexed_at]
     );
   });
 }
@@ -616,6 +637,8 @@ async function replaceParticipantsForEvent(event_id, participants) {
     `;
     await run('BEGIN IMMEDIATE');
     try {
+      const previous = await all('SELECT * FROM participant_index WHERE event_id=?', [String(event_id)]);
+      assertParticipantCoverage(participants, previous);
       await run('DELETE FROM participant_index WHERE event_id = ?', [String(event_id)]);
       for (const p of participants) {
         await run(sql, [
@@ -629,6 +652,108 @@ async function replaceParticipantsForEvent(event_id, participants) {
     } catch (err) {
       await run('ROLLBACK');
       throw err;
+    }
+  });
+}
+
+async function getIdentityNotices(eventIds) {
+  await initPromise;
+  const ids = [...new Set(eventIds.map(String))];
+  const notices = new Map();
+  for (let offset = 0; offset < ids.length; offset += 400) {
+    const batch = ids.slice(offset, offset + 400);
+    const rows = await all(`SELECT event_id,notice_text FROM event_notice_cache
+      WHERE last_error='' AND event_id IN (${batch.map(() => '?').join(',')})`, batch);
+    for (const row of rows) notices.set(row.event_id, row.notice_text);
+  }
+  return notices;
+}
+
+async function getOperationalCacheHealth() {
+  await initPromise;
+  const result = await get(`WITH coverage AS (
+    SELECT group_id,COUNT(DISTINCT bout) AS count,MIN(bout) AS first,MAX(bout) AS last FROM group_match_cache GROUP BY group_id
+  ), ids AS (SELECT group_id FROM group_match_cache_status UNION SELECT group_id FROM coverage)
+  SELECT COUNT(*) AS cached_groups,
+    COALESCE(SUM(CASE WHEN COALESCE(c.first,0)<>1 OR COALESCE(c.count,0)<MAX(COALESCE(s.rounds,0),COALESCE(c.last,0)) THEN 1 ELSE 0 END),0) AS missing_round_groups,
+    MIN(s.updated_at) AS oldest_cached_at
+  FROM ids LEFT JOIN coverage c USING(group_id) LEFT JOIN group_match_cache_status s USING(group_id)`);
+  return {...result,missing_round_rate:result.cached_groups ? result.missing_round_groups/result.cached_groups : 0};
+}
+
+function assertParticipantCoverage(incoming, previous = [], expected = 0) {
+  if (!Array.isArray(incoming) || incoming.length < expected) throw new Error('INCOMPLETE_PARTICIPANTS');
+  const key = p => `${p.group_id}:${p.participant_id}`;
+  const map = new Map();
+  const rounds = p => Number(p.win || 0) + Number(p.lose || 0) + Number(p.draw || 0);
+  for (const p of incoming) {
+    if (!p.participant_id || !p.participant_name || map.has(key(p))
+      || ['win','lose','draw'].some(key => !Number.isInteger(Number(p[key] || 0)) || Number(p[key] || 0) < 0)) throw new Error('INVALID_PARTICIPANTS');
+    map.set(key(p), p);
+  }
+  if (previous.some(p => !map.has(key(p)) || rounds(map.get(key(p))) < rounds(p))) {
+    throw new Error('PARTICIPANT_COVERAGE_REGRESSION');
+  }
+}
+
+async function publishEventIndex({ event_id, groups, groupResults, indexed_at = Date.now() }) {
+  return withWriteLock(async () => {
+    await initPromise;
+    const eventId = String(event_id);
+    const errors = [];
+    let groupCount = 0, participantCount = 0;
+    await run('BEGIN IMMEDIATE');
+    try {
+      const existingGroups = await all('SELECT group_id FROM event_groups WHERE event_id=?', [eventId]);
+      const incomingIds = new Set(groups.map(g => String(g.group_id)));
+      for (const old of existingGroups) {
+        if (!incomingIds.has(old.group_id)) errors.push(`${old.group_id}: MISSING_GROUP`);
+      }
+      if (!groups.length) errors.push('EMPTY_GROUPS');
+      for (const group of groups) {
+        const gid = String(group.group_id);
+        const result = groupResults.find(g => String(g.group_id) === gid);
+        const owner = await get('SELECT event_id FROM event_groups WHERE group_id=?', [gid]);
+        if (owner && owner.event_id !== eventId) throw new Error('GROUP_EVENT_MISMATCH');
+        try {
+          if (!result || result.error) throw new Error(result?.error || 'MISSING_PARTICIPANTS');
+          if (result.rows.some(p => String(p.event_id) !== eventId || String(p.group_id) !== gid)) {
+            throw new Error('PARTICIPANT_EVENT_MISMATCH');
+          }
+          const previous = await all('SELECT * FROM participant_index WHERE event_id=? AND group_id=?', [eventId, gid]);
+          assertParticipantCoverage(result.rows, previous, Number(group.pnumber) || 0);
+        } catch (error) {
+          errors.push(`${gid}: ${error.message}`);
+          continue;
+        }
+        await run(`INSERT OR REPLACE INTO event_groups
+          (group_id,event_id,group_name,team_type,pnumber,updated_at) VALUES(?,?,?,?,?,?)`,
+        [gid,eventId,group.group_name || '',String(group.team_type || '0'),Number(group.pnumber) || 0,indexed_at]);
+        await run('DELETE FROM participant_index WHERE event_id=? AND group_id=?', [eventId,gid]);
+        for (const p of result.rows) {
+          await run(`INSERT INTO participant_index
+            (event_id,group_id,group_name,participant_id,participant_name,org,short_no,win,lose,draw,score,rank,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [eventId,gid,group.group_name || '',String(p.participant_id),p.participant_name,p.org || '',p.short_no || '',
+            Number(p.win) || 0,Number(p.lose) || 0,Number(p.draw) || 0,String(p.score ?? ''),Number(p.rank) || 0,indexed_at]);
+        }
+        groupCount++;
+        participantCount += result.rows.length;
+      }
+      const status = errors.length ? (groupCount ? 'partial' : 'failed') : 'success';
+      const count = await get('SELECT COUNT(*) AS n FROM participant_index WHERE event_id=?', [eventId]);
+      const old = await get('SELECT * FROM indexed_events WHERE event_id=?', [eventId]);
+      const successAt = status === 'success' ? indexed_at : old?.last_success_at || 0;
+      await run(`INSERT OR REPLACE INTO indexed_events
+        (event_id,indexed_at,group_count,participant_count,last_error,status,last_attempt_at,last_success_at)
+        VALUES(?,?,?,?,?,?,?,?)`,
+      [eventId,successAt,new Set([...existingGroups.map(g => g.group_id),...incomingIds]).size,count.n,
+        errors.join('; ').slice(0,2000),status,indexed_at,successAt]);
+      await run('COMMIT');
+      return { status, errors, groupCount, participantCount };
+    } catch (error) {
+      await run('ROLLBACK');
+      throw error;
     }
   });
 }
@@ -706,9 +831,12 @@ module.exports = {
   getLivePairingOverrides,
   replaceLivePairingOverrides,
   getEventNoticeCache,
+  getIdentityNotices,
+  getOperationalCacheHealth,
   replaceEventNoticeCache,
   upsertIndexedEvent,
   upsertEventGroups,
   replaceParticipantsForEvent,
+  publishEventIndex,
   getStats,
 };

@@ -8,7 +8,9 @@
  *   搜索时直接从 DB 过滤赛事，省去每次搜索时的分页加载。
  */
 
-const fetch  = require('node-fetch');
+const rawFetch = require('node-fetch');
+const { limitedFetch } = require('./resource-limits');
+const fetch = (url, options) => limitedFetch(rawFetch, url, options);
 const { upsertEvents, getStats } = require('./db');
 const { isGoEvent } = require('./sport-filter');
 
