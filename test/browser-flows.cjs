@@ -21,7 +21,10 @@ before(async () => {
 });
 after(async () => {
   await browser?.close();
-  if (server) await new Promise(resolve => server.close(resolve));
+  if (server) {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
   assert.deepEqual(errors, [], 'browser runtime errors');
 });
 
