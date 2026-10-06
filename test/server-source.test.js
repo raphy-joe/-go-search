@@ -142,3 +142,47 @@ test('administrator background tasks outlive the initiating request context', as
   controller.abort();
   assert.deepEqual(signals,[undefined]);
 });
+
+test('event round confirmation applies to every group and overrides old direct prediction requests',async()=>{
+  const calls=[];
+  const {routes}=loadServer({
+    './db':{initPromise:new Promise(()=>{}),getLivePairingOverrides:async()=>[]},
+    'node-fetch':async url=>{
+      const u=new URL(url);calls.push(u);
+      const players=[{participantid:'1',participantname:'Alpha',vicsum:'3',faisum:'2',integral:'6'},
+        {participantid:'2',participantname:'Beta',vicsum:'2',faisum:'3',integral:'4'},
+        {participantid:'3',participantname:'Absent',vicsum:'0',faisum:'0',integral:'0'}];
+      let body;
+      if(u.pathname.endsWith('/Eventpart')) body={error:0,datArr:{rows:players}};
+      else {
+        const bout=Number(u.searchParams.get('bout'));
+        const returnedBout=Math.min(bout,6);
+        const result=returnedBout<=3?'1':returnedBout<=5?'2':'0';
+        const rows=[{againstplanid:String(returnedBout),p1id:'1',p2id:'2',p1:'Alpha',p2:'Beta',
+          p1_result:result,p2_result:result==='1'?'2':result==='2'?'1':'0',p1_score:result==='1'?2:0,p2_score:result==='2'?2:0}];
+        if(bout===6) await new Promise(resolve=>setTimeout(resolve,10));
+        if(bout===1) rows.push({againstplanid:'absence',p1id:'3',p2id:'0',p1:'Absent',p1_result:'4',p1_score:0});
+        body={error:0,datArr:{eventid:'70886',total_bout:'6',lastbout:'6',rows}};
+      }
+      return {ok:true,text:async()=>`cb(${JSON.stringify(body)});`};
+    },
+  });
+  for(const group of ['349071','349072','349073','349074','349075','349076']) {
+    const res=response();await routes.get('/api/live-group')({query:{group_id:group,total_rounds:'6'}},res);
+    assert.equal(res.statusCode,200);
+    assert.equal(res.body.total_rounds,7);
+    assert.equal(res.body.total_rounds_source,'event-config');
+    assert.equal(res.body.completed_rounds,5);
+    assert.equal(res.body.known_pairing_rounds,6);
+    assert.equal(res.body.prediction_available,true);
+    assert.equal(res.body.players.find(p=>p.id==='3').score,0);
+  }
+  const prediction=response();await routes.get('/api/live-prediction')({query:{group_id:'349073',participant_id:'1',total_rounds:'6',simulations:'200'}},prediction);
+  assert.equal(prediction.statusCode,200);
+  assert.equal(prediction.body.total_rounds,7);
+  assert.equal(prediction.body.completed_rounds,5);
+  assert.equal(prediction.body.next_opponent.id,'2');
+  assert.equal(prediction.body.next_opponent.bout,6);
+  assert.equal(prediction.body.model.pairing_players,2);
+  assert.ok(calls.some(u=>u.searchParams.get('bout')==='7'));
+});

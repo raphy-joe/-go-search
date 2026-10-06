@@ -5,6 +5,39 @@ const seedrandom = require('seedrandom');
 const versions = require('./model-versions');
 const { rankingRule, snapshotFingerprint } = require('./prediction-rules');
 
+const LIVE_BYE_OPPONENT_ID = '__live_bye__';
+
+function isUnscoredLiveAbsence(row) {
+  if (!row) return false;
+  const p1Absent = row.p2_id === LIVE_BYE_OPPONENT_ID;
+  const p2Absent = row.p1_id === LIVE_BYE_OPPONENT_ID;
+  if (p1Absent === p2Absent) return false;
+  const result = p1Absent ? row.p1_result : row.p2_result;
+  const otherResult = p1Absent ? row.p2_result : row.p1_result;
+  return String(result) === '4' && Number(row.p1_score) === 0 && Number(row.p2_score) === 0
+    && ['', '0'].includes(String(otherResult ?? ''));
+}
+
+// A published zero-point absence is settled, but is not a played game or a bye win.
+function isResolvedLiveMatch(row) {
+  return isPlayedMatch(row) || isUnscoredLiveAbsence(row);
+}
+
+function nonPlayingPlayerIds(players, rows) {
+  const observed = new Set(), competing = new Set();
+  for (const row of rows) {
+    for (const id of [row.p1_id, row.p2_id]) {
+      if (id === LIVE_BYE_OPPONENT_ID) continue;
+      observed.add(id);
+      if (!isUnscoredLiveAbsence(row)) competing.add(id);
+    }
+  }
+  return new Set(players.filter(player => observed.has(String(player.id))
+    && !competing.has(String(player.id)) && Number(player.score || 0) === 0
+    && Number(player.win || 0) + Number(player.lose || 0) + Number(player.draw || 0) === 0)
+    .map(player => String(player.id)));
+}
+
 function validatePredictionSnapshot(snapshot) {
   const players = snapshot?.players || [];
   const rows = snapshot?.matchData?.rows || [];
@@ -13,6 +46,7 @@ function validatePredictionSnapshot(snapshot) {
   if (!players.length || players.length > 1500) fail();
   const ids = new Set(players.map(p => String(p.id)));
   if (ids.size !== players.length) fail();
+  const nonPlaying = nonPlayingPlayerIds(players, rows);
   const playedCounts = new Map(), appearances = new Set(), bouts = new Map(), lastSeen = new Map();
   let lastPlayed = 0;
   for (const row of rows) {
@@ -39,14 +73,14 @@ function validatePredictionSnapshot(snapshot) {
     const previous = bouts.get(bout - 1) || (bout === 1 ? players.map(p => ({ p1_id:String(p.id) })) : []);
     for (const row of previous) {
       for (const id of [row.p1_id, row.p2_id]) {
-        if (ids.has(id) && (lastSeen.get(id) || 0) >= lastPlayed - 1 && !appearances.has(`${bout}:${id}`)) fail();
+        if (ids.has(id) && !nonPlaying.has(id) && (lastSeen.get(id) || 0) >= lastPlayed - 1 && !appearances.has(`${bout}:${id}`)) fail();
       }
     }
     if (!round.length) fail();
   }
   for (let bout = 1; bout <= lastPlayed; bout++) {
     const round = bouts.get(bout);
-    if (!round?.length || (bout < lastPlayed && !round.every(isPlayedMatch))) fail();
+    if (!round?.length || (bout < lastPlayed && !round.every(isResolvedLiveMatch))) fail();
     for (const row of rows.filter(r => r.bout > bout)) {
       for (const id of [row.p1_id, row.p2_id]) {
         if (ids.has(id) && !appearances.has(`${bout}:${id}`)) fail();
@@ -158,7 +192,8 @@ function predictPlayerRank({
 
   const currentRows = computeCurrentRanking(players, matchData.rows, Math.max(matchData.completedRounds || 0, 1), rule.id);
   const current = currentRows.find(p => p.id === String(participantId));
-  const minimumTotalRounds = Math.max(matchData.completedRounds || 0, matchData.knownPairingRounds || 0, 1);
+  const confirmedRounds = matchData.totalRoundsSource === 'event-config' ? matchData.totalRounds : 0;
+  const minimumTotalRounds = Math.max(matchData.completedRounds || 0, matchData.knownPairingRounds || 0, confirmedRounds, 1);
   const totalRounds = requestedTotalRounds
     ? Math.max(requestedTotalRounds, minimumTotalRounds)
     : Math.max(matchData.totalRounds || 0, minimumTotalRounds);
@@ -184,7 +219,7 @@ function predictPlayerRank({
 
     for (let bout = 1; bout <= totalRounds; bout++) {
       const rows = rowsByBout.get(bout) || [];
-      const unplayedRows = rows.filter(row => !playedKeys.has(matchKey(row)) && !isPlayedMatch(row));
+      const unplayedRows = rows.filter(row => !playedKeys.has(matchKey(row)) && !isResolvedLiveMatch(row));
       if (unplayedRows.length) {
         for (const row of unplayedRows) {
           const isSelectedNextMatch = appliedNextResult
@@ -221,7 +256,8 @@ function predictPlayerRank({
     group_id: String(groupId),
     total_rounds: totalRounds,
     detected_total_rounds: matchData.totalRounds,
-    total_rounds_source: requestedTotalRounds ? 'manual' : matchData.totalRoundsSource,
+    total_rounds_source: confirmedRounds && totalRounds === confirmedRounds
+      ? 'event-config' : requestedTotalRounds ? 'manual' : matchData.totalRoundsSource,
     completed_rounds: matchData.completedRounds,
     known_pairing_rounds: matchData.knownPairingRounds,
     manual_pairing_rounds: matchData.manualPairingRounds,
@@ -233,7 +269,8 @@ function predictPlayerRank({
     next_opponent: nextOpponent,
     next_result: appliedNextResult,
     simulations,
-    assumptions: { ranking:rule, total_rounds:requestedTotalRounds ? 'request-override' : matchData.totalRoundsSource || 'unknown',
+    assumptions: { ranking:rule, total_rounds:confirmedRounds && totalRounds === confirmedRounds
+      ? 'event-config' : requestedTotalRounds ? 'request-override' : matchData.totalRoundsSource || 'unknown',
       note:'未核实赛事完整排名细则；按胜2分、和1分、负0分、轮空对手分0、同分并列模拟。' },
     model: {
       version: versions.prediction,
@@ -267,7 +304,7 @@ function findNextKnownOpponent({ participantId, matches, players, currentRows, c
     .filter(row => (
       row.bout > completedRounds
       && row.bout <= totalRounds
-      && !isPlayedMatch(row)
+      && !isResolvedLiveMatch(row)
       && (row.p1_id === playerId || row.p2_id === playerId)
     ))
     .sort((a, b) => a.bout - b.bout || a.seat - b.seat)[0];
@@ -297,9 +334,9 @@ function findNextKnownOpponent({ participantId, matches, players, currentRows, c
   };
 }
 
-const LIVE_BYE_OPPONENT_ID = '__live_bye__';
-
 function selectActiveSimulationPlayers(players, matches, completedRounds) {
+  const nonPlaying = nonPlayingPlayerIds(players, matches);
+  players = players.filter(player => !nonPlaying.has(String(player.id)));
   const round = parseInt(completedRounds) || 0;
   if (!round) return players;
 
@@ -494,4 +531,4 @@ function roundNumber(value, digits = 2) {
 }
 
 
-module.exports = { predictPlayerRank, validatePredictionSnapshot, reconcileLivePlayers, computeCurrentRanking, LIVE_BYE_OPPONENT_ID };
+module.exports = { predictPlayerRank, validatePredictionSnapshot, reconcileLivePlayers, computeCurrentRanking, isResolvedLiveMatch, LIVE_BYE_OPPONENT_ID };

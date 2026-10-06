@@ -36,7 +36,7 @@ const {
 const liveEventSettings = require('./live-event-settings.json');
 const { isGoEvent, isGoGroup } = require('./sport-filter');
 const { fetchEventGroups } = require('./yunbisai-groups');
-const { validatePredictionSnapshot, reconcileLivePlayers, computeCurrentRanking, LIVE_BYE_OPPONENT_ID } = require('./prediction-engine');
+const { validatePredictionSnapshot, reconcileLivePlayers, computeCurrentRanking, isResolvedLiveMatch, LIVE_BYE_OPPONENT_ID } = require('./prediction-engine');
 const { runPrediction } = require('./prediction-runner');
 const { securityHeaders, validateQuery, createRequestBudget, requestContext, sendApiError } = require('./api-security');
 const { partitionPlayerRows, selectIdentity, identityChoices, recordKey } = require('./player-identity');
@@ -612,12 +612,14 @@ app.get('/api/live-group', async (req, res) => {
     const current = computeCurrentRanking(liveState.players, matchData.rows, Math.max(matchData.completedRounds || 0, 1), rule.id);
     let dataWarning = '';
     try { validatePredictionSnapshot(snapshot); } catch (error) { dataWarning = error.message; }
+    const confirmedRounds = matchData.totalRoundsSource === 'event-config' ? matchData.totalRounds : 0;
     res.json({
       group_id: groupId,
       total_rounds: requestedTotalRounds
-        ? Math.max(requestedTotalRounds, matchData.completedRounds || 0, matchData.knownPairingRounds || 0)
+        ? Math.max(requestedTotalRounds, confirmedRounds, matchData.completedRounds || 0, matchData.knownPairingRounds || 0)
         : matchData.totalRounds,
-      total_rounds_source: requestedTotalRounds ? 'event' : matchData.totalRoundsSource,
+      total_rounds_source: confirmedRounds && requestedTotalRounds <= confirmedRounds
+        ? 'event-config' : requestedTotalRounds ? 'manual' : matchData.totalRoundsSource,
       completed_rounds: matchData.completedRounds,
       known_pairing_rounds: matchData.knownPairingRounds,
       manual_pairing_rounds: matchData.manualPairingRounds,
@@ -1116,7 +1118,8 @@ async function fetchGroupMatchesLive(groupId, requestedTotalRounds = 0) {
   const first = await fetchGroupRoundLive(groupId, 1);
   const cloudTotalRounds = parseInt(first.total_bout) || 0;
   if (cloudTotalRounds < 0 || cloudTotalRounds > 30) throw new Error('INVALID_UPSTREAM_ROUNDS');
-  const totalRounds = cloudTotalRounds || inferTotalRoundsFromRows(first.rows || []);
+  const confirmedRounds = configuredLiveEventTotalRounds(first.eventid);
+  const totalRounds = confirmedRounds || cloudTotalRounds || inferTotalRoundsFromRows(first.rows || []);
   const fetchThroughRound = Math.max(totalRounds, parseInt(requestedTotalRounds) || 0);
   const firstRows = first.rows || [];
   const allRows = normalizeLiveRoundRows(groupId, 1, firstRows);
@@ -1125,16 +1128,21 @@ async function fetchGroupMatchesLive(groupId, requestedTotalRounds = 0) {
   if (firstSignature) seenRoundPayloads.add(firstSignature);
 
   const remainingBouts = Array.from({ length: Math.max(fetchThroughRound - 1, 0) }, (_, index) => index + 2);
+  const remainingRounds = new Map();
   await mapLimit(remainingBouts, ROUND_FETCH_CONCURRENCY, async bout => {
     const data = await fetchGroupRoundLive(groupId, bout);
-    const rawRows = data.rows || [];
+    remainingRounds.set(bout, data.rows || []);
+  });
+  // A future request can return the latest sheet; response timing must not relabel it.
+  for (const bout of remainingBouts) {
+    const rawRows = remainingRounds.get(bout) || [];
     const signature = liveRoundPayloadSignature(rawRows);
     const isCloudFallback = signature && seenRoundPayloads.has(signature);
     if (!isCloudFallback) {
       allRows.push(...normalizeLiveRoundRows(groupId, bout, rawRows));
       if (signature) seenRoundPayloads.add(signature);
     }
-  });
+  }
 
   const cloudRounds = new Set(allRows.map(row => row.bout));
   const manualPairingRounds = new Set();
@@ -1155,14 +1163,14 @@ async function fetchGroupMatchesLive(groupId, requestedTotalRounds = 0) {
   let completedRounds = 0;
   for (let bout = 1; bout <= fetchThroughRound; bout++) {
     const rows = rounds.get(bout) || [];
-    if (!rows.length || !rows.every(isPlayedMatch)) break;
+    if (!rows.length || !rows.every(isResolvedLiveMatch)) break;
     completedRounds = bout;
   }
 
   return {
     rows: allRows,
     totalRounds,
-    totalRoundsSource: cloudTotalRounds ? 'cloud' : 'inferred',
+    totalRoundsSource: confirmedRounds ? 'event-config' : cloudTotalRounds ? 'cloud' : 'inferred',
     completedRounds,
     knownPairingRounds,
     manualPairingRounds: [...manualPairingRounds].sort((a, b) => a - b),

@@ -42,3 +42,44 @@ test('an aborted prediction does not launch a worker',async()=>{
   const controller=new AbortController();controller.abort();
   await assert.rejects(runPrediction(options(fixture()),{signal:controller.signal}),e=>e.code==='ABORTED');
 });
+
+const absence=(bout,id,side='p1')=>({bout,p1_id:side==='p1'?id:'__live_bye__',
+  p2_id:side==='p2'?id:'__live_bye__',p1_result:side==='p1'?'4':'',
+  p2_result:side==='p2'?'4':'',p1_score:0,p2_score:0});
+
+test('an unscored absence does not block the field or get simulated as a bye win',()=>{
+  for(const side of ['p1','p2']) {
+    const snapshot=fixture();snapshot.players.push({id:'5',name:'Absent',score:0,win:0,lose:0});
+    snapshot.matchData.rows.push(absence(1,'5',side));
+    assert.doesNotThrow(()=>validatePredictionSnapshot(snapshot));
+    const result=predictPlayerRank({...options(snapshot),participantId:'5',includeDistribution:true});
+    assert.equal(result.current.score,0);
+    assert.deepEqual(result.probabilities,[{rank:5,count:200,probability:1}]);
+    const future=predictPlayerRank({...options(snapshot),participantId:'5',requestedTotalRounds:4});
+    assert.equal(future.model.pairing_players,4);
+    assert.equal(future.next_opponent,null);
+    assert.deepEqual(future.probabilities,[{rank:5,count:200,probability:1}]);
+  }
+});
+
+test('a nonparticipant does not invalidate a second-round pairing sheet',()=>{
+  const snapshot=fixture();snapshot.players=snapshot.players.map(p=>({...p,score:['1','2'].includes(p.id)?2:0,
+    win:['1','2'].includes(p.id)?1:0,lose:['3','4'].includes(p.id)?1:0}));
+  snapshot.players.push({id:'5',name:'Absent',score:0,win:0,lose:0});
+  snapshot.matchData.rows=snapshot.matchData.rows.filter(row=>row.bout<3).map(row=>row.bout===2?
+    {...row,p1_result:'0',p2_result:'0',p1_score:0,p2_score:0}:row);
+  snapshot.matchData.rows.push(absence(1,'5'));snapshot.matchData.completedRounds=1;
+  assert.doesNotThrow(()=>validatePredictionSnapshot(snapshot));
+});
+
+test('an unresolved code 4 game against a real opponent still blocks prediction',()=>{
+  const snapshot=fixture();snapshot.matchData.rows[0]={...game(1,'1','4'),p1_result:'4',p2_result:'4',p1_score:0,p2_score:0};
+  assert.throws(()=>validatePredictionSnapshot(snapshot),e=>e.code==='INCOMPLETE_PREDICTION_DATA');
+});
+
+test('confirmed event rounds override an old six-round player link',()=>{
+  const snapshot=fixture();snapshot.matchData.totalRounds=7;snapshot.matchData.totalRoundsSource='event-config';
+  const result=predictPlayerRank({...options(snapshot),requestedTotalRounds:6});
+  assert.equal(result.total_rounds,7);
+  assert.equal(result.total_rounds_source,'event-config');
+});

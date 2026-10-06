@@ -327,6 +327,27 @@ test('prediction links restore seed, result scenario and chosen ranking assumpti
   assert.match(await page.locator('#livePredictionPanel').innerText(),/规则未核实/);
 });
 
+test('an old six-round link adopts confirmed event rounds before querying and opening player tabs',async t=>{
+  const {page,calls}=await fixture(t,(route,url)=>{
+    if(url.pathname==='/api/live-event') return json(route,{total_rounds:7,groups:[{group_id:'349073',group_name:'3段组',pnumber:101,live:true}]});
+    if(url.pathname==='/api/live-group') return json(route,{group_id:'349073',total_rounds:7,total_rounds_source:'event-config',completed_rounds:5,known_pairing_rounds:6,
+      prediction_available:true,players:[{id:'10597482',name:'黄康凝',display_rank:29,score:6,opponent_score:30,win:3,lose:2}]});
+    if(url.pathname==='/api/live-prediction') return json(route,{player:{id:'10597482',name:'黄康凝'},current:{rank:29,score:6,opponent_score:30},total_rounds:7,
+      total_rounds_source:'event-config',completed_rounds:5,known_pairing_rounds:6,simulations:3000,next_bout:6,
+      next_opponent:{bout:6,name:'路清欢'},probabilities:[{rank:20,probability:0.2,count:600}]});
+    throw new Error(`Unexpected API: ${url}`);
+  });
+  await page.goto(`${origin}/live-prediction.html?event_id=70886&group_id=349073&participant_id=10597482&total_rounds=6`);
+  await page.locator('.live-probability-row').waitFor();
+  for(const request of calls.filter(u=>['/api/live-group','/api/live-prediction'].includes(u.pathname))) {
+    assert.equal(request.searchParams.get('total_rounds'),'7');
+  }
+  assert.equal(new URL(page.url()).searchParams.get('total_rounds'),'7');
+  assert.match(await page.locator('#livePredictionPanel').innerText(),/路清欢/);
+  assert.match(await page.locator('#livePredictionPanel').innerText(),/赛事确认/);
+  assert.equal(await page.evaluate(()=>localStorage.getItem('goSearch.liveTotalRounds.70886')),'7');
+});
+
 test('head-to-head played records fit mobile and preserve accessible unit details',async t=>{
   const {page}=await fixture(t,(route,url)=>{
     if(url.pathname!=='/api/head-to-head') throw new Error(`Unexpected API: ${url}`);

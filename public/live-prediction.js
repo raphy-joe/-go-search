@@ -74,6 +74,13 @@ function normalizeTotalRounds(value) {
   return parsed > 0 ? Math.min(parsed, 30) : 0;
 }
 
+function totalRoundsSourceLabel(source) {
+  if (source === 'event-config') return '赛事确认';
+  if (source === 'cloud') return '接口设置，需确认';
+  if (source === 'inferred') return '推测，需确认';
+  return '手动设置';
+}
+
 function eventTotalRoundsStorageKey(eventId) {
   return eventId ? `goSearch.liveTotalRounds.${eventId}` : '';
 }
@@ -384,7 +391,7 @@ function renderGroupPlayers(data, options = {}) {
     </div>
     ${data.data_warning ? `<div class="live-note" role="status">${esc(data.data_warning)}</div>` : ''}
     <div class="table-toolbar"><label>定位棋手<input id="livePlayerQuery" type="search" placeholder="姓名或单位" maxlength="64" value="${esc(playerQuery)}"></label>${renderRuleEditor()}<span id="livePlayerCount" role="status"></span></div>
-    <div class="live-note">排名规则未核实；当前计算采用${selectedRankingRule==='score-opponent-score'?'大分、对手分':'总得分、大分'}。总轮次来源：${data.total_rounds_source==='cloud'?'云比赛接口':data.total_rounds_source==='inferred'?'推测，需确认':'手动设置'}。</div>
+    <div class="live-note">排名规则未核实；当前计算采用${selectedRankingRule==='score-opponent-score'?'大分、对手分':'总得分、大分'}。总轮次来源：${totalRoundsSourceLabel(data.total_rounds_source)}。</div>
     <div class="ranking-scroll" tabindex="0" aria-label="选手排名表"><table class="live-table">
       <thead><tr><th scope="col">名次</th><th scope="col">选手</th><th scope="col">大分</th><th scope="col" class="secondary-column">小分</th><th scope="col" class="secondary-column">总得分</th><th scope="col" class="secondary-column">胜负</th><th class="mobile-only" scope="col">详情</th></tr></thead>
       <tbody>${rows}</tbody>
@@ -592,7 +599,7 @@ function renderPrediction(data) {
         <button id="recalculatePredictionBtn" type="button" class="btn-secondary">重新计算</button>
       </div>
     </div>
-    <div class="prediction-rule-bar">${renderRuleEditor()}<span class="live-muted">规则未核实 · ${data.total_rounds_source==='cloud'?'轮次来自云比赛':data.total_rounds_source==='inferred'?'总轮次为推测值，需确认':'轮次为手动设置'}</span></div>
+    <div class="prediction-rule-bar">${renderRuleEditor()}<span class="live-muted">规则未核实 · 总轮次来源：${totalRoundsSourceLabel(data.total_rounds_source)}</span></div>
     ${nextOpponentHtml}
     <div class="live-probability-heading">
       <div class="live-panel-title">${probabilityTitle}</div>
