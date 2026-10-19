@@ -1,6 +1,7 @@
 'use strict';
 
 const { isGoEvent, isGoGroup } = require('./sport-filter');
+const { parseResponse, assertSuccess } = require('./yunbisai-response');
 const API = 'https://data-center.yunbisai.com/api/lswl-groups/event/';
 const HTML = 'https://www.yunbisai.com/tpl/eventFeatures/eventDetail-';
 
@@ -13,8 +14,8 @@ async function fetchEventGroups(eventId, { fetchText, eventTitle = '' }) {
   if (!/^\d{1,15}$/.test(String(eventId))) throw new Error('invalid event identity');
   const options = { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 15000 };
   try {
-    const json = JSON.parse(await fetchText(`${API}${eventId}`, options, 1));
-    if (Number(json.error) !== 0 || !Array.isArray(json.data)) throw new Error('invalid group response');
+    const json = assertSuccess(parseResponse(await fetchText(`${API}${eventId}`, options, 1)));
+    if (!Array.isArray(json.data)) throw new Error('invalid group response');
     const seen = new Set();
     return json.data.filter(g => String(g.eventtype) === '2' && isGoGroup('', g.groupname))
       .map(g => {

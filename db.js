@@ -72,6 +72,7 @@ const initPromise = new Promise((res, rej) =>
       event_id     TEXT    PRIMARY KEY,
       title        TEXT    NOT NULL DEFAULT '',
       min_time     TEXT    NOT NULL DEFAULT '',
+      max_time     TEXT    NOT NULL DEFAULT '',
       provincename TEXT    NOT NULL DEFAULT '',
       city_name    TEXT    NOT NULL DEFAULT '',
       cname        TEXT    NOT NULL DEFAULT '',
@@ -183,8 +184,23 @@ const initPromise = new Promise((res, rej) =>
       updated_at    INTEGER NOT NULL DEFAULT 0,
       last_error    TEXT NOT NULL DEFAULT ''
     );
+    CREATE TABLE IF NOT EXISTS published_group_results (
+      group_id TEXT PRIMARY KEY,
+      report_id TEXT NOT NULL,
+      published_at TEXT NOT NULL DEFAULT '',
+      rounds INTEGER NOT NULL,
+      payload TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
   `, err => err ? rej(err) : res())
-).then(ensureParticipantRankColumn).then(ensureIndexStatusColumns).then(ensureGoViews);
+).then(ensureEventEndColumn).then(ensureParticipantRankColumn).then(ensureIndexStatusColumns).then(ensureGoViews);
+
+async function ensureEventEndColumn() {
+  const columns = await all('PRAGMA table_info(events)');
+  if (!columns.some(column => column.name === 'max_time')) {
+    await run("ALTER TABLE events ADD COLUMN max_time TEXT NOT NULL DEFAULT ''");
+  }
+}
 
 async function ensureIndexStatusColumns() {
   const cols = new Set((await all('PRAGMA table_info(indexed_events)')).map(c => c.name));
@@ -200,6 +216,12 @@ async function ensureIndexStatusColumns() {
       last_success_at=CASE WHEN last_error='' THEN indexed_at ELSE 0 END,
       status=CASE WHEN last_error='' THEN 'success' ELSE 'failed' END`);
   }
+  await run(`CREATE TABLE IF NOT EXISTS index_retry_queue (
+    event_id TEXT PRIMARY KEY, reason TEXT NOT NULL, attempts INTEGER NOT NULL,
+    next_attempt_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+  await run('CREATE INDEX IF NOT EXISTS idx_index_retry_due ON index_retry_queue(next_attempt_at)');
+  await run(`INSERT OR IGNORE INTO index_retry_queue(event_id,reason,attempts,next_attempt_at,updated_at)
+    SELECT event_id,'unclassified',0,0,last_attempt_at FROM indexed_events WHERE status IN ('partial','failed')`);
 }
 
 async function ensureGoViews() {
@@ -240,23 +262,78 @@ async function upsertEvents(events) {
   return withWriteLock(async () => {
     await initPromise;
     const sql = `
-      INSERT OR REPLACE INTO events
-        (event_id, title, min_time, provincename, city_name, cname, play_num, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO events
+        (event_id, title, min_time, max_time, provincename, city_name, cname, play_num, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(event_id) DO UPDATE SET title=excluded.title,min_time=excluded.min_time,
+        max_time=COALESCE(NULLIF(excluded.max_time,''),events.max_time),
+        provincename=excluded.provincename,city_name=excluded.city_name,cname=excluded.cname,
+        play_num=excluded.play_num,updated_at=excluded.updated_at
     `;
     await run('BEGIN IMMEDIATE');
     try {
       for (const e of events) {
         await run(sql, [
-          e.event_id, e.title, e.min_time,
-          e.provincename, e.city_name, e.cname,
-          e.play_num, e.updated_at,
+          e.event_id, e.title || '', e.min_time || '', e.max_time || '',
+          e.provincename || '', e.city_name || '', e.cname || '',
+          Number(e.play_num) || 0, e.updated_at || Date.now(),
         ]);
       }
       await run('COMMIT');
     } catch (err) {
       await run('ROLLBACK');
       throw err;
+    }
+  });
+}
+
+async function queryLiveEventCandidates({ province = '', dateFrom, dateTo, limit = 500 }) {
+  await initPromise;
+  const conditions = ["COALESCE(NULLIF(max_time,''),min_time)>=?", 'min_time<=?'];
+  const params = [dateFrom, `${dateTo} 23:59:59`];
+  if (province) { conditions.push('provincename=?'); params.push(province); }
+  params.push(Math.min(Math.max(Number(limit) || 500, 1), 1000));
+  return all(`SELECT event_id,title,min_time,max_time,provincename,city_name,cname,play_num
+    FROM go_events WHERE ${conditions.join(' AND ')} ORDER BY min_time DESC LIMIT ?`, params);
+}
+
+async function getPublishedGroupResult(groupId) {
+  await initPromise;
+  const row = await get('SELECT payload FROM published_group_results WHERE group_id=?', [String(groupId)]);
+  return row ? JSON.parse(row.payload) : null;
+}
+
+async function getGroupResultContext(groupId) {
+  await initPromise;
+  return get(`SELECT e.event_id,e.max_time FROM events e JOIN event_groups g ON g.event_id=e.event_id
+    WHERE g.group_id=?`, [String(groupId)]);
+}
+
+async function savePublishedGroupResult(report) {
+  return withWriteLock(async () => {
+    await initPromise;
+    await run('BEGIN IMMEDIATE');
+    try {
+      const previous = await getPublishedGroupResult(report.group_id);
+      if (previous && (previous.published_at > report.published_at
+        || (previous.published_at === report.published_at && Number(previous.report_id) > Number(report.report_id))
+        || previous.rounds > report.rounds
+        || previous.players.some(player => !report.players.some(next => next.id === player.id)))) {
+        await run('COMMIT');
+        return false;
+      }
+      if (previous?.verified_final && previous.report_id === report.report_id && previous.rounds === report.rounds) {
+        report = { ...report, verified_final: true };
+      }
+      await run(`INSERT INTO published_group_results(group_id,report_id,published_at,rounds,payload,updated_at)
+        VALUES(?,?,?,?,?,?) ON CONFLICT(group_id) DO UPDATE SET report_id=excluded.report_id,
+        published_at=excluded.published_at,rounds=excluded.rounds,payload=excluded.payload,updated_at=excluded.updated_at`,
+      [report.group_id,report.report_id,report.published_at,report.rounds,JSON.stringify(report),Date.now()]);
+      await run('COMMIT');
+      return true;
+    } catch (error) {
+      await run('ROLLBACK');
+      throw error;
     }
   });
 }
@@ -281,7 +358,8 @@ async function queryEvents({ province, dateFrom, dateTo }) {
   );
 }
 
-async function queryEventsForIndex({ province = '', dateFrom, dateTo, force = false, limit = 0 }) {
+async function queryEventsForIndex({ province = '', dateFrom, dateTo, force = false, limit = 0,
+  retryOnly = false, respectRetrySchedule = false, now = Date.now() }) {
   await initPromise;
   const params = [];
   const conds  = ['e.play_num > 0'];
@@ -290,6 +368,8 @@ async function queryEventsForIndex({ province = '', dateFrom, dateTo, force = fa
   if (dateFrom) { conds.push('e.min_time >= ?');     params.push(dateFrom); }
   if (dateTo)   { conds.push('e.min_time <= ?');     params.push(dateTo); }
   if (!force) conds.push(NEEDS_INDEX_COND);
+  if (retryOnly) { conds.push('rq.event_id IS NOT NULL AND rq.next_attempt_at <= ?'); params.push(now); }
+  else if (respectRetrySchedule && !force) { conds.push('(rq.event_id IS NULL OR rq.next_attempt_at <= ?)'); params.push(now); }
 
   const limitClause = limit ? ' LIMIT ?' : '';
   if (limit) params.push(limit);
@@ -298,7 +378,8 @@ async function queryEventsForIndex({ province = '', dateFrom, dateTo, force = fa
     `SELECT e.event_id, e.title, e.min_time, e.provincename, e.city_name, e.cname
      FROM go_events e
      LEFT JOIN indexed_events ie ON ie.event_id = e.event_id
-     WHERE ${conds.join(' AND ')} ORDER BY e.min_time DESC${limitClause}`,
+     LEFT JOIN index_retry_queue rq ON rq.event_id = e.event_id
+     WHERE ${conds.join(' AND ')} ORDER BY ${retryOnly ? 'rq.next_attempt_at ASC,' : ''} e.min_time DESC${limitClause}`,
     params
   );
 }
@@ -587,7 +668,9 @@ async function replaceGroupMatchCache({ group_id, rounds, rows, last_error = '',
 async function upsertIndexedEvent({ event_id, group_count = 0, participant_count = 0, last_error = '', indexed_at = Date.now() }) {
   return withWriteLock(async () => {
     await initPromise;
-    return run(
+    await run('BEGIN IMMEDIATE');
+    try {
+    await run(
       `INSERT INTO indexed_events
          (event_id, indexed_at, group_count, participant_count, last_error, status, last_attempt_at, last_success_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -600,7 +683,28 @@ async function upsertIndexedEvent({ event_id, group_count = 0, participant_count
       [String(event_id), last_error ? 0 : indexed_at, group_count, participant_count, last_error,
         last_error ? 'failed' : 'success', indexed_at, last_error ? 0 : indexed_at]
     );
+    await recordIndexRetry(event_id, last_error, indexed_at);
+    await run('COMMIT');
+    } catch (error) {
+      await run('ROLLBACK');
+      throw error;
+    }
   });
+}
+
+async function recordIndexRetry(eventId, error, now) {
+  if (!error) return run('DELETE FROM index_retry_queue WHERE event_id=?', [String(eventId)]);
+  const old = await get('SELECT attempts FROM index_retry_queue WHERE event_id=?', [String(eventId)]);
+  const attempts = (old?.attempts || 0) + 1;
+  const { reason, nextAttemptAt } = require('./index-retry').retrySchedule(error, attempts, now);
+  await run(`INSERT OR REPLACE INTO index_retry_queue(event_id,reason,attempts,next_attempt_at,updated_at) VALUES(?,?,?,?,?)`,
+    [String(eventId),reason,attempts,nextAttemptAt,now]);
+}
+
+async function getIndexRetryHealth() {
+  await initPromise;
+  return all(`SELECT reason,COUNT(*) AS count,SUM(CASE WHEN next_attempt_at<=? THEN 1 ELSE 0 END) AS due,
+    MIN(next_attempt_at) AS next_attempt_at FROM index_retry_queue GROUP BY reason`, [Date.now()]);
 }
 
 async function upsertEventGroups(groups) {
@@ -739,6 +843,7 @@ async function publishEventIndex({ event_id, groups, groupResults, indexed_at = 
         }
         groupCount++;
         participantCount += result.rows.length;
+        if (result.warning) errors.push(`${gid}: ${result.warning}`);
       }
       const status = errors.length ? (groupCount ? 'partial' : 'failed') : 'success';
       const count = await get('SELECT COUNT(*) AS n FROM participant_index WHERE event_id=?', [eventId]);
@@ -749,6 +854,7 @@ async function publishEventIndex({ event_id, groups, groupResults, indexed_at = 
         VALUES(?,?,?,?,?,?,?,?)`,
       [eventId,successAt,new Set([...existingGroups.map(g => g.group_id),...incomingIds]).size,count.n,
         errors.join('; ').slice(0,2000),status,indexed_at,successAt]);
+      await recordIndexRetry(eventId, errors.join('; '), indexed_at);
       await run('COMMIT');
       return { status, errors, groupCount, participantCount };
     } catch (error) {
@@ -818,7 +924,12 @@ module.exports = {
   queryExcludedResultGroups,
   upsertEvents,
   queryEvents,
+  queryLiveEventCandidates,
+  getPublishedGroupResult,
+  getGroupResultContext,
+  savePublishedGroupResult,
   queryEventsForIndex,
+  getIndexRetryHealth,
   queryUnindexedEvents,
   getIndexCoverage,
   queryParticipants,

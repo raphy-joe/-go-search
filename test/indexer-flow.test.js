@@ -13,8 +13,9 @@ test('typed group discovery plus partial participant errors preserve complete gr
   const rawFetch=async url=>{
     const u=new URL(url);calls.push(u);
     const body=u.pathname.includes('/lswl-groups/event/')?{error:0,data:[10,20].map(groupid=>({groupid,eventid:1,eventtype:2,groupname:'5段组',pnumber:1}))}
+      :u.pathname.includes('/competition/')?{error:0,datArr:[]}
       :fail&&u.searchParams.get('groupid')==='20'?{error:1,msg:'temporary business error'}
-        :{error:0,datArr:{rows:[{participantid:u.searchParams.get('groupid'),participantname:'棋手',vicsum:4,faisum:3}]}};
+        :{error:0,datArr:{rows:[{participantid:u.searchParams.get('groupid'),participantname:'棋手',vicsum:4,faisum:3,deusum:0,integral:8}]}};
     return {ok:true,text:async()=>JSON.stringify(body)};
   };
   const root=path.resolve(__dirname,'..');

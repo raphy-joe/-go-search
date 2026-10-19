@@ -13,6 +13,7 @@
     "test:browser": "node --test test/browser-flows.cjs",
     "test:smoke": "node scripts/smoke.js",
     "ops:check": "node scripts/ops-check.js",
+    "ops:upstream": "node scripts/upstream-probe.js",
     "backup": "node scripts/backup.js",
     "backtest": "node scripts/backtest.js"
   },

@@ -18,11 +18,11 @@ const group = (id = 346562, eventid = 70596) => ({ groupid: id, eventid, groupna
   eventtype: 2, pnumber: 21, begintime: '2026-09-26 00:00:00', endtime: '2026-09-27 19:30:00' });
 const html = '<title>\u56f4\u68cb\u6bd4\u8d5b</title><a data-groupid="17" data-groupname="3\u6bb5\u7ec4" data-pnumber="20" data-bt="2026-09-27 09:00:00" data-et="2026-09-27 19:00:00">';
 
-function load({ events = [event()], listError = false, groups = () => [group()], fallback = '\u8be5\u6bd4\u8d5b\u6570\u636e\u4e0d\u5b58\u5728' } = {}) {
+function load({ events = [event()], eventsAt, totalPages, localEvents = [], listError = false, groups = () => [group()], fallback = '\u8be5\u6bd4\u8d5b\u6570\u636e\u4e0d\u5b58\u5728' } = {}) {
   const routes = new Map(), calls = [];
   const app = { set() {}, use() {}, listen() {}, post() {}, get(route, handler) { routes.set(route, handler); } };
   const express = Object.assign(() => app, { static: () => () => {}, json: () => () => {} });
-  const mocks = { express, './db': { initPromise: new Promise(() => {}) }, './crawler': {}, './indexer': {},
+  const mocks = { express, './db': { initPromise: new Promise(() => {}),queryLiveEventCandidates:async()=>localEvents }, './crawler': {}, './indexer': {},
     './strength': {}, './promotions': {}, 'node-cron': { schedule() {} },
     'node-fetch': async url => {
       const u = new URL(url);
@@ -30,7 +30,8 @@ function load({ events = [event()], listError = false, groups = () => [group()],
       let body;
       if (u.pathname === '/api/lswl-events') {
         body = listError ? { error: 1, msg: 'temporarily unavailable', datArr: { rows: [] } }
-          : { error: 0, datArr: { rows: u.searchParams.get('page') === '1' ? events : [] } };
+          : { error: 0, datArr: { TotalPage:totalPages,rows: eventsAt ? eventsAt(Number(u.searchParams.get('page')))
+            : u.searchParams.get('page') === '1' ? events : [] } };
       } else if (u.pathname.startsWith('/api/lswl-groups/event/')) {
         const data = groups(u.pathname.split('/').pop());
         body = Array.isArray(data) ? { error: 0, data } : data;
@@ -129,6 +130,40 @@ test('invalid event identifiers do not trigger upstream requests', async () => {
   const res = await f.request('/api/live-event', { event_id: '../70596' });
   assert.equal(res.statusCode, 400);
   assert.equal(f.calls.length, 0);
+});
+
+test('the real 15-row page size does not hide a competition on province page three', async () => {
+  const f=load({totalPages:3,eventsAt:page=>page===3?[event('17')]:Array.from({length:15},(_,i)=>({
+    ...event(String(page*100+i)),min_time:'2020-01-01',max_time:'2020-01-01'})),groups:()=>[group(17,17)]});
+  const res=await f.request('/api/live-events',{province:'\u56db\u5ddd\u7701'});
+  assert.equal(res.statusCode,200);
+  assert.equal(res.body.events[0].event_id,'17');
+  assert.equal(res.body.directory_scan.pages_scanned,3);
+  assert.equal(res.body.directory_scan.complete,true);
+  assert.equal(res.body.warning,'');
+});
+
+test('a long-running event in the local directory is still checked against live group metadata', async () => {
+  const f=load({events:[],localEvents:[event('17')],groups:()=>[group(17,17)]});
+  const res=await f.request('/api/live-events',{province:'\u56db\u5ddd\u7701'});
+  assert.equal(res.body.events[0].event_id,'17');
+  assert.equal(res.body.events[0].status,'live');
+  assert.ok(f.calls.some(url=>url.pathname.endsWith('/event/17')));
+});
+
+test('a bounded directory scan discloses partial coverage rather than silently claiming no games', async () => {
+  const f=load({totalPages:100,eventsAt:page=>[{...event(String(page+100)),min_time:'2020-01-01',max_time:'2020-01-01'}]});
+  const res=await f.request('/api/live-events',{province:'\u56db\u5ddd\u7701'});
+  assert.equal(res.statusCode,200);
+  assert.equal(res.body.directory_scan.pages_scanned,12);
+  assert.equal(res.body.directory_scan.complete,false);
+  assert.ok(res.body.warning);
+});
+
+test('an upstream repeated page is an error instead of duplicate or missing competitions', async () => {
+  const f=load({totalPages:3,eventsAt:()=>[event()]});
+  const res=await f.request('/api/live-events');
+  assert.equal(res.statusCode,502);
 });
 
 function loadPage(response = { ok: true, data: { events: [] } }) {

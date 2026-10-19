@@ -83,3 +83,38 @@ test('confirmed event rounds override an old six-round player link',()=>{
   assert.equal(result.total_rounds,7);
   assert.equal(result.total_rounds_source,'event-config');
 });
+
+test('unresolved tied places never count as guaranteed top-N slots', () => {
+  const snapshot = { players: ['1','2','3','4'].map(id => ({ id, name: id, score: 1, win: 0, lose: 0, draw: 1 })),
+    matchData: { rows: [game(1,'1','2'),game(1,'3','4')].map(row => ({ ...row,
+      p1_result:'3',p2_result:'3',p1_score:1,p2_score:1 })), totalRounds:1,completedRounds:1,knownPairingRounds:1 }, snapshotAt:1 };
+  const result = predictPlayerRank({ ...options(snapshot), requestedTotalRounds:1 });
+  assert.deepEqual(result.rank_intervals, [{ rank:1, rank_max:4, count:200, probability:1 }]);
+  assert.deepEqual(result.top_n[0], { n:1, probability_min:0, probability_max:1 });
+  assert.deepEqual(result.top_n[2], { n:3, probability_min:0, probability_max:1 });
+  assert.deepEqual(result.top_n[3], { n:4, probability_min:1, probability_max:1 });
+  assert.equal(result.assumptions.ranking.verified, false);
+  assert.equal(result.probability_semantics, 'unresolved-tie-bounds');
+});
+
+test('top-N probability bounds are monotone and derive from every simulation, not only the five displayed outcomes', () => {
+  const result = predictPlayerRank({ ...options(fixture()), requestedTotalRounds:7, includeDistribution:true });
+  for (const bounds of result.top_n) {
+    const expectedMin = result.rank_intervals.filter(row => row.rank_max <= bounds.n).reduce((sum,row) => sum + row.count,0) / result.simulations;
+    const expectedMax = result.rank_intervals.filter(row => row.rank <= bounds.n).reduce((sum,row) => sum + row.count,0) / result.simulations;
+    assert.equal(bounds.probability_min, expectedMin);
+    assert.equal(bounds.probability_max, expectedMax);
+    assert.ok(bounds.probability_min <= bounds.probability_max);
+  }
+  assert.equal(result.top_n.at(-1).probability_min, 1);
+});
+
+test('corrected round results reconcile stale statistics even when the number of played games is unchanged', () => {
+  const snapshot=fixture();
+  snapshot.matchData.rows[0]={...game(1,'1','4'),p1_result:'2',p2_result:'1',p1_score:0,p2_score:2};
+  const result=predictPlayerRank(options(snapshot));
+  assert.equal(result.current.score,4);
+  assert.equal(result.current.win,2);
+  assert.equal(result.current.lose,1);
+  assert.equal(result.score_updates_applied,true);
+});

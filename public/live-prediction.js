@@ -34,6 +34,7 @@ let selectedRankingRule = new URLSearchParams(window.location.search).get('ranki
 if (!['','cloud-total-score','score-opponent-score'].includes(selectedRankingRule)) selectedRankingRule='';
 let predictionSeed = new URLSearchParams(window.location.search).get('seed') || '';
 let currentPredictionId = '';
+let selectedTopN = 7;
 let playerQuery = new URLSearchParams(window.location.search).get('player_q') || '';
 
 function scoreText(value) { return window.PageView?.score(value) ?? (value ?? '--'); }
@@ -59,7 +60,10 @@ function esc(s) {
 }
 
 function pct(value) {
-  return `${Math.round((Number(value) || 0) * 1000) / 10}%`;
+  const number = Math.max(0, Math.min(1, Number(value) || 0));
+  if (number > 0 && number < 0.001) return '<0.1%';
+  if (number < 1 && number > 0.999) return '>99.9%';
+  return `${Math.round(number * 1000) / 10}%`;
 }
 
 function formatSnapshotTime(value) {
@@ -75,6 +79,7 @@ function normalizeTotalRounds(value) {
 }
 
 function totalRoundsSourceLabel(source) {
+  if (source === 'published-results') return '正式成绩';
   if (source === 'event-config') return '赛事确认';
   if (source === 'cloud') return '接口设置，需确认';
   if (source === 'inferred') return '推测，需确认';
@@ -360,7 +365,8 @@ function renderGroupPlayers(data, options = {}) {
     return;
   }
 
-  const minimumRounds = prepareTotalRounds(data);
+  const minimumRounds = data.results_final ? getMinimumTotalRounds(data) : prepareTotalRounds(data);
+  if (data.results_final) applyTotalRoundsValue(data.total_rounds, minimumRounds, false);
   const snapshotLabel = formatSnapshotTime(data.snapshot_at);
   if (options.predictionOnly && options.autoPredictId) {
     startPrediction(options.autoPredictId);
@@ -382,16 +388,16 @@ function renderGroupPlayers(data, options = {}) {
   livePlayersPanel.innerHTML = `
     <div class="live-panel-heading">
       <div>
-        <div class="live-panel-title">当前名次</div>
+        <div class="live-panel-title">${data.results_final ? '正式名次' : '当前名次'}</div>
         <div class="live-round-summary">
           <div class="live-muted">已完成 ${data.completed_rounds || 0} 轮 · 已知对阵至第 ${data.known_pairing_rounds || 0} 轮${data.score_updates_applied ? ` · 积分已按第 ${data.score_updated_through_round || data.completed_rounds} 轮赛果更新` : ''}${snapshotLabel ? ` · 数据 ${snapshotLabel}` : ''}</div>
-          ${renderTotalRoundsEditor('liveTotalRoundsInput', minimumRounds)}
+          ${data.results_final ? '' : renderTotalRoundsEditor('liveTotalRoundsInput', minimumRounds)}
         </div>
       </div>
     </div>
     ${data.data_warning ? `<div class="live-note" role="status">${esc(data.data_warning)}</div>` : ''}
-    <div class="table-toolbar"><label>定位棋手<input id="livePlayerQuery" type="search" placeholder="姓名或单位" maxlength="64" value="${esc(playerQuery)}"></label>${renderRuleEditor()}<span id="livePlayerCount" role="status"></span></div>
-    <div class="live-note">排名规则未核实；当前计算采用${selectedRankingRule==='score-opponent-score'?'大分、对手分':'总得分、大分'}。总轮次来源：${totalRoundsSourceLabel(data.total_rounds_source)}。</div>
+    <div class="table-toolbar"><label>定位棋手<input id="livePlayerQuery" type="search" placeholder="姓名或单位" maxlength="64" value="${esc(playerQuery)}"></label>${data.results_final ? '' : renderRuleEditor()}<span id="livePlayerCount" role="status"></span></div>
+    <div class="live-note">${data.results_final ? `比赛已结束，名次取自官方正式成绩${data.published_result?.published_at ? ` · 发布 ${esc(data.published_result.published_at)}` : ''}` : `排名规则未核实；当前计算采用${selectedRankingRule==='score-opponent-score'?'大分、对手分':'总得分、大分'}。总轮次来源：${totalRoundsSourceLabel(data.total_rounds_source)}。`}</div>
     <div class="ranking-scroll" tabindex="0" aria-label="选手排名表"><table class="live-table">
       <thead><tr><th scope="col">名次</th><th scope="col">选手</th><th scope="col">大分</th><th scope="col" class="secondary-column">小分</th><th scope="col" class="secondary-column">总得分</th><th scope="col" class="secondary-column">胜负</th><th class="mobile-only" scope="col">详情</th></tr></thead>
       <tbody>${rows}</tbody>
@@ -516,15 +522,29 @@ async function startPrediction(participantId, nextResult = selectedNextResult, o
 }
 
 function renderPrediction(data) {
+  if (data.results_final) {
+    selectedNextResult = '';
+    applyTotalRoundsValue(data.total_rounds, getMinimumTotalRounds(data), false);
+    const current = data.current || {};
+    livePredictionPanel.innerHTML = `<div class="live-panel-heading"><div>
+      <div class="live-panel-title">${esc(data.player?.name || '')} 的正式成绩</div>
+      <div class="live-muted">第 ${current.display_rank || current.cloud_rank || current.rank || '-'} 名 · 大分 ${scoreText(current.score)} · ${current.win || 0}胜${current.lose || 0}负${current.draw ? `${current.draw}和` : ''}</div>
+      <div class="live-muted">已完成 ${data.total_rounds} 轮${data.published_result?.published_at ? ` · 发布 ${esc(data.published_result.published_at)}` : ''}</div>
+      </div><button id="refreshFinalResultBtn" type="button" class="btn-secondary">刷新</button></div>
+      ${data.data_warning ? `<div class="live-note" role="status">${esc(data.data_warning)}</div>` : ''}`;
+    document.getElementById('refreshFinalResultBtn')?.addEventListener('click', () => startPrediction(data.player.id, ''));
+    return;
+  }
   if(data.model?.seed) predictionSeed=data.model.seed;
   window.PageView?.update({ranking_rule:selectedRankingRule,seed:predictionSeed,next_result:data.next_result||''});
-  const items = data.probabilities || [];
+  const items = data.rank_intervals || data.probabilities || [];
   const rows = items.map(item => {
     const probability = Math.max(0, Math.min(1, Number(item.probability) || 0));
     const barWidth = probability > 0 ? Math.max(2, probability * 100) : 0;
+    const rankLabel = item.rank_max > item.rank ? `第 ${item.rank}-${item.rank_max} 名` : `第 ${item.rank} 名`;
     return `
-      <div class="live-probability-row" aria-label="第 ${item.rank} 名，概率 ${pct(probability)}，模拟 ${item.count}/${data.simulations} 次">
-        <span class="live-probability-rank">第 ${item.rank} 名</span>
+      <div class="live-probability-row" aria-label="${rankLabel}，概率 ${pct(probability)}，模拟 ${item.count}/${data.simulations} 次">
+        <span class="live-probability-rank">${rankLabel}</span>
         <span class="live-probability-track" aria-hidden="true"><span class="live-probability-fill" style="width:${barWidth}%"></span></span>
         <span class="live-probability-value">${pct(probability)}</span>
       </div>`;
@@ -600,15 +620,28 @@ function renderPrediction(data) {
       </div>
     </div>
     <div class="prediction-rule-bar">${renderRuleEditor()}<span class="live-muted">规则未核实 · 总轮次来源：${totalRoundsSourceLabel(data.total_rounds_source)}</span></div>
+    ${data.data_warning ? `<div class="live-note" role="status">${esc(data.data_warning)}</div>` : ''}
     ${nextOpponentHtml}
     <div class="live-probability-heading">
       <div class="live-panel-title">${probabilityTitle}</div>
       <div class="live-muted">${data.simulations} 次模拟</div>
     </div>
     <div class="live-probability-list">${rows}</div>
+    ${data.top_n?.length ? `<div class="prediction-rule-bar"><label class="live-round-editor" for="liveTopN"><span>前</span><input id="liveTopN" class="live-round-input" type="number" inputmode="numeric" min="1" max="${data.top_n.length}" step="1" value="${Math.min(selectedTopN,data.top_n.length)}" aria-label="目标前N名"><span>名</span></label><strong id="liveTopNProbability" role="status" aria-live="polite"></strong></div>` : ''}
+    ${data.freshness ? `<div class="live-muted">读取时间 ${esc(formatSnapshotTime(data.freshness.fetched_at))} · 已完成轮次复核 ${esc(formatSnapshotTime(data.freshness.history_checked_at))}${data.freshness.results_changed_at ? ` · 本地检测到赛果变化 ${esc(formatSnapshotTime(data.freshness.results_changed_at))}` : ''} · 上游未提供赛果更新时间</div>` : ''}
     <div class="live-note">${esc(data.assumptions?.note||'排名细则未核实，结果为假设情景。')}已公布对阵按真实配对模拟；未公布轮次仅在概率计算中按简化瑞士制配对。${isBye ? '轮空自动按胜局计入，' : selectedNextResult ? `下一轮已固定为${resultLabel}，` : ''}其余单盘按等强 50/50 估计。</div>
     ${data.model?.version?`<details class="model-details"><summary>计算版本</summary><div>${esc(data.model.version)}</div><div>数据标识 ${esc(data.model.snapshot_fingerprint)}</div><div>随机种子 ${esc(data.model.seed)}</div></details>`:''}`;
   bindRuleEditor();
+  const topNInput = document.getElementById('liveTopN');
+  const updateTopN = () => {
+    const n = Math.max(1, Math.min(data.top_n.length, Number(topNInput.value) || 1));
+    topNInput.value = String(Math.trunc(n));
+    selectedTopN = Math.trunc(n);
+    const bounds = data.top_n[Math.trunc(n) - 1];
+    document.getElementById('liveTopNProbability').textContent = bounds.probability_min === bounds.probability_max
+      ? pct(bounds.probability_min) : `${pct(bounds.probability_min)} - ${pct(bounds.probability_max)}（同分名额待定）`;
+  };
+  if (topNInput) { topNInput.addEventListener('change', updateTopN); updateTopN(); }
 
   const roundInput = bindTotalRoundsEditor('livePredictionTotalRoundsInput', minimumRounds);
   const recalculateBtn = document.getElementById('recalculatePredictionBtn');

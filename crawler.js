@@ -13,6 +13,8 @@ const { limitedFetch } = require('./resource-limits');
 const fetch = (url, options) => limitedFetch(rawFetch, url, options);
 const { upsertEvents, getStats } = require('./db');
 const { isGoEvent } = require('./sport-filter');
+const { eventPage } = require('./yunbisai-response');
+const { fetchTextWithRetry } = require('./upstream-client');
 
 const EVENTS_API       = 'https://data-center.yunbisai.com/api/lswl-events';
 const PAGE_CONCURRENCY = parseInt(process.env.CRAWL_PAGE_CONCURRENCY || '2', 10);
@@ -54,37 +56,21 @@ async function fetchPage(eventType, province, page) {
   const controller = new AbortController();
   activeControllers.add(controller);
   try {
-    const res = await fetch(`${EVENTS_API}?${params}`, {
+    const text = await fetchTextWithRetry(fetch, `${EVENTS_API}?${params}`, {
       timeout: TIMEOUT_MS,
+      priority: 'background',
       signal: controller.signal,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = await res.json();
+    }, PAGE_RETRIES);
+    const json = JSON.parse(text);
     throwIfStopped();
-    return json.datArr || {};
+    return eventPage(json);
   } finally {
     activeControllers.delete(controller);
   }
 }
 
 async function fetchPageWithRetry(eventType, province, page) {
-  let lastErr;
-  for (let attempt = 0; attempt <= PAGE_RETRIES; attempt++) {
-    try {
-      return await fetchPage(eventType, province, page);
-    } catch (err) {
-      if (err.message === 'CRAWL_STOPPED' || err.name === 'AbortError') throw err;
-      lastErr = err;
-      const isRateLimited = /HTTP 429/.test(err.message);
-      const isRetryable = isRateLimited || /timeout|socket hang up|ECONNRESET|ETIMEDOUT/i.test(err.message);
-      if (!isRetryable || attempt === PAGE_RETRIES) break;
-      const backoff = (isRateLimited ? 2500 : 800) * Math.pow(1.8, attempt);
-      const jitter = Math.floor(Math.random() * 400);
-      console.warn(`[Crawler] page ${page} failed (${err.message}), retry ${attempt + 1}/${PAGE_RETRIES} after ${Math.round(backoff + jitter)}ms.`);
-      await delay(backoff + jitter);
-    }
-  }
-  throw lastErr;
+  return fetchPage(eventType, province, page);
 }
 
 // ── 主入口 ────────────────────────────────────────────────────────────────────
@@ -146,6 +132,7 @@ async function runCrawl({ eventType = '2', province = '' } = {}) {
       event_id:     String(e.event_id),
       title:        e.title        || '',
       min_time:     e.min_time     || '',
+      max_time:     e.max_time     || e.min_time || '',
       provincename: e.provincename || '',
       city_name:    e.city_name    || '',
       cname:        e.cname        || '',

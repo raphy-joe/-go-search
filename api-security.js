@@ -75,7 +75,8 @@ function createRequestBudget({ maxActive = 16, perIp = 6, timeoutMs = 60000 } = 
 
 function sendApiError(res, error, fallback = '数据暂时读取失败，请稍后重试') {
   if (res.headersSent || res.destroyed) return;
-  const expected = ['BUSY','TIMEOUT','INCOMPLETE_PREDICTION_DATA','IDENTITY_REQUIRED','INVALID_IDENTITY'].includes(error.code);
+  const expected = ['BUSY','TIMEOUT','UPSTREAM_COOLDOWN','INCOMPLETE_PREDICTION_DATA','IDENTITY_REQUIRED','INVALID_IDENTITY'].includes(error.code);
+  if (error.retryAfterMs) res.setHeader('Retry-After', String(Math.ceil(error.retryAfterMs / 1000)));
   res.status(expected ? error.status || 502 : 502).json({
     code: expected ? error.code : 'UPSTREAM_UNAVAILABLE', error: expected ? error.message : fallback,
   });

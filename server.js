@@ -2,7 +2,9 @@
 
 const express = require('express');
 const rawFetch = require('node-fetch');
-const { limitedFetch } = require('./resource-limits');
+const { limitedFetch, upstreamHealth } = require('./resource-limits');
+const { fetchTextWithRetry: retryText, combineSignals } = require('./upstream-client');
+const { createLiveRoundCache } = require('./live-round-cache');
 const fetch = (url, options) => limitedFetch(rawFetch, url, options);
 const path    = require('path');
 const cron    = require('node-cron');
@@ -21,6 +23,11 @@ const {
   getLivePairingOverrides,
   getIdentityNotices,
   getOperationalCacheHealth,
+  getIndexRetryHealth,
+  queryLiveEventCandidates,
+  getPublishedGroupResult,
+  getGroupResultContext,
+  savePublishedGroupResult,
   getStats,
 } = require('./db');
 const { runCrawl, stopCrawl, getState: getCrawlerState } = require('./crawler');
@@ -42,8 +49,11 @@ const { securityHeaders, validateQuery, createRequestBudget, requestContext, sen
 const { partitionPlayerRows, selectIdentity, identityChoices, recordKey } = require('./player-identity');
 const modelVersions = require('./model-versions');
 const { rankingRule } = require('./prediction-rules');
+const upstreamResponse = require('./yunbisai-response');
+const { createPublishedResultsClient, validateRoster, mergePublishedMatches } = require('./yunbisai-results');
 const { createTelemetry, healthAlerts } = require('./operations');
 const telemetry = createTelemetry();
+const publishedResults = createPublishedResultsClient({ getCached: getPublishedGroupResult, saveCached: savePublishedGroupResult });
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -67,6 +77,17 @@ const API_RATE_LIMIT_MAX = parseInt(process.env.API_RATE_LIMIT_MAX || '60', 10);
 const groupMatchFetches = new Map();
 const liveGroupSnapshots = new Map();
 const livePredictionResults = new Map();
+const liveRoundCache = createLiveRoundCache({ validateRefresh(data, previous, { groupId, bout, completed }) {
+  if (!previous || bout > completed) return;
+  const before = normalizeLiveRoundRows(groupId, bout, previous.rows);
+  const after = normalizeLiveRoundRows(groupId, bout, data.rows);
+  const pair = row => [row.p1_id, row.p2_id].sort().join(':');
+  const incoming = new Map(after.map(row => [pair(row), row]));
+  if (before.some(row => isResolvedLiveMatch(row) && !isResolvedLiveMatch(incoming.get(pair(row)) || {}))) {
+    throw Object.assign(new Error('已完成轮次返回不完整，保留上次校验数据'), { code: 'INCOMPLETE_PREDICTION_DATA', status: 502 });
+  }
+} });
+const liveResultChanges = new Map();
 const apiRateBuckets = new Map();
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
@@ -352,7 +373,10 @@ app.get('/api/ops/status', requireAdmin, async (_req,res)=>{
     const requests=telemetry.snapshot();
     const alerts=healthAlerts({coverage,cache,requests});
     res.setHeader('Cache-Control','no-store');
-    res.json({checked_at:Date.now(),coverage,cache,requests,alerts,models:modelVersions});
+    const upstream = upstreamHealth();
+    if (upstream.some(source => source.retry_at > Date.now())) alerts.push({code:'UPSTREAM_COOLDOWN',severity:'warning'});
+    const index_retries = await getIndexRetryHealth();
+    res.json({checked_at:Date.now(),coverage,cache,requests,upstream,index_retries,alerts,models:modelVersions});
   } catch(error) { sendApiError(res,error); }
 });
 
@@ -429,13 +453,22 @@ async function doSearch(event, name, send) {
       headers: { Referer: 'https://www.yunbisai.com/' },
       timeout: SEARCH_TIMEOUT_MS,
     }, SEARCH_RETRIES);
-    const s    = text.trim()
-      .replace(/^[^(]+\(/, '').replace(/\);\s*$/, '').replace(/\)\s*$/, '');
-    const data = JSON.parse(s);
-    if (data.error !== 0 || !Array.isArray(data.datArr)) throw new Error('INVALID_SEARCH_RESPONSE');
+    const data = upstreamResponse.assertSuccess(upstreamResponse.parseResponse(text));
+    if (!Array.isArray(data.datArr)) throw new Error('INVALID_SEARCH_RESPONSE');
     {
-      for (const p of data.datArr) {
-        if (p.participantname === name && isGoGroup(event.title, p.groupname)) {
+      for (const raw of data.datArr) {
+        if (typeof raw.participantname !== 'string' || !raw.participantname.trim()) throw new Error('INVALID_SEARCH_PARTICIPANT');
+        let p = raw;
+        if (p.participantname.trim() === name && isGoGroup(event.title, p.groupname)) {
+          if (typeof p.groupname !== 'string' || !p.groupname.trim()) throw new Error('INVALID_SEARCH_GROUP');
+          const groupId = upstreamResponse.identity(p.groupid || p.group_id);
+          if (p.eventid != null && String(p.eventid) !== String(event.event_id)) throw new Error('SEARCH_EVENT_MISMATCH');
+          [p] = upstreamResponse.participants({error:0,datArr:{rows:[{...p,groupid:groupId,group_id:groupId}]}},groupId);
+          const final = await publishedResults(groupId, {fetchText:fetchTextWithRetry,eventId:event.event_id,endedAt:event.max_time});
+          const official = final.report?.players.find(player=>player.id===String(p.participantid) && player.name===name);
+          if (official && official.win+official.lose+official.draw >= Number(p.vicsum)+Number(p.faisum)+Number(p.deusum)) {
+            p = {...p,vicsum:official.win,faisum:official.lose,deusum:official.draw,integral:official.score,compositor:official.cloud_rank};
+          }
           send({
             type: 'hit',
             event: {
@@ -472,19 +505,7 @@ async function doSearch(event, name, send) {
 }
 
 async function fetchTextWithRetry(url, options, retries) {
-  let lastErr;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const r = await fetch(url, options);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      return await r.text();
-    } catch (err) {
-      lastErr = err;
-      if (requestContext.getStore()?.aborted || options?.signal?.aborted) throw err;
-      if (attempt < retries) await delay(300 * (attempt + 1));
-    }
-  }
-  throw lastErr;
+  return retryText(fetch, url, { ...options, signal: combineSignals(options?.signal, requestContext.getStore()) }, retries);
 }
 
 // ── /api/matches ──────────────────────────────────────────────────────────────
@@ -566,7 +587,9 @@ app.get('/api/live-events', async (req, res) => {
     }
     res.json({ events, scope: { province: province || '__ALL__', dateFrom, dateTo },
       failed_events: failedEvents,
-      warning: failedEvents ? `有 ${failedEvents} 场赛事组别暂时读取失败，当前结果可能不完整` : '',
+      directory_scan: candidates.directoryInfo,
+      warning: [failedEvents ? `有 ${failedEvents} 场赛事组别暂时读取失败，当前结果可能不完整` : '',
+        candidates.directoryInfo?.warning].filter(Boolean).join('；'),
     });
   } catch (err) {
     sendApiError(res, err);
@@ -610,15 +633,24 @@ app.get('/api/live-group', async (req, res) => {
     const liveState = reconcileLivePlayers(players, matchData.rows);
     const rule = rankingRule(req.query.ranking_rule);
     const current = computeCurrentRanking(liveState.players, matchData.rows, Math.max(matchData.completedRounds || 0, 1), rule.id);
+    if (matchData.resultsFinal) {
+      const official = new Map(players.map(player => [String(player.id), player]));
+      for (const player of current) {
+        player.rank = player.display_rank = player.cloud_rank;
+        player.rank_max = player.cloud_rank;
+        player.total_score = official.get(player.id)?.official_total_score ?? null;
+      }
+      current.sort((a, b) => a.rank - b.rank);
+    }
     let dataWarning = '';
     try { validatePredictionSnapshot(snapshot); } catch (error) { dataWarning = error.message; }
     const confirmedRounds = matchData.totalRoundsSource === 'event-config' ? matchData.totalRounds : 0;
     res.json({
       group_id: groupId,
-      total_rounds: requestedTotalRounds
+      total_rounds: matchData.resultsFinal ? matchData.totalRounds : requestedTotalRounds
         ? Math.max(requestedTotalRounds, confirmedRounds, matchData.completedRounds || 0, matchData.knownPairingRounds || 0)
         : matchData.totalRounds,
-      total_rounds_source: confirmedRounds && requestedTotalRounds <= confirmedRounds
+      total_rounds_source: matchData.resultsFinal ? 'published-results' : confirmedRounds && requestedTotalRounds <= confirmedRounds
         ? 'event-config' : requestedTotalRounds ? 'manual' : matchData.totalRoundsSource,
       completed_rounds: matchData.completedRounds,
       known_pairing_rounds: matchData.knownPairingRounds,
@@ -627,10 +659,13 @@ app.get('/api/live-group', async (req, res) => {
       score_updated_players: liveState.updatedCount,
       score_updated_through_round: liveState.updatedThroughRound,
       players: dataWarning ? current.map(p => ({ ...p, opponent_score:null, total_score:null })) : current,
-      data_warning: dataWarning,
-      prediction_available: !dataWarning,
+      data_warning: [dataWarning, matchData.resultWarning].filter(Boolean).join('；'),
+      prediction_available: !dataWarning && !matchData.resultsFinal,
+      results_final: Boolean(matchData.resultsFinal),
+      published_result: snapshot.publishedResult || null,
       snapshot_at: snapshot.snapshotAt,
-      ranking_rule: rule,
+      freshness: snapshot.freshness || null,
+      ranking_rule: matchData.resultsFinal ? {id:'published-results',label:'官方正式成绩',verified:true,source:'published-results'} : rule,
     });
   } catch (err) {
     console.warn(`[LiveGroup] ${groupId} failed: ${err.message}`);
@@ -804,7 +839,9 @@ async function getOrFetchGroupMatches(groupId, rounds) {
   }
   const cached = await getGroupMatchCache(groupId);
   const cachedRows = normalizeCachedRows(cached.rows);
+  const savedReport = typeof getPublishedGroupResult === 'function' ? await getPublishedGroupResult(groupId) : null;
   rounds = Math.max(parseInt(rounds) || 1, parseInt(cached.status?.rounds) || 0,
+    savedReport?.rounds || 0,
     ...cachedRows.map(row => row.bout));
   if (rounds > 30) throw new Error('INVALID_CACHED_ROUND_COUNT');
   if (cached.status && !cached.status.last_error && hasAllMatchRounds(cachedRows, rounds)) {
@@ -821,9 +858,10 @@ async function getOrFetchGroupMatches(groupId, rounds) {
   const key = `${String(groupId)}:${Math.max(parseInt(rounds) || 0, 1)}`;
   if (!groupMatchFetches.has(key)) {
     const request = (async () => {
-      const rows = await fetchGroupMatches(groupId, rounds);
+      const rows = mergePublishedMatches(cachedRows, await fetchGroupMatches(groupId, rounds));
       if (!hasAllMatchRounds(rows, rounds)) throw new Error('INCOMPLETE_MATCH_RESPONSE');
-      const stored = await replaceGroupMatchCache({ group_id: groupId, rounds, rows, preserveCoverage: true });
+      const storedRounds = Math.max(rounds, ...rows.map(row => row.bout));
+      const stored = await replaceGroupMatchCache({ group_id: groupId, rounds: storedRounds, rows, preserveCoverage: true });
       let effectiveRows = rows;
       let cacheInfo = { stale: false, updated_at: Date.now() };
       if (stored === false) {
@@ -877,7 +915,60 @@ async function getLiveGroupSnapshot(groupId, requestedTotalRounds = 0) {
   const promise = Promise.all([
     fetchGroupParticipantsLive(groupId),
     fetchGroupMatchesLive(groupId, requestedTotalRounds),
-  ]).then(([players, matchData]) => ({ players, matchData, snapshotAt: Date.now() }));
+  ]).then(async ([players, matchData]) => {
+    const final = await publishedResults(groupId, { fetchText: fetchTextWithRetry, players, eventId: matchData.eventId });
+    const report = final.report;
+    const minimumRounds = Math.max(matchData.completedRounds || 0, matchData.knownPairingRounds || 0,
+      matchData.totalRounds || 0);
+    if (report && report.rounds >= minimumRounds) {
+      validateRoster(report, players);
+      const snapshot = { players: report.players, matchData: { ...matchData,
+        rows: mergePublishedMatches(matchData.rows, report.rows), totalRounds: report.rounds,
+        totalRoundsSource: 'published-results', completedRounds: report.rounds,
+        knownPairingRounds: report.rounds, resultsFinal: true, resultWarning: final.warning },
+      publishedResult: { id: report.report_id, published_at: report.published_at }, snapshotAt: Date.now() };
+      validatePredictionSnapshot(snapshot);
+      if (typeof savePublishedGroupResult === 'function' && !report.verified_final) {
+        await savePublishedGroupResult({ ...report, verified_final: true });
+      }
+      return snapshot;
+    }
+    const snapshot = { players, matchData: { ...matchData, resultWarning: final.warning }, snapshotAt: Date.now() };
+    try {
+      validatePredictionSnapshot(snapshot);
+      snapshot.validated = true;
+      liveRoundCache.confirm(groupId, matchData.completedRounds);
+    } catch (error) {
+      liveRoundCache.invalidate(groupId);
+      if (cached?.value?.validated) throw error;
+    }
+    const resultKey = crypto.createHash('sha256').update(JSON.stringify(matchData.rows.filter(isResolvedLiveMatch))).digest('hex');
+    const previous = liveResultChanges.get(String(groupId));
+    const changedAt = previous ? previous.key === resultKey ? previous.changedAt : snapshot.snapshotAt : null;
+    if (liveResultChanges.size >= 32) liveResultChanges.delete(liveResultChanges.keys().next().value);
+    liveResultChanges.set(String(groupId), { key: resultKey, changedAt });
+    snapshot.freshness = { fetched_at: snapshot.snapshotAt, history_checked_at: matchData.historyCheckedAt,
+      results_changed_at: changedAt, source_updated_at: null };
+    return snapshot;
+  }).catch(async error => {
+    if (error.name === 'AbortError' || requestContext.getStore()?.aborted) throw error;
+    if (cached?.value && !cached.value.matchData.resultsFinal && Date.now() - cached.value.snapshotAt <= 120000) {
+      try {
+        validatePredictionSnapshot(cached.value);
+        return { ...cached.value, matchData: { ...cached.value.matchData,
+          resultWarning: '实时接口暂时读取失败，显示两分钟内上次校验的数据，请稍后刷新' },
+        freshness: { ...cached.value.freshness, stale: true } };
+      } catch (_) { /* Never fall back to an incomplete snapshot. */ }
+    }
+    const report = typeof getPublishedGroupResult === 'function' ? await getPublishedGroupResult(groupId) : null;
+    if (!report?.verified_final) throw error;
+    const snapshot = { players: report.players, matchData: { rows: report.rows, totalRounds: report.rounds,
+      totalRoundsSource: 'published-results', completedRounds: report.rounds, knownPairingRounds: report.rounds,
+      manualPairingRounds: [], resultsFinal: true, resultWarning: '云比赛实时接口暂时读取失败，显示上次校验的正式成绩' },
+    publishedResult: { id: report.report_id, published_at: report.published_at }, snapshotAt: Date.now() };
+    validatePredictionSnapshot(snapshot);
+    return snapshot;
+  });
   liveGroupSnapshots.set(key, { promise, expiresAt: 0, value: null });
   try {
     const value = await promise;
@@ -911,6 +1002,12 @@ function normalizeCachedRows(rows) {
 }
 
 async function fetchGroupMatches(groupId, rounds) {
+  const context = typeof getGroupResultContext === 'function' ? await getGroupResultContext(groupId) : null;
+  const final = await publishedResults(groupId, { fetchText: fetchTextWithRetry, eventId: context?.event_id,
+    endedAt: context?.max_time });
+  if (final.report && final.report.rounds >= rounds) {
+    return final.report.rows.filter(row => !(row.p2_id === LIVE_BYE_OPPONENT_ID && row.p1_result === '4'));
+  }
   const allRows = [];
   const bouts = Array.from({ length: rounds }, (_, index) => index + 1);
   // Avoid upstream cache-generation races within the same historical group.
@@ -924,10 +1021,10 @@ async function fetchGroupMatches(groupId, rounds) {
           timeout: 8000,
         }, 1);
         const data = parseJsonp(text);
-        if (data.error !== 0 || !Array.isArray(data.datArr?.rows) || !data.datArr.rows.length) {
+        rows = upstreamResponse.matchRound(data, groupId).rows;
+        if (!rows.length) {
           throw new Error(`INCOMPLETE_MATCH_ROUND group=${groupId} bout=${bout}`);
         }
-        rows = data.datArr.rows;
         if (!rows.some(row => row.p1id && row.p2id)) throw new Error(`EMPTY_MATCH_ROUND bout=${bout}`);
         break;
       } catch (err) {
@@ -958,9 +1055,7 @@ async function fetchGroupMatches(groupId, rounds) {
 }
 
 function parseJsonp(text) {
-  const s = text.trim()
-    .replace(/^[^(]+\(/, '').replace(/\);\s*$/, '').replace(/\)\s*$/, '');
-  return JSON.parse(s);
+  return upstreamResponse.parseResponse(text);
 }
 
 function formatDateOffset(offsetDays) {
@@ -973,13 +1068,19 @@ function formatDateOffset(offsetDays) {
 }
 
 async function fetchLiveEventCandidates({ province = '', dateFrom, dateTo, limit = 60 }) {
-  const rows = [];
-  const pageSize = Math.min(Math.max(limit, 20), 100);
-  const maxPages = province ? 2 : 4;
-  for (let page = 1; page <= maxPages && rows.length < limit; page++) {
+  const found = new Map();
+  const local = typeof queryLiveEventCandidates === 'function'
+    ? await queryLiveEventCandidates({ province, dateFrom, dateTo, limit: 1000 }) : [];
+  for (const row of local) found.set(String(row.event_id), row);
+  const maxPages = province ? 12 : 24;
+  const deadline = Date.now() + 8000;
+  const seenPages = new Set();
+  let pagesScanned = 0, totalPages = null, complete = false;
+  for (let page = 1; page <= maxPages; page++) {
+    if (Date.now() > deadline) break;
     const params = new URLSearchParams({
       page,
-      PageSize: pageSize,
+      PageSize: 100,
       eventType: '2',
       areaNum: province || '',
     });
@@ -987,18 +1088,22 @@ async function fetchLiveEventCandidates({ province = '', dateFrom, dateTo, limit
       timeout: SEARCH_TIMEOUT_MS,
       headers: { 'User-Agent': 'Mozilla/5.0' },
     }, 1);
-    const json = JSON.parse(text);
-    if (Number(json.error) !== 0 || !Array.isArray(json.datArr?.rows)) {
-      throw new Error('云比赛赛事列表暂时读取失败，请稍后重试');
-    }
-    const pageRows = json.datArr.rows;
+    const data = upstreamResponse.eventPage(upstreamResponse.parseResponse(text));
+    const pageRows = data.rows;
+    totalPages = data.totalPages;
+    pagesScanned++;
+    const signature = pageRows.map(row => row.event_id).join(',');
+    if (signature && seenPages.has(signature)) throw new Error('REPEATED_EVENT_LIST_PAGE');
+    if (signature) seenPages.add(signature);
     for (const row of pageRows) {
+      // Fresh source metadata supersedes an older local date/sport assignment.
+      found.delete(String(row.event_id));
       if (String(row.event_value) !== '2' || !isGoEvent(row)) continue;
       const start = (row.min_time || '').substring(0, 10);
       const end = (row.max_time || row.min_time || '').substring(0, 10);
       if (dateFrom && end < dateFrom) continue;
       if (dateTo && start > dateTo) continue;
-      rows.push({
+      found.set(String(row.event_id), {
         event_id: String(row.event_id),
         title: row.title || '',
         min_time: row.min_time || '',
@@ -1008,11 +1113,17 @@ async function fetchLiveEventCandidates({ province = '', dateFrom, dateTo, limit
         cname: row.cname || '',
         play_num: parseInt(row.play_num) || 0,
       });
-      if (rows.length >= limit) break;
     }
-    if (!pageRows.length) break;
+    if (!pageRows.length || (totalPages != null && page >= totalPages)) { complete = true; break; }
+    if (found.size >= limit) break;
     await delay(80);
   }
+  const all = [...found.values()].sort((a, b) => (b.min_time || '').localeCompare(a.min_time || ''));
+  const rows = all.slice(0, limit);
+  rows.directoryInfo = { pages_scanned: pagesScanned, total_pages: totalPages,
+    local_candidates: local.length, complete: complete && all.length <= limit && local.length < 1000,
+    warning: all.length > limit || local.length >= 1000 ? '候选赛事较多，当前列表未全部展示，请缩小查询范围'
+      : !complete ? `已结合本地赛事目录，云比赛实时目录已校验前 ${pagesScanned} 页，较早发布的赛事仍可能遗漏` : '' };
   return rows;
 }
 
@@ -1096,9 +1207,7 @@ async function fetchGroupParticipantsLive(groupId) {
       await delay(800);
       continue;
     }
-    if (data.error !== 0) throw new Error(data.msg || 'Eventpart API error');
-    if (!Array.isArray(data.datArr?.rows)) throw new Error('INVALID_PARTICIPANT_RESPONSE');
-    return data.datArr.rows.map(row => ({
+    return upstreamResponse.participants(data, groupId).map(row => ({
       id: String(row.participantid || row.id || row.pid || ''),
       name: row.participantname || row.name || '',
       org: row.teamname || row.othername || '',
@@ -1115,7 +1224,9 @@ async function fetchGroupParticipantsLive(groupId) {
 
 async function fetchGroupMatchesLive(groupId, requestedTotalRounds = 0) {
   const manualRowsPromise = getLivePairingOverrides(groupId);
-  const first = await fetchGroupRoundLive(groupId, 1);
+  const firstRead = await liveRoundCache.get(groupId, 1, () => fetchGroupRoundLive(groupId, 1));
+  const first = firstRead.data;
+  const checkedTimes = [firstRead.checkedAt];
   const cloudTotalRounds = parseInt(first.total_bout) || 0;
   if (cloudTotalRounds < 0 || cloudTotalRounds > 30) throw new Error('INVALID_UPSTREAM_ROUNDS');
   const confirmedRounds = configuredLiveEventTotalRounds(first.eventid);
@@ -1130,7 +1241,9 @@ async function fetchGroupMatchesLive(groupId, requestedTotalRounds = 0) {
   const remainingBouts = Array.from({ length: Math.max(fetchThroughRound - 1, 0) }, (_, index) => index + 2);
   const remainingRounds = new Map();
   await mapLimit(remainingBouts, ROUND_FETCH_CONCURRENCY, async bout => {
-    const data = await fetchGroupRoundLive(groupId, bout);
+    const read = await liveRoundCache.get(groupId, bout, () => fetchGroupRoundLive(groupId, bout));
+    const data = read.data;
+    checkedTimes.push(read.checkedAt);
     remainingRounds.set(bout, data.rows || []);
   });
   // A future request can return the latest sheet; response timing must not relabel it.
@@ -1171,9 +1284,11 @@ async function fetchGroupMatchesLive(groupId, requestedTotalRounds = 0) {
     rows: allRows,
     totalRounds,
     totalRoundsSource: confirmedRounds ? 'event-config' : cloudTotalRounds ? 'cloud' : 'inferred',
+    eventId: String(first.eventid || ''),
     completedRounds,
     knownPairingRounds,
     manualPairingRounds: [...manualPairingRounds].sort((a, b) => a - b),
+    historyCheckedAt: Math.min(...checkedTimes),
   };
 }
 
@@ -1212,8 +1327,7 @@ async function fetchGroupRoundLive(groupId, bout) {
     timeout: 8000,
   }, 1);
   const data = parseJsonp(text);
-  if (data.error && data.error !== 0) throw new Error(data.msg || 'Againstplan API error');
-  return data.datArr || { rows: [] };
+  return upstreamResponse.matchRound(data, groupId);
 }
 
 function inferTotalRoundsFromRows(rows) {
@@ -1399,13 +1513,18 @@ app.post('/api/index/stop', requireAdmin, (_req, res) => {
 if (process.env.BACKGROUND_TASKS_DISABLED !== '1') cron.schedule('30 2 * * *', () => {
   console.log('[Scheduler] Nightly crawl triggered.');
   runCrawl()
-    .then(() => runIndex())
+    .then(() => runIndex({ respectRetrySchedule: true }))
     .then(async () => {
       for (const group of await queryExcludedResultGroups()) {
         try { await getOrFetchGroupMatches(group.group_id, group.rounds); } catch (_) { /* Still quarantined. */ }
       }
     })
     .catch(console.error);
+}, { timezone: 'Asia/Shanghai' });
+
+if (process.env.BACKGROUND_TASKS_DISABLED !== '1') cron.schedule('15 * * * *', () => {
+  if (getCrawlerState().running || getIndexerState().running) return;
+  runIndex({ retryOnly: true, limit: 30 }).catch(console.error);
 }, { timezone: 'Asia/Shanghai' });
 
 // ── 启动：DB 空则立即爬一次 ───────────────────────────────────────────────────

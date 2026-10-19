@@ -20,7 +20,9 @@ function isUnscoredLiveAbsence(row) {
 
 // A published zero-point absence is settled, but is not a played game or a bye win.
 function isResolvedLiveMatch(row) {
-  return isPlayedMatch(row) || isUnscoredLiveAbsence(row);
+  return isPlayedMatch(row) || isUnscoredLiveAbsence(row)
+    || (row?.published_no_game === true && String(row.p1_result) === '4' && String(row.p2_result) === '4'
+      && Number(row.p1_score) === 0 && Number(row.p2_score) === 0);
 }
 
 function nonPlayingPlayerIds(players, rows) {
@@ -44,6 +46,8 @@ function validatePredictionSnapshot(snapshot) {
   const fail = () => { throw Object.assign(new Error('历史轮次或对局数据不完整，暂不能计算概率，请刷新后重试'),
     { code: 'INCOMPLETE_PREDICTION_DATA', status: 422 }); };
   if (!players.length || players.length > 1500) fail();
+  if (snapshot.matchData?.resultsFinal && (snapshot.matchData.completedRounds !== snapshot.matchData.totalRounds
+    || !rows.length || !rows.every(isResolvedLiveMatch))) fail();
   const ids = new Set(players.map(p => String(p.id)));
   if (ids.size !== players.length) fail();
   const nonPlaying = nonPlayingPlayerIds(players, rows);
@@ -65,6 +69,8 @@ function validatePredictionSnapshot(snapshot) {
     if (isPlayedMatch(row)) lastPlayed = Math.max(lastPlayed, row.bout);
   }
   for (const player of players) {
+    if (snapshot.matchData?.resultsFinal && (!Number.isInteger(Number(player.cloud_rank))
+      || Number(player.cloud_rank) < 1 || Number(player.cloud_rank) > players.length)) fail();
     const games = Number(player.win || 0) + Number(player.lose || 0) + Number(player.draw || 0);
     if (games > (playedCounts.get(String(player.id)) || 0)) fail();
     if (rows.length && !lastSeen.has(String(player.id))) fail();
@@ -111,7 +117,10 @@ function reconcileLivePlayers(players, matches) {
   const reconciledPlayers = players.map(player => {
     const stats = matchStats.get(String(player.id));
     const cloudGames = (parseInt(player.win) || 0) + (parseInt(player.lose) || 0) + (parseInt(player.draw) || 0);
-    const useRoundResults = Boolean(stats && stats.games > cloudGames);
+    const ordinaryCloudScore = Number(player.score || 0) === Number(player.win || 0) * 2 + Number(player.draw || 0);
+    const correctedResults = stats && stats.games > 0 && stats.games === cloudGames && ordinaryCloudScore
+      && (stats.win !== Number(player.win || 0) || stats.lose !== Number(player.lose || 0) || stats.draw !== Number(player.draw || 0));
+    const useRoundResults = Boolean(stats && (stats.games > cloudGames || correctedResults));
     if (!useRoundResults) return { ...player, score_reconciled: false };
 
     updatedCount += 1;
@@ -191,10 +200,18 @@ function predictPlayerRank({
   if (!selected) throw new Error('player not found in group');
 
   const currentRows = computeCurrentRanking(players, matchData.rows, Math.max(matchData.completedRounds || 0, 1), rule.id);
+  if (matchData.resultsFinal) {
+    const official = new Map(players.map(player => [String(player.id), player]));
+    for (const row of currentRows) {
+      row.rank = row.display_rank = row.cloud_rank;
+      row.rank_max = row.cloud_rank;
+      row.total_score = official.get(row.id)?.official_total_score ?? null;
+    }
+  }
   const current = currentRows.find(p => p.id === String(participantId));
   const confirmedRounds = matchData.totalRoundsSource === 'event-config' ? matchData.totalRounds : 0;
   const minimumTotalRounds = Math.max(matchData.completedRounds || 0, matchData.knownPairingRounds || 0, confirmedRounds, 1);
-  const totalRounds = requestedTotalRounds
+  const totalRounds = matchData.resultsFinal ? matchData.totalRounds : requestedTotalRounds
     ? Math.max(requestedTotalRounds, minimumTotalRounds)
     : Math.max(matchData.totalRounds || 0, minimumTotalRounds);
   const rowsByBout = groupMatchesByBout(matchData.rows);
@@ -211,8 +228,12 @@ function predictPlayerRank({
   const appliedNextResult = nextOpponent && !nextOpponent.is_bye ? normalizedNextResult : '';
   const playerId = String(participantId);
   const counts = new Map();
+  const intervals = new Map();
+  const guaranteed = new Array(players.length + 2).fill(0);
+  const possible = new Array(players.length + 2).fill(0);
+  const iterations = matchData.resultsFinal ? 1 : simulations;
 
-  for (let i = 0; i < simulations; i++) {
+  for (let i = 0; i < iterations; i++) {
     const scoreMap = new Map(players.map(p => [String(p.id), parseFloat(p.score) || 0]));
     const opponentSets = buildInitialOpponentSets(players, matchData.rows);
     const playedKeys = new Set(matchData.rows.filter(isPlayedMatch).map(matchKey));
@@ -240,23 +261,37 @@ function predictPlayerRank({
 
     const ranked = rankPlayersFromScores(players, scoreMap, opponentSets, totalRounds, rule.id);
     const target = ranked.find(p => p.id === playerId);
-    counts.set(target.rank, (counts.get(target.rank) || 0) + 1);
+    const finalRank = matchData.resultsFinal ? Number(selected.cloud_rank) : target.rank;
+    counts.set(finalRank, (counts.get(finalRank) || 0) + 1);
+    const rankMax = matchData.resultsFinal ? finalRank : target.rank_max;
+    const intervalKey = `${finalRank}:${rankMax}`;
+    const interval = intervals.get(intervalKey) || { rank: finalRank, rank_max: rankMax, count: 0 };
+    interval.count++;
+    intervals.set(intervalKey, interval);
+    guaranteed[rankMax]++;
+    possible[finalRank]++;
   }
 
   const probabilities = [...counts.entries()]
     .map(([rank, count]) => ({
       rank,
       count,
-      probability: count / simulations,
+      probability: count / iterations,
     }))
     .sort((a, b) => b.probability - a.probability || a.rank - b.rank)
     .slice(0, includeDistribution ? Infinity : 5);
+  let lower = 0, upper = 0;
+  const topN = players.map((_, index) => {
+    const n = index + 1;
+    lower += guaranteed[n]; upper += possible[n];
+    return { n, probability_min: lower / iterations, probability_max: upper / iterations };
+  });
 
   return {
     group_id: String(groupId),
     total_rounds: totalRounds,
     detected_total_rounds: matchData.totalRounds,
-    total_rounds_source: confirmedRounds && totalRounds === confirmedRounds
+    total_rounds_source: matchData.resultsFinal ? 'published-results' : confirmedRounds && totalRounds === confirmedRounds
       ? 'event-config' : requestedTotalRounds ? 'manual' : matchData.totalRoundsSource,
     completed_rounds: matchData.completedRounds,
     known_pairing_rounds: matchData.knownPairingRounds,
@@ -266,20 +301,25 @@ function predictPlayerRank({
     score_updated_through_round: liveState.updatedThroughRound,
     next_bout: matchData.completedRounds < totalRounds ? matchData.completedRounds + 1 : null,
     snapshot_at: snapshot.snapshotAt,
+    freshness: snapshot.freshness || null,
     next_opponent: nextOpponent,
     next_result: appliedNextResult,
-    simulations,
-    assumptions: { ranking:rule, total_rounds:confirmedRounds && totalRounds === confirmedRounds
+    simulations: iterations,
+    results_final: Boolean(matchData.resultsFinal),
+    published_result: snapshot.publishedResult || null,
+    data_warning: matchData.resultWarning || '',
+    assumptions: { ranking:matchData.resultsFinal ? { id:'published-results',label:'\u5b98\u65b9\u6b63\u5f0f\u6210\u7ee9',verified:true,source:'published-results' } : rule, total_rounds:matchData.resultsFinal ? 'published-results' : confirmedRounds && totalRounds === confirmedRounds
       ? 'event-config' : requestedTotalRounds ? 'request-override' : matchData.totalRoundsSource || 'unknown',
-      note:'未核实赛事完整排名细则；按胜2分、和1分、负0分、轮空对手分0、同分并列模拟。' },
+      note:matchData.resultsFinal ? '\u5b98\u65b9\u5df2\u53d1\u5e03\u6b63\u5f0f\u603b\u6210\u7ee9\uff0c\u540d\u6b21\u76f4\u63a5\u53d6\u6b63\u5f0f\u6210\u7ee9\uff0c\u4e0d\u518d\u6a21\u62df\u3002'
+        : '未核实赛事完整排名细则；按胜2分、和1分、负0分、轮空对手分0模拟。未决同分保留名次区间；前N名概率按实际N个名额给出上下界，不将并列名次直接计为入围。' },
     model: {
       version: versions.prediction,
       seed: usedSeed,
       snapshot_fingerprint: fingerprint,
       pairing: 'real-pairings-then-swiss-active-roster',
       pairing_players: pairingPlayers.length,
-      win_probability: appliedNextResult ? `next-match-fixed-${appliedNextResult}` : 'equal-strength-50-50',
-      ranking_rule: rule.id,
+      win_probability: matchData.resultsFinal ? 'not-applicable-final-results' : appliedNextResult ? `next-match-fixed-${appliedNextResult}` : 'equal-strength-50-50',
+      ranking_rule: matchData.resultsFinal ? 'published-results' : rule.id,
     },
     player: {
       id: String(selected.id),
@@ -288,6 +328,11 @@ function predictPlayerRank({
     },
     current,
     probabilities,
+    rank_intervals: [...intervals.values()].map(row => ({ ...row, probability: row.count / iterations }))
+      .sort((a, b) => b.probability - a.probability || a.rank - b.rank || a.rank_max - b.rank_max)
+      .slice(0, includeDistribution ? Infinity : 5),
+    top_n: topN,
+    probability_semantics: matchData.resultsFinal ? 'official-rank' : 'unresolved-tie-bounds',
   };
 }
 
@@ -517,6 +562,12 @@ function rankPlayersFromScores(players, scoreMap, opponentSets, roundsForFormula
       row.rank = i + 1;
     }
     last = row;
+  }
+  for (let end = rows.length - 1; end >= 0;) {
+    let start = end;
+    while (start > 0 && rows[start - 1].rank === rows[end].rank) start--;
+    for (let i = start; i <= end; i++) rows[i].rank_max = end + 1;
+    end = start - 1;
   }
   return rows;
 }

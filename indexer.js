@@ -5,11 +5,18 @@ const { limitedFetch } = require('./resource-limits');
 const fetch = (url, options) => limitedFetch(rawFetch, url, options);
 const { isGoGroup } = require('./sport-filter');
 const { fetchEventGroups } = require('./yunbisai-groups');
+const upstreamResponse = require('./yunbisai-response');
+const { fetchTextWithRetry } = require('./upstream-client');
+const { createPublishedResultsClient } = require('./yunbisai-results');
 const {
   queryEventsForIndex,
   publishEventIndex,
   upsertIndexedEvent,
+  getPublishedGroupResult,
+  savePublishedGroupResult,
 } = require('./db');
+
+const publishedResults = createPublishedResultsClient({ getCached: getPublishedGroupResult, saveCached: savePublishedGroupResult });
 
 const EVENTPART_API = 'https://api.yunbisai.com/request/Group/Eventpart';
 const REQUEST_TIMEOUT_MS = 15000;
@@ -48,7 +55,8 @@ function throwIfStopped() {
   if (state.stopRequested || !state.running) throw new Error('INDEX_STOPPED');
 }
 
-async function runIndex({ province = '', dateFrom, dateTo, force = false, limit = 0 } = {}) {
+async function runIndex({ province = '', dateFrom, dateTo, force = false, limit = 0,
+  retryOnly = false, respectRetrySchedule = false } = {}) {
   if (state.running) {
     console.log('[Indexer] Already running.');
     return;
@@ -69,7 +77,8 @@ async function runIndex({ province = '', dateFrom, dateTo, force = false, limit 
   };
 
   try {
-    const events = await queryEventsForIndex({ province, dateFrom, dateTo, force, limit });
+    const events = await queryEventsForIndex({ province, dateFrom, dateTo, force, limit,
+      retryOnly, respectRetrySchedule });
     state.totalEvents = events.length;
     console.log(`[Indexer] Start indexing ${events.length} events.`);
 
@@ -135,6 +144,7 @@ async function indexEvent(event) {
     group_name: g.groupname || '',
     team_type: g.team || '0',
     pnumber: g.pnumber || 0,
+    ends_at: g.et || '',
     updated_at: now,
   }));
   const groupResults = [];
@@ -163,7 +173,18 @@ async function indexEvent(event) {
           updated_at: now,
         });
       }
-      groupResults.push({ group_id: group.group_id, rows: participants });
+      const final = await publishedResults(group.group_id, { fetchText, eventId: event.event_id, endedAt: group.ends_at,
+        players: participants.map(row => ({ id: row.participant_id, name: row.participant_name,
+          win: row.win, lose: row.lose, draw: row.draw })) });
+      if (final.report) {
+        const byId = new Map(final.report.players.map(player => [player.id, player]));
+        for (const participant of participants) {
+          const result = byId.get(participant.participant_id);
+          Object.assign(participant, { win: result.win, lose: result.lose, draw: result.draw,
+            score: result.score, rank: result.cloud_rank });
+        }
+      }
+      groupResults.push({ group_id: group.group_id, rows: participants, warning: final.warning });
     } catch (error) {
       if (error.name === 'AbortError' || state.stopRequested) throw error;
       groupResults.push({ group_id: group.group_id, error: error.message });
@@ -181,14 +202,12 @@ async function fetchGroupParticipants(groupId) {
       headers: { Referer: 'https://www.yunbisai.com/' },
       timeout: REQUEST_TIMEOUT_MS,
     });
-    const data = parseJsonp(text);
+    const data = upstreamResponse.parseResponse(text);
     if (data.datArr === 'wait') {
       await delay(1000);
       continue;
     }
-    if (data.error !== 0) throw new Error(data.msg || 'Eventpart API error');
-    if (!Array.isArray(data.datArr?.rows)) throw new Error('INVALID_PARTICIPANT_RESPONSE');
-    return data.datArr.rows;
+    return upstreamResponse.participants(data, groupId);
   }
   throw new Error(`participants wait timeout for group ${groupId}`);
 }
@@ -197,20 +216,10 @@ async function fetchText(url, options) {
   const controller = new AbortController();
   activeControllers.add(controller);
   try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.text();
+    return await fetchTextWithRetry(fetch, url, { ...options, priority: 'background', signal: controller.signal }, 2);
   } finally {
     activeControllers.delete(controller);
   }
-}
-
-function parseJsonp(text) {
-  const s = text.trim()
-    .replace(/^[^(]+\(/, '')
-    .replace(/\);\s*$/, '')
-    .replace(/\)\s*$/, '');
-  return JSON.parse(s);
 }
 
 if (require.main === module) {
@@ -224,6 +233,8 @@ if (require.main === module) {
     dateTo: args.dateTo,
     force: args.force === 'true',
     limit: parseInt(args.limit) || 0,
+    retryOnly: args['retry-only'] === 'true',
+    respectRetrySchedule: true,
   }).then(() => process.exit(0), err => {
     console.error(err);
     process.exit(1);

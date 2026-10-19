@@ -330,6 +330,43 @@ test('prediction links restore seed, result scenario and chosen ranking assumpti
   assert.match(await page.locator('#livePredictionPanel').innerText(),/规则未核实/);
 });
 
+test('unresolved ties show rank ranges and top-N slot bounds without extra network requests', async t => {
+  const {page,calls} = await fixture(t,(route,url) => {
+    if(url.pathname==='/api/live-event') return json(route,{total_rounds:7,groups:[{group_id:'1',group_name:'3段组',pnumber:20,live:true}]});
+    if(url.pathname==='/api/live-group') return json(route,{group_id:'1',total_rounds:7,completed_rounds:6,known_pairing_rounds:6,
+      players:[{id:'11',name:'甲',score:8}]});
+    if(url.pathname==='/api/live-prediction') return json(route,{player:{id:'11',name:'甲'},current:{rank:8,score:8},total_rounds:7,
+      completed_rounds:6,known_pairing_rounds:6,simulations:3000,next_bout:7,next_opponent:null,
+      rank_intervals:[{rank:6,rank_max:9,probability:0.6,count:1800},{rank:100,rank_max:199,probability:0.4,count:1200}],
+      top_n:Array.from({length:20},(_,i) => ({n:i+1,probability_min:i===3?1/3000:i<8?0:0.6,probability_max:i===3?1/3000:i<5?0:0.6})),
+      freshness:{fetched_at:Date.now(),history_checked_at:Date.now()-120000,results_changed_at:Date.now()-60000}});
+    throw new Error(`Unexpected API: ${url}`);
+  });
+  await page.goto(`${origin}/live-prediction.html?event_id=1&group_id=1&participant_id=11&total_rounds=7`);
+  await page.locator('#liveTopNProbability').waitFor();
+  assert.match(await page.locator('.live-probability-row').first().innerText(),/第 6-9 名/);
+  assert.equal(await page.locator('#liveTopNProbability').innerText(),'0% - 60%（同分名额待定）');
+  const count = calls.length;
+  await page.locator('#liveTopN').fill('9'); await page.locator('#liveTopN').dispatchEvent('change');
+  assert.equal(await page.locator('#liveTopNProbability').innerText(),'60%');
+  assert.equal(calls.length,count);
+  await page.locator('#liveTopN').fill('4');await page.locator('#liveTopN').dispatchEvent('change');
+  assert.equal(await page.locator('#liveTopNProbability').innerText(),'<0.1%');
+  await page.locator('#liveTopN').fill('9');await page.locator('#liveTopN').dispatchEvent('change');
+  assert.match(await page.locator('#livePredictionPanel').innerText(),/上游未提供赛果更新时间/);
+  const dir=path.join(root,'work','ui-hardening');fs.mkdirSync(dir,{recursive:true});
+  for(const width of [1440,390,320]) {
+    await page.setViewportSize({width,height:1000});
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`probability bounds overflow at ${width}`);
+    const overlaps = await page.locator('.live-probability-row').evaluateAll(rows => rows.some(row => {
+      const label=row.children[0].getBoundingClientRect(),track=row.children[1].getBoundingClientRect();
+      return label.right>track.left;
+    }));
+    assert.equal(overlaps,false);
+    await page.screenshot({path:path.join(dir,`prediction-tie-bounds-${width}.png`),fullPage:true});
+  }
+});
+
 test('an old six-round link adopts confirmed event rounds before querying and opening player tabs',async t=>{
   const {page,calls}=await fixture(t,(route,url)=>{
     if(url.pathname==='/api/live-event') return json(route,{total_rounds:7,groups:[{group_id:'349073',group_name:'3段组',pnumber:101,live:true}]});
@@ -370,5 +407,38 @@ test('head-to-head played records fit mobile and preserve accessible unit detail
     }
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`H2H at ${width}`);
     await page.screenshot({path:path.join(dir,`head-to-head-records-${width}.png`),fullPage:true});
+  }
+});
+
+test('published final standings show official results without round overrides or simulated probabilities',async t=>{
+  const current={id:'11',name:'黄康凝',score:10,display_rank:11,cloud_rank:11,rank:11,win:5,lose:2,opponent_score:58,total_score:11.29};
+  const common={group_id:'1',total_rounds:7,completed_rounds:7,known_pairing_rounds:7,results_final:true,
+    total_rounds_source:'published-results',published_result:{id:'99',published_at:'2026-10-09 09:25:48'}};
+  const {page}=await fixture(t,(route,url)=>{
+    if(url.pathname==='/api/live-event') return json(route,{total_rounds:7,groups:[{group_id:'1',group_name:'3段组',pnumber:1,live:false}]});
+    if(url.pathname==='/api/live-group') return json(route,{...common,prediction_available:false,players:[current]});
+    if(url.pathname==='/api/live-prediction') return json(route,{...common,player:{id:'11',name:'黄康凝'},current,
+      next_opponent:null,simulations:1,probabilities:[{rank:11,count:1,probability:1}]});
+    throw new Error(`Unexpected API: ${url}`);
+  });
+  await page.goto(`${origin}/live-prediction.html?event_id=1&group_id=1&total_rounds=7`);
+  await page.getByText('正式名次',{exact:true}).waitFor();
+  assert.equal(await page.locator('#liveTotalRoundsInput').count(),0);
+  assert.equal(await page.locator('#liveRankingRule').count(),0);
+  await page.goto(`${origin}/live-prediction.html?event_id=1&group_id=1&participant_id=11&total_rounds=7`);
+  await page.getByText('黄康凝 的正式成绩',{exact:true}).waitFor();
+  const result=await page.locator('#livePredictionPanel').innerText();
+  assert.match(result,/第 11 名/);
+  assert.match(result,/5胜2负/);
+  assert.doesNotMatch(result,/模拟|概率|下一轮|规则未核实/);
+  assert.equal(await page.locator('.live-probability-row').count(),0);
+  assert.equal(await page.locator('#livePredictionTotalRoundsInput').count(),0);
+  await page.locator('#refreshFinalResultBtn').click();
+  await page.getByText('黄康凝 的正式成绩',{exact:true}).waitFor();
+  const dir=path.join(root,'work','ui-hardening');fs.mkdirSync(dir,{recursive:true});
+  for(const width of [1440,390,320]) {
+    await page.setViewportSize({width,height:1000});
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`final results at ${width}`);
+    await page.screenshot({path:path.join(dir,`published-results-${width}.png`),fullPage:true});
   }
 });

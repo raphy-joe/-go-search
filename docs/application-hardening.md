@@ -80,6 +80,96 @@ rotate credentials, enable 19Road, or change the 180-day strength window.
 - HTTP still lacks transport encryption. Do not send administrative credentials
   over a public HTTP connection; use a protected SSH tunnel until HTTPS is set up.
 
+## Yunbisai Compatibility
+
+- JSON and JSONP responses share explicit business-error, identity, numeric and
+  required-field checks. Missing real-player scores are not zeroes. A nonexistent
+  bye/absence opponent may legitimately have a null score.
+- Published group result lists and their structured tables supplement the legacy
+  participant and pairing feeds. Tables must have complete columns, unique player
+  identities, reciprocal opponents and consistent cumulative points. Unsupported
+  or incomplete tables retain existing records instead of guessing outcomes.
+- Verified reports are persisted in `published_group_results`. Older publications,
+  shorter round coverage and missing participant identities cannot replace them.
+  Explicit unscored games are accepted only with a publication after the verified
+  event end; they never become draws or bye wins. A cached report can remain
+  usable during a legacy-feed outage only after final-round snapshot validation,
+  with a visible stale-source warning.
+- Fully reconciled final results display official ranks, not a Monte Carlo
+  estimate, and ignore hypothetical extra rounds. Ongoing forecasts retain their
+  primary ranking assumptions. Prediction version is `rank-simulation-v5`;
+  strength still uses the unchanged 180-day model.
+- Event ingestion persists `max_time`, with an additive migration for existing
+  databases. The live-event finder supplements current upstream pages with the
+  local overlapping-date directory, then reads groups and pairings live. Existing
+  directories gain end dates on their next regular crawl; no full recrawl is
+  automatically triggered by deployment.
+- Pagination follows actual page metadata rather than assuming `PageSize` is
+  honored. The live scan has an eight-second budget and caps of 12 provincial or
+  24 nationwide pages. Truncated scans/results disclose incomplete coverage;
+  repeated pages and business errors are not successful empty searches.
+- Formal-source verification failures mark indexing partial while retaining
+  usable participant rows, so coverage does not silently claim full validation.
+- The lockfile pins the patched `proxy-addr` 2.0.8 dependency. Proxy trust remains
+  loopback-only; no authentication or network exposure settings were relaxed.
+
+## Tie Boundaries and Refresh Policy
+
+- Unknown event-specific head-to-head, opponent-score cuts, penalties and lots
+  are not inferred from table column names. The association's published rules
+  allow different methods, not a universal tournament comparator:
+  https://wqwh.weiqi.org.cn/rules/
+- Ongoing forecasts expose `rank_intervals` and `top_n` probability bounds under
+  the selected primary ranking assumption. A tied block crossing the Nth slot
+  contributes only to the upper bound. No random tiebreak or guaranteed shared
+  rank is substituted for an actual qualifying place. The legacy `probabilities`
+  field remains a distribution of the best shared rank for API compatibility;
+  the UI uses intervals, not that field. Bounds cover unresolved tiebreaks, not
+  uncertainty in the 50/50 strength or simplified Swiss pairing assumptions.
+- Live round sheets use a bounded 16 MiB / 32-group memory cache. Metadata round
+  one and the latest completed/current/future rounds refresh after 10 seconds;
+  earlier verified completed rounds are rechecked after five minutes. Failed
+  or incomplete refreshes cannot erase already resolved historical games.
+- Invalid mixed-age snapshots invalidate the round cache. During a temporary
+  outage, a validated ongoing snapshot at most two minutes old may be returned
+  with a visible warning, retaining its original timestamps. Older/incomplete
+  snapshots cannot serve as prediction fallback. Formal final-result fallback
+  continues to require the separate persistent final verification.
+- `freshness` distinguishes the local read time, oldest sheet verification and
+  locally observed result changes. It does not claim an upstream publication
+  timestamp where the source provides none. Formal reports show their actual
+  publication time separately.
+- Upstream HTTP retries honor seconds/date `Retry-After`, abort signals and
+  jittered exponential backoff. Long cooldowns fail fast; 429 and repeated
+  temporary failures open a per-origin circuit with one recovery probe. Normal
+  4xx and validation failures are not blindly retried. Background work is capped
+  at four of the eight upstream slots, and foreground requests precede queued
+  background work. Ops status exposes active cooldowns.
+
+## Compatibility Probes and Compensation
+
+- `npm run ops:upstream -- --output=work/upstream-compatibility.json` checks two
+  event pages and a small known completed/long-running sample. It checks response
+  schemas, ownership, roster completeness, duplicate sheets and legacy/formal
+  discrepancies without publishing anything into the application database.
+  Critical failures exit 2; recognized source discrepancies are warnings in the
+  report. The independent GitHub workflow runs weekly or by manual dispatch and
+  retains the JSON artifact. These are canaries, not proof that all events work;
+  sample IDs need occasional maintenance as source coverage changes.
+- The additive `index_retry_queue` migration enrolls existing failed/partial
+  events. Failures are classified as transient (5-minute initial delay), missing
+  data (6 hours), unavailable/schema (24 hours), or other upstream issues (1
+  hour), with bounded exponential backoff and jitter. Success clears the retry.
+- At minute 15 of each hour, at most 30 due events are compensated, skipping a
+  run when crawl/index work is already active. This refetches those events, not
+  the entire directory, and retains complete groups if another group fails.
+  Nightly indexing respects the retry schedule; explicit force operations can
+  bypass it. `node indexer.js --retry-only=true --limit=30` runs a bounded manual
+  pass. Ops status includes per-category pending/due counts.
+- Scheduled application work remains disabled by `BACKGROUND_TASKS_DISABLED=1`.
+  No full crawl, Git push, server deployment or external schedule activation is
+  performed by local verification.
+
 ## Verification and Local Preview
 
 Run `npm test`, `npm run test:browser`, and `npm audit`.

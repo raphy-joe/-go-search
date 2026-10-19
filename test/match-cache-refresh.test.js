@@ -32,6 +32,7 @@ function load({ cache = { rows: [], status: null }, response, storeResult = true
   const mocks = { express, './db': db, './crawler': {}, './indexer': {}, './strength': {}, './promotions': {},
     'node-cron': { schedule() {} },
     'node-fetch': async url => {
+      if (new URL(url).pathname.includes('/competition/')) return { ok:true, text:async()=>JSON.stringify({error:0,datArr:[]}) };
       const bout = Number(new URL(url).searchParams.get('bout'));
       calls.push(bout);
       const data = response ? await response(bout, calls) : { error: 0, datArr: { rows: [upstream(bout)] } };
