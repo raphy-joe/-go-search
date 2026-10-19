@@ -110,6 +110,10 @@ rotate credentials, enable 19Road, or change the 180-day strength window.
   repeated pages and business errors are not successful empty searches.
 - Formal-source verification failures mark indexing partial while retaining
   usable participant rows, so coverage does not silently claim full validation.
+- Formal history retains nonparticipant placeholders when replacing a guarded
+  legacy cache. Virtual bye/absence entries are not missing contested results.
+  Match responses include all verified available rounds, even when the requesting
+  result card still carries an older game count.
 - The lockfile pins the patched `proxy-addr` 2.0.8 dependency. Proxy trust remains
   loopback-only; no authentication or network exposure settings were relaxed.
 

@@ -309,3 +309,29 @@ test('an unindexed search hit uses verified published scores instead of an older
   assert.equal(hits[0].player.win,2);
   assert.equal(hits[0].player.rank,'2');
 });
+
+test('published history retains inactive placeholders when extending a guarded legacy cache', async t => {
+  const {databaseFixture}=require('./helpers/database');
+  const {publishedFixture,entry}=require('./helpers/published-results');
+  const {parsePublishedResults}=require('../yunbisai-results');
+  const db=await databaseFixture(t);
+  const report=parsePublishedResults(publishedFixture(),'8',entry);
+  await db.replaceGroupMatchCache({group_id:'8',rounds:2,rows:report.rows.filter(row=>row.bout<=2)
+    .map(row=>row.p2_id==='__live_bye__'?{...row,p2_id:'0'}:row)});
+  const {routes}=loadServer({
+    './db':{...db,initPromise:new Promise(()=>{}),getPublishedGroupResult:async()=>report},
+    'node-fetch':async url=>{
+      assert.ok(new URL(url).pathname.includes('/competition/'));
+      return {ok:true,text:async()=>JSON.stringify({error:0,datArr:[]})};
+    },
+  });
+  const result=response();
+  await routes.get('/api/matches')({query:{group_id:'8',rounds:'2',player_id:'1'}},result);
+  assert.equal(result.statusCode,200,JSON.stringify(result.body));
+  assert.equal(result.body.matches.length,3);
+  assert.equal(result.body.total_rounds,3);
+  const stored=await db.getGroupMatchCache('8');
+  assert.equal(stored.status.rounds,3);
+  assert.equal(stored.rows.filter(row=>row.bout===1).length,report.rows.filter(row=>row.bout===1).length);
+  assert.ok(stored.rows.some(row=>row.p1_id==='5'&&row.p1_result==='4'&&row.p1_score===0));
+});

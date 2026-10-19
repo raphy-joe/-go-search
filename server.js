@@ -528,7 +528,8 @@ app.get('/api/matches', async (req, res) => {
 
   try {
     const groupRows = await getOrFetchGroupMatches(group_id, totalRounds);
-    return res.json({ matches: buildPlayerMatches(groupRows, totalRounds, player_id),
+    const availableRounds = Math.max(totalRounds, ...groupRows.map(row => Number(row.bout) || 0));
+    return res.json({ matches: buildPlayerMatches(groupRows, availableRounds, player_id), total_rounds: availableRounds,
       stale: Boolean(groupRows.cacheInfo?.stale), updated_at: groupRows.cacheInfo?.updated_at || null });
   } catch (err) {
     console.warn(`[Matches] group ${group_id} failed: ${err.message}`);
@@ -1006,7 +1007,7 @@ async function fetchGroupMatches(groupId, rounds) {
   const final = await publishedResults(groupId, { fetchText: fetchTextWithRetry, eventId: context?.event_id,
     endedAt: context?.max_time });
   if (final.report && final.report.rounds >= rounds) {
-    return final.report.rows.filter(row => !(row.p2_id === LIVE_BYE_OPPONENT_ID && row.p1_result === '4'));
+    return final.report.rows;
   }
   const allRows = [];
   const bouts = Array.from({ length: rounds }, (_, index) => index + 1);

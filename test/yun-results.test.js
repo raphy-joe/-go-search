@@ -6,6 +6,15 @@ const sqlite3 = require('sqlite3');
 const { isGoEvent, isGoGroup, sportSql } = require('../sport-filter');
 const { assessYunMatches } = require('../result-quality');
 
+test('virtual bye and inactive placeholders are not missing contested games', () => {
+  const played={bout:1,p1_id:'1',p2_id:'2',p1_name:'A',p2_name:'B',p1_result:'1',p2_result:'2',p1_score:2,p2_score:0};
+  const inactive=Array.from({length:10},(_,index)=>({bout:1,p1_id:String(index+3),p2_id:'__live_bye__',
+    p1_name:'Inactive',p2_name:'',p1_result:'4',p2_result:'0',p1_score:0,p2_score:0}));
+  const quality=assessYunMatches([played,...inactive]);
+  assert.equal(quality.eligible,true);assert.equal(quality.contests,1);assert.equal(quality.unknown,0);
+  assert.equal(assessYunMatches(inactive).eligible,false);
+});
+
 test('Yunbisai rejects other sports and ambiguous multi-sport groups', () => {
   assert.equal(isGoEvent({ title: '\u56fd\u9645\u8c61\u68cb\u6bd4\u8d5b', event_value: '2' }), false);
   assert.equal(isGoEvent({ title: '\u56f4\u68cb\u6bd4\u8d5b', event_value: '1' }), false);
