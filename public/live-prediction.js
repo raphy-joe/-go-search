@@ -292,7 +292,7 @@ async function loadGroup(groupId = liveGroupSelect.value, options = {}) {
   } catch (err) {
     if (seq === groupRequestSeq && err.name !== 'AbortError') {
       livePlayersPanel.style.display = 'block';
-      showMessage(livePlayersPanel, `本组加载失败：${err.message}`);
+      showMessage(livePlayersPanel, err.code === 'GROUP_DATA_UNPUBLISHED' ? err.message : `本组加载失败：${err.message}`);
     }
   } finally {
     if (seq === groupRequestSeq) refreshLiveGroupBtn.disabled = false;

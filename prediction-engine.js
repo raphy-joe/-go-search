@@ -6,6 +6,7 @@ const versions = require('./model-versions');
 const { rankingRule, snapshotFingerprint } = require('./prediction-rules');
 
 const LIVE_BYE_OPPONENT_ID = '__live_bye__';
+const isForfeitResult = result => ['4', '6'].includes(String(result));
 
 function isUnscoredLiveAbsence(row) {
   if (!row) return false;
@@ -14,24 +15,25 @@ function isUnscoredLiveAbsence(row) {
   if (p1Absent === p2Absent) return false;
   const result = p1Absent ? row.p1_result : row.p2_result;
   const otherResult = p1Absent ? row.p2_result : row.p1_result;
-  return String(result) === '4' && Number(row.p1_score) === 0 && Number(row.p2_score) === 0
+  return isForfeitResult(result) && Number(row.p1_score) === 0 && Number(row.p2_score) === 0
     && ['', '0'].includes(String(otherResult ?? ''));
 }
 
 // A published zero-point absence is settled, but is not a played game or a bye win.
 function isResolvedLiveMatch(row) {
   return isPlayedMatch(row) || isUnscoredLiveAbsence(row)
-    || (row?.published_no_game === true && String(row.p1_result) === '4' && String(row.p2_result) === '4'
+    || (isForfeitResult(row?.p1_result) && isForfeitResult(row?.p2_result)
       && Number(row.p1_score) === 0 && Number(row.p2_score) === 0);
 }
 
 function nonPlayingPlayerIds(players, rows) {
   const observed = new Set(), competing = new Set();
   for (const row of rows) {
-    for (const id of [row.p1_id, row.p2_id]) {
+    for (const side of ['p1', 'p2']) {
+      const id = row[`${side}_id`];
       if (id === LIVE_BYE_OPPONENT_ID) continue;
       observed.add(id);
-      if (!isUnscoredLiveAbsence(row)) competing.add(id);
+      if (!isUnscoredLiveAbsence(row) && !isForfeitResult(row[`${side}_result`])) competing.add(id);
     }
   }
   return new Set(players.filter(player => observed.has(String(player.id))
@@ -51,6 +53,17 @@ function validatePredictionSnapshot(snapshot) {
   const ids = new Set(players.map(p => String(p.id)));
   if (ids.size !== players.length) fail();
   const nonPlaying = nonPlayingPlayerIds(players, rows);
+  const history = new Map();
+  for (const row of rows) {
+    for (const side of ['p1', 'p2']) {
+      const id = row[`${side}_id`];
+      if (!history.has(id)) history.set(id, []);
+      history.get(id).push({ bout: row.bout, result: String(row[`${side}_result`]) });
+    }
+  }
+  for (const entries of history.values()) entries.sort((a, b) => b.bout - a.bout);
+  // An explicit forfeit can explain an absent sheet until the player returns.
+  const withdrewBefore = (id, bout) => isForfeitResult(history.get(id)?.find(entry => entry.bout < bout)?.result);
   const playedCounts = new Map(), appearances = new Set(), bouts = new Map(), lastSeen = new Map();
   let lastPlayed = 0;
   for (const row of rows) {
@@ -64,7 +77,8 @@ function validatePredictionSnapshot(snapshot) {
       if (appearances.has(key)) fail();
       appearances.add(key);
       lastSeen.set(id, Math.max(lastSeen.get(id) || 0, row.bout));
-      if (isPlayedMatch(row)) playedCounts.set(id, (playedCounts.get(id) || 0) + 1);
+      const result = id === row.p1_id ? row.p1_result : row.p2_result;
+      if (isPlayedMatch(row) && !isForfeitResult(result)) playedCounts.set(id, (playedCounts.get(id) || 0) + 1);
     }
     if (isPlayedMatch(row)) lastPlayed = Math.max(lastPlayed, row.bout);
   }
@@ -79,7 +93,8 @@ function validatePredictionSnapshot(snapshot) {
     const previous = bouts.get(bout - 1) || (bout === 1 ? players.map(p => ({ p1_id:String(p.id) })) : []);
     for (const row of previous) {
       for (const id of [row.p1_id, row.p2_id]) {
-        if (ids.has(id) && !nonPlaying.has(id) && (lastSeen.get(id) || 0) >= lastPlayed - 1 && !appearances.has(`${bout}:${id}`)) fail();
+        if (ids.has(id) && !nonPlaying.has(id) && (lastSeen.get(id) || 0) >= lastPlayed - 1
+          && !appearances.has(`${bout}:${id}`) && !withdrewBefore(id, bout)) fail();
       }
     }
     if (!round.length) fail();
@@ -89,7 +104,7 @@ function validatePredictionSnapshot(snapshot) {
     if (!round?.length || (bout < lastPlayed && !round.every(isResolvedLiveMatch))) fail();
     for (const row of rows.filter(r => r.bout > bout)) {
       for (const id of [row.p1_id, row.p2_id]) {
-        if (ids.has(id) && !appearances.has(`${bout}:${id}`)) fail();
+        if (ids.has(id) && !appearances.has(`${bout}:${id}`) && !withdrewBefore(id, bout)) fail();
       }
     }
   }
@@ -143,7 +158,8 @@ function reconcileLivePlayers(players, matches) {
 }
 
 function applyLiveMatchResult(stats, ownResult, opponentResult, ownScore, opponentScore, bout) {
-  if (!stats) return;
+  // Yunbisai excludes code-4/6 forfeits from the player's loss count.
+  if (!stats || isForfeitResult(ownResult)) return;
   const result = resolveLiveMatchResult(ownResult, opponentResult, ownScore, opponentScore);
   if (!result) return;
 
@@ -382,17 +398,16 @@ function findNextKnownOpponent({ participantId, matches, players, currentRows, c
 function selectActiveSimulationPlayers(players, matches, completedRounds) {
   const nonPlaying = nonPlayingPlayerIds(players, matches);
   players = players.filter(player => !nonPlaying.has(String(player.id)));
-  const round = parseInt(completedRounds) || 0;
+  const round = Math.max(parseInt(completedRounds) || 0, ...matches.map(row => row.bout));
   if (!round) return players;
 
   const playerIds = new Set(players.map(player => String(player.id)));
   const activeIds = new Set();
   for (const row of matches) {
     if (row.bout !== round) continue;
-    if (playerIds.has(row.p1_id)) activeIds.add(row.p1_id);
-    if (playerIds.has(row.p2_id)) activeIds.add(row.p2_id);
+    if (playerIds.has(row.p1_id) && !isForfeitResult(row.p1_result)) activeIds.add(row.p1_id);
+    if (playerIds.has(row.p2_id) && !isForfeitResult(row.p2_result)) activeIds.add(row.p2_id);
   }
-  if (activeIds.size < 2) return players;
   return players.filter(player => activeIds.has(String(player.id)));
 }
 

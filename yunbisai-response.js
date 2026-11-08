@@ -69,6 +69,11 @@ function participants(data, groupId) {
 }
 
 function matchRound(data, groupId) {
+  if ([4, '4'].includes(data?.error) && data.msg === '\u5c0f\u7ec4\u4e0b\u6682\u65e0\u6570\u636e'
+    && Array.isArray(data.datArr?.rows) && data.datArr.rows.length === 0) {
+    throw Object.assign(new Error('\u4e91\u6bd4\u8d5b\u5c1a\u672a\u53d1\u5e03\u672c\u7ec4\u53c2\u8d5b\u540d\u5355\u6216\u5bf9\u9635\u6570\u636e\uff0c\u6682\u4e0d\u80fd\u9884\u6d4b'),
+      { code: 'GROUP_DATA_UNPUBLISHED', status: 422 });
+  }
   assertSuccess(data);
   if (!data.datArr || !Array.isArray(data.datArr.rows)) throw invalid('INVALID_MATCH_RESPONSE');
   const round = data.datArr;
@@ -78,7 +83,7 @@ function matchRound(data, groupId) {
     for (const side of ['p1', 'p2']) {
       const hasPlayer = row[`${side}id`] != null && !['', '0', 0].includes(row[`${side}id`]);
       if (hasPlayer) identity(row[`${side}id`]);
-      if (!['', '0', '1', '2', '3', '4'].includes(String(row[`${side}_result`] ?? ''))) throw invalid('UNKNOWN_RESULT_CODE');
+      if (!['', '0', '1', '2', '3', '4', '6'].includes(String(row[`${side}_result`] ?? ''))) throw invalid('UNKNOWN_RESULT_CODE');
       // A nonexistent bye/absence side has no score field in the public feed.
       normalized[`${side}_score`] = !hasPlayer && row[`${side}_score`] == null ? 0 : number(row[`${side}_score`]);
     }

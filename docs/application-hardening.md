@@ -117,6 +117,28 @@ rotate credentials, enable 19Road, or change the 180-day strength window.
 - The lockfile pins the patched `proxy-addr` 2.0.8 dependency. Proxy trust remains
   loopback-only; no authentication or network exposure settings were relaxed.
 
+## Live Forfeit Compatibility (2026-11-08)
+
+- Yunbisai's public mobile referee renderer treats result codes 4 and 6 as
+  forfeits. Sampled event 71958 uses 6/6; event 72686 group 353961 also uses 6/4.
+  These explicit zero-point double forfeits settle a round without a win/draw.
+  Unknown result codes still fail validation. Source inspected:
+  https://m.yunbisai.com/static/js/index.985f0634.js (`getResult`).
+- Live statistics exclude a forfeiting side from the ordinary loss count, as
+  the sampled participant feeds do. A winning opponent still receives the
+  recorded win. A preceding explicit forfeit can explain a missing later sheet
+  until a player returns; missing counted games or unexplained gaps still block
+  prediction. Latest published pairings take precedence over withdrawal when
+  identifying active players for simulated future rounds.
+- The explicit empty-group response (error 4, "small group has no data", empty
+  rows) maps to `GROUP_DATA_UNPUBLISHED`, not a fabricated empty success or a
+  generic loading failure. Other business errors retain strict rejection.
+- Prediction version is `rank-simulation-v6`; strength's 180-day window,
+  promotion rules, group quality exclusions and source selection are unchanged.
+- The release lockfile also applies compatible security patches: body-parser
+  1.20.9, qs 6.16.2 and undici 6.29.1. SQLite's package and native build remain
+  unchanged. Deployment must install the patched dependencies, not just copy code.
+
 ## Tie Boundaries and Refresh Policy
 
 - Unknown event-specific head-to-head, opponent-score cuts, penalties and lots

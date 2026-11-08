@@ -1,6 +1,6 @@
 'use strict';
 const test=require('node:test');const assert=require('node:assert/strict');
-const {predictPlayerRank,validatePredictionSnapshot}=require('../prediction-engine');
+const {predictPlayerRank,validatePredictionSnapshot,reconcileLivePlayers,isResolvedLiveMatch}=require('../prediction-engine');
 const {runPrediction}=require('../prediction-runner');
 const game=(bout,a,b)=>({bout,p1_id:a,p2_id:b,p1_result:'1',p2_result:'2',p1_score:2,p2_score:0});
 const fixture=()=>({players:[{id:'1',name:'A',score:6,win:3,lose:0},{id:'2',name:'B',score:4,win:2,lose:1},
@@ -72,7 +72,7 @@ test('a nonparticipant does not invalidate a second-round pairing sheet',()=>{
   assert.doesNotThrow(()=>validatePredictionSnapshot(snapshot));
 });
 
-test('an unresolved code 4 game against a real opponent still blocks prediction',()=>{
+test('double forfeits cannot replace a counted completed game',()=>{
   const snapshot=fixture();snapshot.matchData.rows[0]={...game(1,'1','4'),p1_result:'4',p2_result:'4',p1_score:0,p2_score:0};
   assert.throws(()=>validatePredictionSnapshot(snapshot),e=>e.code==='INCOMPLETE_PREDICTION_DATA');
 });
@@ -117,4 +117,58 @@ test('corrected round results reconcile stale statistics even when the number of
   assert.equal(result.current.win,2);
   assert.equal(result.current.lose,1);
   assert.equal(result.score_updates_applied,true);
+});
+
+test('double forfeits settle the round without awarding a win, draw or a next-match scenario',()=>{
+  for(const [a,b] of [['4','4'],['4','6'],['6','4'],['6','6']]) {
+    const snapshot=fixture();
+    snapshot.players=snapshot.players.map(p=>({...p,score:0,win:0,lose:0}));
+    snapshot.matchData={rows:[game(1,'1','2'),game(1,'3','4')].map(row=>({...row,
+      p1_result:a,p2_result:b,p1_score:0,p2_score:0})),totalRounds:1,completedRounds:1,knownPairingRounds:1};
+    assert.ok(snapshot.matchData.rows.every(isResolvedLiveMatch));
+    const result=predictPlayerRank({...options(snapshot),requestedTotalRounds:2,nextResult:'win'});
+    assert.equal(result.current.score,0);
+    assert.equal(result.current.win,0);
+    assert.equal(result.current.lose,0);
+    assert.equal(result.current.draw,0);
+    assert.equal(result.model.pairing_players,0);
+    assert.equal(result.next_opponent,null);
+    assert.equal(result.next_result,'');
+    assert.deepEqual(result.rank_intervals,[{rank:1,rank_max:4,count:200,probability:1}]);
+  }
+});
+
+test('a forfeiting player can sit out and return, but a missing ordinary result is still rejected',()=>{
+  const snapshot={players:[{id:'1',name:'Returning',score:2,win:1,lose:0},
+    {id:'2',name:'B',score:6,win:3,lose:0},{id:'3',name:'C',score:2,win:1,lose:2},
+    {id:'4',name:'D',score:0,win:0,lose:2}],
+    matchData:{rows:[{...game(1,'2','1'),p2_result:'6'},game(1,'3','4'),
+      game(2,'2','3'),{...absence(2,'4'),p1_result:'6'},game(3,'1','3'),game(3,'2','4'),
+      ...[game(4,'1','2'),game(4,'3','4')].map(row=>({...row,p1_result:'0',p2_result:'0',p1_score:0,p2_score:0}))],
+      totalRounds:4,completedRounds:3,knownPairingRounds:4}};
+  assert.doesNotThrow(()=>validatePredictionSnapshot(snapshot));
+  const state=reconcileLivePlayers(snapshot.players,snapshot.matchData.rows);
+  const returning=state.players.find(p=>p.id==='1');
+  assert.equal(returning.win,1);
+  assert.equal(returning.lose,0);
+  assert.equal(returning.score,2);
+  const result=predictPlayerRank({...options(snapshot),requestedTotalRounds:4});
+  assert.equal(result.next_opponent.id,'2');
+  snapshot.matchData.rows.find(row=>row.p2_id==='1').p2_result='2';
+  assert.throws(()=>validatePredictionSnapshot(snapshot),e=>e.code==='INCOMPLETE_PREDICTION_DATA');
+});
+
+test('forfeits neither inflate losses nor mask a missing counted game',()=>{
+  for(const code of ['4','6']) {
+    const players=[{id:'1',name:'Absent',score:0,win:0,lose:0},{id:'2',name:'Winner',score:0,win:0,lose:0}];
+    const rows=[{...game(1,'2','1'),p2_result:code}];
+    const state=reconcileLivePlayers(players,rows);
+    assert.equal(state.players[0].lose,0);
+    assert.equal(state.players[0].score_reconciled,false);
+    assert.equal(state.players[1].win,1);
+    assert.equal(state.players[1].score,2);
+    const snapshot={players:[{...players[0],lose:1},state.players[1]],
+      matchData:{rows,totalRounds:2,completedRounds:1,knownPairingRounds:1}};
+    assert.throws(()=>validatePredictionSnapshot(snapshot),e=>e.code==='INCOMPLETE_PREDICTION_DATA');
+  }
 });

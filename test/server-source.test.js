@@ -233,6 +233,53 @@ test('published final results reconcile a stale live feed and disable further pr
   assert.equal(result.body.total_rounds,3);
 });
 
+test('live groups accept mixed code-4/6 forfeits, preserve official losses and count double forfeits as settled',async()=>{
+  const {routes}=loadServer({
+    './db':{initPromise:new Promise(()=>{}),getLivePairingOverrides:async()=>[]},
+    'node-fetch':async url=>{
+      const u=new URL(url);let body;
+      if(u.pathname.includes('/competition/')) body={error:0,datArr:[]};
+      else if(u.pathname.endsWith('/Eventpart')) body={error:0,datArr:{rows:['1','2','3','4'].map(id=>({
+        participantid:id,participantname:id,vicsum:id==='1'?1:0,faisum:0,deusum:0,integral:id==='1'?2:0,compositor:Number(id)}))}};
+      else {
+        const bout=Number(u.searchParams.get('bout'));
+        const row=(a,b,x,y,score)=>({againstplanid:`${bout}-${a}`,p1id:a,p2id:b,p1:a,p2:b,
+          p1_result:x,p2_result:y,p1_score:score,p2_score:0});
+        body={error:0,datArr:{eventid:'71958',total_bout:'2',rows:bout===1?
+          [row('1','2','1','6',2),row('3','4','6','4',0)]:[row('1','3','0','0',0)]}};
+      }
+      return {ok:true,text:async()=>JSON.stringify(body)};
+    },
+  });
+  const group=response();await routes.get('/api/live-group')({query:{group_id:'353443'}},group);
+  assert.equal(group.statusCode,200);
+  assert.equal(group.body.completed_rounds,1);
+  assert.equal(group.body.total_rounds,2);
+  assert.equal(group.body.prediction_available,true);
+  assert.equal(group.body.data_warning,'');
+  assert.equal(group.body.players.find(p=>p.id==='2').lose,0);
+  const result=response();await routes.get('/api/live-prediction')({query:{group_id:'353443',participant_id:'1',simulations:'200',next_result:'win'}},result);
+  assert.equal(result.statusCode,200);
+  assert.equal(result.body.next_opponent.id,'3');
+  assert.equal(result.body.next_result,'win');
+  assert.equal(result.body.model.pairing_players,2);
+});
+
+test('an explicitly unpublished group has a distinct public response and cannot generate probabilities',async()=>{
+  const {routes}=loadServer({
+    './db':{initPromise:new Promise(()=>{}),getLivePairingOverrides:async()=>[]},
+    'node-fetch':async url=>({ok:true,text:async()=>JSON.stringify(String(url).includes('/Eventpart')?
+      {error:0,datArr:{rows:[]}}:{error:4,msg:'\u5c0f\u7ec4\u4e0b\u6682\u65e0\u6570\u636e',datArr:{rows:[]}})}),
+  });
+  for(const route of ['/api/live-group','/api/live-prediction']) {
+    const res=response();await routes.get(route)({query:{group_id:'351821',participant_id:'1'}},res);
+    assert.equal(res.statusCode,422);
+    assert.equal(res.body.code,'GROUP_DATA_UNPUBLISHED');
+    assert.match(res.body.error,/\u5c1a\u672a\u53d1\u5e03/);
+    assert.equal(res.body.probabilities,undefined);
+  }
+});
+
 test('a failed legacy feed can fall back to an already verified post-event published table',async()=>{
   const {publishedFixture,entry}=require('./helpers/published-results');
   const {parsePublishedResults}=require('../yunbisai-results');

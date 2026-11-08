@@ -34,3 +34,19 @@ test('the source may omit the score of a nonexistent opponent on a zero-point ab
   assert.equal(round.rows[0].p2_score,0);
   assert.equal(round.rows[0].p1_score,0);
 });
+
+test('published forfeits use code 6 while unknown codes still fail closed',()=>{
+  for (const [a,b,score] of [['6','1',2],['1','6',0],['6','6',0]]) {
+    const row={p1id:'1',p2id:'2',p1_result:a,p2_result:b,p1_score:a==='1'?2:0,p2_score:score};
+    assert.equal(matchRound({error:0,datArr:{rows:[row]}},'8').rows[0].p1_result,a);
+    assert.throws(()=>matchRound({error:0,datArr:{rows:[{...row,p1_result:'5'}]}},'8'),/UNKNOWN_RESULT_CODE/);
+  }
+});
+
+test('only the explicit empty-group response is classified as unpublished data',()=>{
+  const data={error:4,msg:'\u5c0f\u7ec4\u4e0b\u6682\u65e0\u6570\u636e',datArr:{rows:[]}};
+  assert.throws(()=>matchRound(data,'8'),e=>e.code==='GROUP_DATA_UNPUBLISHED'&&e.status===422);
+  assert.throws(()=>matchRound({...data,msg:'Other failure'},'8'),/UPSTREAM_BUSINESS_ERROR/);
+  assert.throws(()=>matchRound({...data,datArr:{rows:[{}]}},'8'),/UPSTREAM_BUSINESS_ERROR/);
+  assert.throws(()=>matchRound({...data,error:1},'8'),/UPSTREAM_BUSINESS_ERROR/);
+});

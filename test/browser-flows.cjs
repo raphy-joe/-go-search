@@ -62,6 +62,21 @@ async function search(page, name='同名棋手') {
   await page.waitForFunction(() => !document.getElementById('searchBtn').disabled);
 }
 
+test('unpublished live data shows its source status without a generic loading failure or probabilities',async t=>{
+  const message='云比赛尚未发布本组参赛名单或对阵数据，暂不能预测';
+  const {page,calls}=await fixture(t,(route,url)=>{
+    if(url.pathname==='/api/live-event') return json(route,{event_id:'72261',groups:[{group_id:'351821',group_name:'公开组'}]});
+    if(url.pathname==='/api/live-group') return json(route,{code:'GROUP_DATA_UNPUBLISHED',error:message},422);
+    throw new Error(`Unexpected API: ${url}`);
+  });
+  await page.goto(`${origin}/live-prediction.html?event_id=72261&group_id=351821`);
+  await page.getByText(message,{exact:true}).waitFor();
+  assert.doesNotMatch(await page.locator('#livePlayersPanel').innerText(),/本组加载失败/);
+  assert.equal(await page.locator('.live-probability-row').count(),0);
+  assert.equal(await page.locator('#refreshLiveGroupBtn').isEnabled(),true);
+  assert.equal(calls.some(url=>url.pathname==='/api/live-prediction'),false);
+});
+
 test('search separates identities, rejects stale evaluations, and binds actions to result context', async t => {
   const {page,calls} = await fixture(t, async (route,url) => {
     if (url.pathname === '/api/search') return route.fulfill({contentType:'text/event-stream',body:sse([
